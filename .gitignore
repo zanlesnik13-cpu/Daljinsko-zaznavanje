@@ -1,0 +1,42 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables & secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Geospatial / raster outputs & temporary data
+*.tif
+*.tiff
+*.vrt
+*.aux.xml
+*.ovr
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Notebooks & IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS files & logs
+.DS_Store
+Thumbs.db
+*.log
