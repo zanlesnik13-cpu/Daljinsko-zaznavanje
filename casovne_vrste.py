@@ -8,25 +8,31 @@ and supporting exact polygon clipping (`rioxarray.rio.clip`).
 from __future__ import annotations
 
 import gc
+import io
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import pystac
 import rioxarray  # noqa: F401 - registers .rio accessor on xarray objects
 import xarray as xr
+from PIL import Image, ImageDraw, ImageFont
 from rasterio.enums import Resampling
 
 from analize import (
+    SAR_METRICS,
+    SPECTRAL_INDICES,
     apply_cloud_mask,
     compute_index,
     compute_index_stats,
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
-from stac_loader import SENSOR_S1, SENSOR_S2, load_scene
+from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, load_scene
 
 logger = logging.getLogger(__name__)
 
@@ -347,3 +353,409 @@ def compute_change_summary(
         "neg_pct": round(100.0 * neg_px / valid_pixels, 1),
         "stable_pct": round(100.0 * stable_px / valid_pixels, 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# Visual Timelapse (PIL + Animated GIF) & Before/After Swipe Frame Rendering
+# ---------------------------------------------------------------------------
+def _load_stamp_font(size: int = 16) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load a crisp sans-serif TrueType font bundled with Matplotlib or system fonts."""
+    candidates = [
+        os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _format_platform_stamp(platform: str, sensor: str) -> str:
+    """Format a compact, readable sensor/platform label for timelapse banners."""
+    raw = str(platform or "").strip()
+    if raw:
+        low = raw.lower()
+        if "landsat-" in low:
+            return raw.replace("-", " ").title()
+        if "sentinel-2" in low:
+            return raw.replace("sentinel-", "Sentinel-").upper().replace("SENTINEL-", "Sentinel-")
+        if "sentinel-1" in low:
+            return raw.replace("sentinel-", "Sentinel-").upper().replace("SENTINEL-", "Sentinel-")
+        return raw
+    if sensor == SENSOR_LANDSAT:
+        return "Landsat C2 L2"
+    if sensor == SENSOR_S1:
+        return "Sentinel-1 SAR"
+    return "Sentinel-2 L2A"
+
+
+def _ensure_north_up(arr: np.ndarray, y_coords: np.ndarray) -> np.ndarray:
+    """Ensure row 0 corresponds to North (max Y) so PIL images match map orientation."""
+    if y_coords.size > 1 and float(y_coords[0]) < float(y_coords[-1]):
+        return arr[::-1, ...]
+    return arr
+
+
+def _resize_pil_frame(
+    img: Image.Image,
+    max_width: int = 700,
+    min_width: int = 480,
+    target_size: tuple[int, int] | None = None,
+) -> Image.Image:
+    """Resize PIL image preserving aspect ratio (or exact ``target_size`` for GIF alignment)."""
+    if target_size is not None:
+        if img.size == target_size:
+            return img
+        resamp = (
+            Image.Resampling.LANCZOS
+            if target_size[0] < img.width
+            else Image.Resampling.NEAREST
+        )
+        return img.resize(target_size, resample=resamp)
+
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return img
+
+    if w > max_width:
+        scale = float(max_width) / float(w)
+        new_size = (max_width, max(1, int(round(h * scale))))
+        return img.resize(new_size, resample=Image.Resampling.LANCZOS)
+
+    if w < min_width:
+        scale = float(min_width) / float(w)
+        new_h = max(1, int(round(h * scale)))
+        if new_h > max_width:
+            scale = float(max_width) / float(h)
+            new_size = (max(1, int(round(w * scale))), max_width)
+        else:
+            new_size = (min_width, new_h)
+        return img.resize(new_size, resample=Image.Resampling.NEAREST)
+
+    return img
+
+
+def _stamp_banner_on_pil(img: Image.Image, stamp_text: str) -> Image.Image:
+    """Draw a dark-slate (#0F172A) date & sensor stamp banner in the top-left corner."""
+    if not stamp_text:
+        return img
+
+    rgba = img.convert("RGBA")
+    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = _load_stamp_font(size=max(13, min(18, rgba.width // 34)))
+
+    bbox = draw.textbbox((0, 0), stamp_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x, pad_y = 10, 6
+    margin = 10
+
+    rect = [
+        margin,
+        margin,
+        min(rgba.width - margin, margin + text_w + 2 * pad_x),
+        min(rgba.height - margin, margin + text_h + 2 * pad_y),
+    ]
+    # Dark slate #0F172A background with crisp cartographic teal left accent #0F766E
+    draw.rectangle(rect, fill=(15, 23, 42, 224))
+    draw.rectangle([rect[0], rect[1], rect[0] + 4, rect[3]], fill=(15, 118, 110, 255))
+    draw.text(
+        (rect[0] + pad_x + 2, rect[1] + pad_y - bbox[1]),
+        stamp_text,
+        fill=(248, 250, 252, 255),
+        font=font,
+    )
+    combined = Image.alpha_composite(rgba, overlay).convert("RGB")
+    return combined
+
+
+def _stretch_rgb_for_pil(
+    ds: xr.Dataset,
+    bands: Sequence[str],
+    y_coords: np.ndarray,
+) -> np.ndarray:
+    """Compose a north-up uint8 (H, W, 3) array using 2–98% reflectance stretch."""
+    channels: list[np.ndarray] = []
+    valid = np.ones(ds[bands[0]].shape, dtype=bool)
+    for b in bands:
+        arr = ds[b].values.astype(np.float32, copy=False)
+        valid &= np.isfinite(arr)
+        channels.append(arr)
+
+    bg_rgb = (226, 232, 240)  # Neutral cartographic slate #E2E8F0
+    out_ch: list[np.ndarray] = []
+    for idx, arr in enumerate(channels):
+        fin = arr[np.isfinite(arr)]
+        if fin.size == 0:
+            stretched = np.zeros_like(arr, dtype=np.float32)
+        else:
+            lo, hi = np.percentile(fin, [2.0, 98.0])
+            if hi <= lo:
+                lo, hi = float(fin.min()), float(fin.max())
+            denom = max(float(hi - lo), 1e-6)
+            stretched = np.clip((arr - np.float32(lo)) / np.float32(denom), 0.0, 1.0)
+        u8 = np.where(valid, np.clip(np.round(stretched * 255.0), 0, 255), bg_rgb[idx]).astype(
+            np.uint8
+        )
+        out_ch.append(u8)
+
+    rgb = np.stack(out_ch, axis=-1)
+    return _ensure_north_up(rgb, y_coords)
+
+
+def render_dataarray_to_pil(
+    da: xr.DataArray,
+    cmap_name: str,
+    vmin: float,
+    vmax: float,
+    stamp_text: str | None = None,
+    max_width: int = 700,
+    target_size: tuple[int, int] | None = None,
+) -> Image.Image:
+    """Render a 2D georeferenced DataArray into a crisp north-up PIL RGB Image."""
+    vals = da.values.astype(np.float32, copy=False)
+    y_coords = np.asarray(da.coords["y"].values, dtype=np.float64)
+    vals = _ensure_north_up(vals, y_coords)
+
+    finite = np.isfinite(vals)
+    denom = max(float(vmax - vmin), 1e-6)
+    norm = np.clip((np.nan_to_num(vals, nan=vmin) - np.float32(vmin)) / np.float32(denom), 0.0, 1.0)
+
+    cmap = matplotlib.colormaps[cmap_name]
+    rgba_f = cmap(norm)  # (H, W, 4) in [0, 1]
+    rgb_u8 = np.clip(np.round(rgba_f[..., :3] * 255.0), 0, 255).astype(np.uint8)
+    # Neutral light slate #E2E8F0 for NaN / clipped pixels
+    rgb_u8[~finite] = np.array([226, 232, 240], dtype=np.uint8)
+
+    img = Image.fromarray(rgb_u8, mode="RGB")
+    img = _resize_pil_frame(img, max_width=max_width, target_size=target_size)
+    if stamp_text:
+        img = _stamp_banner_on_pil(img, stamp_text)
+    return img
+
+
+def pil_to_png_bytes(img: Image.Image) -> bytes:
+    """Encode a PIL Image to compact PNG bytes in memory."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def compile_timelapse_gif(
+    frames_png_bytes: Sequence[bytes],
+    duration_ms: int = 800,
+) -> bytes:
+    """Compile a sequence of PNG frame byte buffers into a looping animated GIF."""
+    if not frames_png_bytes:
+        raise ValueError("Cannot compile timelapse GIF from an empty frame list.")
+
+    pil_frames: list[Image.Image] = []
+    base_size: tuple[int, int] | None = None
+    for raw in frames_png_bytes:
+        with Image.open(io.BytesIO(raw)) as im:
+            frame_rgb = im.convert("RGB")
+            if base_size is None:
+                base_size = frame_rgb.size
+            elif frame_rgb.size != base_size:
+                frame_rgb = frame_rgb.resize(base_size, resample=Image.Resampling.BILINEAR)
+            pil_frames.append(frame_rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+
+    buf = io.BytesIO()
+    pil_frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=int(max(100, duration_ms)),
+        loop=0,
+        optimize=True,
+    )
+    gif_bytes = buf.getvalue()
+    del pil_frames
+    gc.collect()
+    return gif_bytes
+
+
+def render_change_swipe_pair(
+    da_t1: xr.DataArray,
+    da_t2: xr.DataArray,
+    index_key: str,
+    is_sar: bool = False,
+    max_width: int = 720,
+) -> tuple[bytes, bytes]:
+    """Render pixel-aligned ``t1`` and ``t2`` DataArrays to identical-dimension PNG bytes for swipe comparison."""
+    spec = SAR_METRICS[index_key] if is_sar else SPECTRAL_INDICES[index_key]
+    vmin, vmax = float(spec["vmin"]), float(spec["vmax"])
+    cmap_name = str(spec["cmap"])
+
+    img_t1 = render_dataarray_to_pil(
+        da_t1, cmap_name=cmap_name, vmin=vmin, vmax=vmax, stamp_text=None, max_width=max_width
+    )
+    img_t2 = render_dataarray_to_pil(
+        da_t2,
+        cmap_name=cmap_name,
+        vmin=vmin,
+        vmax=vmax,
+        stamp_text=None,
+        max_width=max_width,
+        target_size=img_t1.size,
+    )
+    return pil_to_png_bytes(img_t1), pil_to_png_bytes(img_t2)
+
+
+def generate_timelapse_frames(
+    items: Sequence[pystac.Item],
+    bbox_4326: Sequence[float],
+    layer_mode: str = "RGB",
+    target_epsg: int | str = "EPSG:3794",
+    resolution: float = 10,
+    sensor: str = SENSOR_S2,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    mask_clouds: bool = True,
+    min_valid_pct: float = 10.0,
+    duration_ms: int = 800,
+    max_width: int = 700,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Generate a memory-safe visual timelapse (compact PNG frames + animated GIF).
+
+    Loads strictly one acquisition at a time, aligns frames onto a consistent
+    pixel grid, stamps each frame with ``YYYY-MM-DD | Platform``, frees raster
+    memory via ``gc.collect()`` after every frame, and compiles a looping GIF.
+    """
+    mode = layer_mode.strip().upper()
+    is_sar = sensor == SENSOR_S1
+    is_rgb_composite = mode in ("RGB", "NIR") and not is_sar
+
+    if is_sar:
+        if mode not in SAR_METRICS:
+            mode = "VV"
+        req_bands = list(SAR_METRICS[mode]["pols"])
+        use_cloud_mask = False
+    elif mode == "RGB":
+        req_bands = ["B04", "B03", "B02"]
+        use_cloud_mask = False
+    elif mode == "NIR":
+        req_bands = ["B08", "B04", "B03"]
+        use_cloud_mask = False
+    else:
+        use_cloud_mask = bool(mask_clouds)
+        req_bands = get_required_bands_for_sensor(sensor, mode, include_cloud_mask=use_cloud_mask)
+
+    sorted_items = sorted(items, key=_item_dt_utc)
+    total = len(sorted_items)
+
+    frames: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    target_pil_size: tuple[int, int] | None = None
+
+    for step, item in enumerate(sorted_items):
+        dt_utc = _item_dt_utc(item)
+        date_str = dt_utc.strftime("%Y-%m-%d")
+        if progress_callback is not None:
+            progress_callback(step, total, date_str)
+
+        ds: xr.Dataset | None = None
+        masked_ds: xr.Dataset | None = None
+        layer_da: xr.DataArray | None = None
+        img: Image.Image | None = None
+
+        try:
+            ds = load_scene(
+                sensor=sensor,
+                item=item,
+                bbox_4326=bbox_4326,
+                bands=req_bands,
+                target_epsg=target_epsg,
+                resolution=float(resolution),
+                aoi_polygon_4326=aoi_polygon_4326,
+            )
+
+            platform_lbl = _format_platform_stamp(str(item.properties.get("platform", "")), sensor)
+            stamp = f"{date_str} | {platform_lbl} | {mode}"
+
+            if is_rgb_composite:
+                # Check valid pixel coverage across the 3 composite bands
+                valid = np.ones(ds[req_bands[0]].shape, dtype=bool)
+                for b in req_bands:
+                    valid &= np.isfinite(ds[b].values)
+                valid_pct = float(100.0 * np.count_nonzero(valid) / max(valid.size, 1))
+                if valid_pct < float(min_valid_pct):
+                    skipped.append(
+                        {"date_str": date_str, "scene_id": item.id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
+                    )
+                    continue
+
+                y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64)
+                rgb_u8 = _stretch_rgb_for_pil(ds, req_bands, y_coords)
+                img = Image.fromarray(rgb_u8, mode="RGB")
+                img = _resize_pil_frame(img, max_width=max_width, target_size=target_pil_size)
+                if target_pil_size is None:
+                    target_pil_size = img.size
+                img = _stamp_banner_on_pil(img, stamp)
+            else:
+                masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask)
+                layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=mode)
+                stats = compute_index_stats(layer_da, resolution_m=float(resolution))
+                valid_pct = float(stats["valid_pct"])
+                if valid_pct < float(min_valid_pct):
+                    skipped.append(
+                        {"date_str": date_str, "scene_id": item.id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
+                    )
+                    continue
+
+                spec = SAR_METRICS[mode] if is_sar else SPECTRAL_INDICES[mode]
+                img = render_dataarray_to_pil(
+                    layer_da,
+                    cmap_name=str(spec["cmap"]),
+                    vmin=float(spec["vmin"]),
+                    vmax=float(spec["vmax"]),
+                    stamp_text=stamp,
+                    max_width=max_width,
+                    target_size=target_pil_size,
+                )
+                if target_pil_size is None:
+                    target_pil_size = img.size
+
+            frames.append(
+                {
+                    "date_str": date_str,
+                    "platform": platform_lbl,
+                    "scene_id": item.id,
+                    "valid_pct": round(valid_pct, 1),
+                    "png_bytes": pil_to_png_bytes(img),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Timelapse skipped %s (%s): %s", date_str, item.id, exc)
+            skipped.append(
+                {"date_str": date_str, "scene_id": item.id, "valid_pct": 0.0, "reason": str(exc)}
+            )
+        finally:
+            del ds, masked_ds, layer_da, img
+            gc.collect()
+
+    if progress_callback is not None:
+        progress_callback(total, total, "done")
+
+    gif_bytes = (
+        compile_timelapse_gif([f["png_bytes"] for f in frames], duration_ms=duration_ms)
+        if frames
+        else b""
+    )
+
+    return {
+        "frames": frames,
+        "gif_bytes": gif_bytes,
+        "skipped": skipped,
+        "layer_mode": mode,
+        "sensor": sensor,
+    }
+

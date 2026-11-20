@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import rioxarray  # noqa: F401 - registers .rio accessor on xarray objects
 import xarray as xr
 
@@ -113,6 +114,44 @@ SAR_METRICS: dict[str, dict[str, Any]] = {
         "units": "dB",
     },
 }
+
+# Optical bands & nominal central wavelengths [nm] for Spectral Signature Profiler
+OPTICAL_SIGNATURE_BANDS: tuple[tuple[str, int, str], ...] = (
+    ("B02", 490, "Blue"),
+    ("B03", 560, "Green"),
+    ("B04", 665, "Red"),
+    ("B08", 842, "NIR"),
+    ("B11", 1610, "SWIR-1"),
+    ("B12", 2190, "SWIR-2"),
+)
+
+# 4-class physical land-cover definitions (clean cartographic palette)
+LAND_COVER_CLASSES: tuple[dict[str, Any], ...] = (
+    {
+        "class_key": "water",
+        "class_id": 1,
+        "rule": "NDWI > 0.1",
+        "color": "#0369A1",
+    },
+    {
+        "class_key": "built_bare",
+        "class_id": 2,
+        "rule": "NDWI <= 0.1 & NDVI < 0.2",
+        "color": "#94A3B8",
+    },
+    {
+        "class_key": "sparse_veg",
+        "class_id": 3,
+        "rule": "NDWI <= 0.1 & 0.2 <= NDVI < 0.5",
+        "color": "#84CC16",
+    },
+    {
+        "class_key": "dense_veg",
+        "class_id": 4,
+        "rule": "NDWI <= 0.1 & NDVI >= 0.5",
+        "color": "#0F766E",
+    },
+)
 
 
 def get_required_bands(index_name: str, include_scl: bool = True) -> list[str]:
@@ -548,3 +587,134 @@ def compute_index_stats(
         "valid_pct": round(valid_pct, 2),
         "valid_area_ha": round(valid_area_ha, 3),
     }
+
+
+def extract_spectral_signature(
+    ds: xr.Dataset,
+    x_coord: float,
+    y_coord: float,
+) -> pd.DataFrame:
+    """Extract surface reflectance ``[0, 1]`` at the nearest pixel to ``(x_coord, y_coord)``.
+
+    Works for both Sentinel-2 L2A and harmonized Landsat C2 L2 Datasets across
+    ``B02 (490 nm)``, ``B03 (560 nm)``, ``B04 (665 nm)``, ``B08 (842 nm)``,
+    ``B11 (1610 nm)``, and ``B12 (2190 nm)``.
+    """
+    x_vals = np.asarray(ds.coords["x"].values, dtype=np.float64)
+    y_vals = np.asarray(ds.coords["y"].values, dtype=np.float64)
+    if x_vals.size == 0 or y_vals.size == 0:
+        raise ValueError("Dataset has empty spatial coordinates.")
+
+    ix = int(np.argmin(np.abs(x_vals - float(x_coord))))
+    iy = int(np.argmin(np.abs(y_vals - float(y_coord))))
+    actual_x = float(x_vals[ix])
+    actual_y = float(y_vals[iy])
+
+    rows: list[dict[str, Any]] = []
+    for band_code, wl_nm, band_name in OPTICAL_SIGNATURE_BANDS:
+        if band_code not in ds.data_vars:
+            continue
+        raw_val = float(ds[band_code].isel(y=iy, x=ix).values)
+        rows.append(
+            {
+                "band": band_code,
+                "wavelength_nm": int(wl_nm),
+                "band_name": band_name,
+                "reflectance": raw_val if np.isfinite(raw_val) else np.nan,
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=["band", "wavelength_nm", "band_name", "reflectance"])
+    df.attrs["actual_x"] = actual_x
+    df.attrs["actual_y"] = actual_y
+    df.attrs["ix"] = ix
+    df.attrs["iy"] = iy
+    return df
+
+
+def compute_quick_land_cover(
+    ds: xr.Dataset,
+    resolution_m: float,
+) -> tuple[xr.DataArray, pd.DataFrame]:
+    """Classify an optical (cloud-masked) scene into 4 intuitive physical land-cover classes.
+
+    Classes:
+    - ``1`` (``water``): ``NDWI > 0.1``
+    - ``2`` (``built_bare``): ``NDWI <= 0.1`` and ``NDVI < 0.2``
+    - ``3`` (``sparse_veg``): ``NDWI <= 0.1`` and ``0.2 <= NDVI < 0.5``
+    - ``4`` (``dense_veg``): ``NDWI <= 0.1`` and ``NDVI >= 0.5``
+    - ``255``: NoData / Cloud-masked pixels
+    """
+    if resolution_m <= 0:
+        raise ValueError(f"resolution_m must be strictly positive, got {resolution_m}.")
+
+    ndvi_da = compute_index(ds, "NDVI")
+    ndwi_da = compute_index(ds, "NDWI")
+
+    ndvi = ndvi_da.values
+    ndwi = ndwi_da.values
+    valid = np.isfinite(ndvi) & np.isfinite(ndwi)
+
+    lc_arr = np.full(ndvi.shape, 255, dtype=np.uint8)
+    is_water = valid & (ndwi > 0.1)
+    not_water = valid & (~is_water)
+    is_built = not_water & (ndvi < 0.2)
+    is_sparse = not_water & (ndvi >= 0.2) & (ndvi < 0.5)
+    is_dense = not_water & (ndvi >= 0.5)
+
+    lc_arr[is_water] = 1
+    lc_arr[is_built] = 2
+    lc_arr[is_sparse] = 3
+    lc_arr[is_dense] = 4
+
+    valid_pixels = int(np.count_nonzero(valid))
+    px_area_ha = (float(resolution_m) ** 2) / 10_000.0
+
+    counts = {
+        "water": int(np.count_nonzero(is_water)),
+        "built_bare": int(np.count_nonzero(is_built)),
+        "sparse_veg": int(np.count_nonzero(is_sparse)),
+        "dense_veg": int(np.count_nonzero(is_dense)),
+    }
+
+    rows: list[dict[str, Any]] = []
+    for spec in LAND_COVER_CLASSES:
+        ckey = spec["class_key"]
+        px = counts[ckey]
+        area_ha = px * px_area_ha
+        share_pct = (100.0 * px / valid_pixels) if valid_pixels > 0 else 0.0
+        rows.append(
+            {
+                "class_key": ckey,
+                "class_id": spec["class_id"],
+                "rule": spec["rule"],
+                "color": spec["color"],
+                "pixels": px,
+                "area_ha": round(area_ha, 3),
+                "share_pct": round(share_pct, 2),
+            }
+        )
+
+    lc_da = xr.DataArray(
+        lc_arr,
+        dims=ndvi_da.dims,
+        coords=ndvi_da.coords,
+        name="LAND_COVER",
+        attrs={
+            "long_name": "Quick Physical Land-Cover Classification",
+            "classes": "1=Water, 2=Built-up/Bare, 3=Sparse Veg, 4=Dense Veg, 255=NoData",
+            "resolution_m": float(resolution_m),
+            "scene_id": ds.attrs.get("scene_id", ""),
+            "datetime": ds.attrs.get("datetime", ""),
+        },
+    )
+    crs = ds.rio.crs or ndvi_da.rio.crs
+    if crs is not None:
+        lc_da = lc_da.rio.write_crs(crs, inplace=False)
+    lc_da = lc_da.rio.write_nodata(255, inplace=False)
+
+    summary_df = pd.DataFrame(rows)
+    summary_df.attrs["valid_pixels"] = valid_pixels
+    summary_df.attrs["valid_area_ha"] = round(valid_pixels * px_area_ha, 3)
+    return lc_da, summary_df
+

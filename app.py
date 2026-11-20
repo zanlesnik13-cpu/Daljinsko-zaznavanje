@@ -10,6 +10,7 @@ interaktivni rastrski prikazovalnik (Plotly zoom/pan) ter dvojezični vmesnik (S
 
 from __future__ import annotations
 
+import base64
 import gc
 import json
 from datetime import date, timedelta
@@ -24,25 +25,32 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import xarray as xr
 from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 from analize import (
+    OPTICAL_SIGNATURE_BANDS,
     SAR_METRICS,
     SPECTRAL_INDICES,
     apply_cloud_mask,
     compute_index,
     compute_index_stats,
+    compute_quick_land_cover,
     compute_sar_water_mask,
     extract_sar_metric,
+    extract_spectral_signature,
     get_required_bands_for_sensor,
 )
 from casovne_vrste import (
+    compile_timelapse_gif,
     compute_change_detection,
     compute_change_summary,
     extract_time_series,
+    generate_timelapse_frames,
+    render_change_swipe_pair,
 )
 from geodezija_crs import (
     CRS_D96TM,
@@ -406,6 +414,12 @@ def _init_session_state() -> None:
         "tab2_tif_filename": None,
         "tab2_sar_ds": None,
         "tab2_sar_meta": None,
+        "tab2_sig_ds": None,
+        "tab2_sig_meta": None,
+        "tab2_lc_df": None,
+        "tab2_lc_meta": None,
+        "tab2_lc_tif_bytes": None,
+        "tab2_lc_tif_filename": None,
         # Tab 3 state
         "tab3_ts_df": None,
         "tab3_ts_meta": None,
@@ -415,6 +429,9 @@ def _init_session_state() -> None:
         "tab3_change_meta": None,
         "tab3_change_tif_bytes": None,
         "tab3_change_tif_filename": None,
+        "tab3_swipe_png_t1": None,
+        "tab3_swipe_png_t2": None,
+        "tab3_timelapse_data": None,
         # Resolution guard
         "last_rec_res_key": None,
         "selected_resolution": 10,
@@ -438,6 +455,12 @@ def _clear_loaded_products() -> None:
         "tab2_tif_filename",
         "tab2_sar_ds",
         "tab2_sar_meta",
+        "tab2_sig_ds",
+        "tab2_sig_meta",
+        "tab2_lc_df",
+        "tab2_lc_meta",
+        "tab2_lc_tif_bytes",
+        "tab2_lc_tif_filename",
         "tab3_ts_df",
         "tab3_ts_meta",
         "tab3_change_t1",
@@ -446,6 +469,9 @@ def _clear_loaded_products() -> None:
         "tab3_change_meta",
         "tab3_change_tif_bytes",
         "tab3_change_tif_filename",
+        "tab3_swipe_png_t1",
+        "tab3_swipe_png_t2",
+        "tab3_timelapse_data",
     ):
         st.session_state[key] = None
     gc.collect()
@@ -1240,6 +1266,250 @@ def _build_sar_vv_histogram(
         showlegend=False,
     )
     return fig
+
+
+def _build_spectral_signature_chart(
+    sig_df: pd.DataFrame,
+    sensor_name: str,
+    date_str: str,
+) -> go.Figure:
+    """Interaktivni Plotly linijski graf spektralnega podpisa (valovna dolžina vs. odbojnost)."""
+    fig = go.Figure()
+    labels = [f"{r['band_name']}<br>({r['band']})" for _, r in sig_df.iterrows()]
+    fig.add_trace(
+        go.Scatter(
+            x=sig_df["wavelength_nm"],
+            y=sig_df["reflectance"],
+            mode="lines+markers+text",
+            text=labels,
+            textposition="top center",
+            textfont=dict(size=10, color="#334155"),
+            line=dict(color="#0F766E", width=2.8),
+            marker=dict(size=9, color="#0F766E", line=dict(color="#FFFFFF", width=1.5)),
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "λ = %{x} nm<br>"
+                "ρ = %{y:.4f}<extra></extra>"
+            ),
+            name=sensor_name,
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text=t("sig_chart_title", sensor=sensor_name, date=date_str),
+            font=dict(size=14, color="#0F172A"),
+        ),
+        xaxis=dict(
+            title=t("sig_xaxis"),
+            tickvals=list(sig_df["wavelength_nm"]),
+            ticktext=[f"{int(w)} nm" for w in sig_df["wavelength_nm"]],
+            gridcolor="#E2E8F0",
+            range=[420, 2320],
+        ),
+        yaxis=dict(
+            title=t("sig_yaxis"),
+            gridcolor="#E2E8F0",
+            zerolinecolor="#94A3B8",
+            range=[0.0, min(1.05, max(0.55, float(np.nanmax(sig_df["reflectance"]) * 1.22)))],
+        ),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        margin=dict(l=52, r=24, t=52, b=46),
+        height=350,
+        showlegend=False,
+    )
+    return fig
+
+
+def _build_land_cover_bar_chart(
+    lc_df: pd.DataFrame,
+    date_str: str,
+    total_valid_ha: float,
+    lang: str,
+) -> go.Figure:
+    """Horizontalni Plotly stolpčni graf površin [ha] in deležev [%] za 4 razrede rabe tal."""
+    labels = [t(f"lc_{ck}", lang=lang) for ck in lc_df["class_key"]]
+    text_ann = [f"{a:,.2f} ha ({p:.1f} %)" for a, p in zip(lc_df["area_ha"], lc_df["share_pct"])]
+    fig = go.Figure(
+        data=go.Bar(
+            y=labels,
+            x=lc_df["area_ha"],
+            orientation="h",
+            marker=dict(
+                color=list(lc_df["color"]),
+                line=dict(color="#FFFFFF", width=1),
+            ),
+            text=text_ann,
+            textposition="auto",
+            hovertemplate="<b>%{y}</b><br>%{x:,.2f} ha<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text=t("lc_chart_title", date=date_str, area=total_valid_ha),
+            font=dict(size=14, color="#0F172A"),
+        ),
+        xaxis=dict(title=t("lc_col_area"), gridcolor="#E2E8F0"),
+        yaxis=dict(autorange="reversed"),
+        plot_bgcolor="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        margin=dict(l=20, r=24, t=48, b=42),
+        height=280,
+        showlegend=False,
+    )
+    return fig
+
+
+def _render_before_after_swipe_html(
+    png_t1_bytes: bytes,
+    png_t2_bytes: bytes,
+    label_t1: str,
+    label_t2: str,
+    height: int = 520,
+) -> None:
+    """Izriše samostojni HTML5/CSS/JS drsnik Prej / Potem (t₁ levo, t₂ desno) z miško ali dotikom."""
+    b64_t1 = base64.b64encode(png_t1_bytes).decode("ascii")
+    b64_t2 = base64.b64encode(png_t2_bytes).decode("ascii")
+    safe_t1 = label_t1.replace("<", "&lt;").replace(">", "&gt;")
+    safe_t2 = label_t2.replace("<", "&lt;").replace(">", "&gt;")
+
+    html_doc = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: #FFFFFF;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 4px;
+  }}
+  .swipe-shell {{
+    position: relative;
+    width: 100%;
+    max-width: 760px;
+    height: {height - 16}px;
+    border: 1px solid #CBD5E1;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #F1F5F9;
+    user-select: none;
+    touch-action: pan-y;
+  }}
+  .swipe-img {{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }}
+  .swipe-left-wrap {{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    clip-path: inset(0 50% 0 0);
+    pointer-events: none;
+  }}
+  .swipe-divider {{
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 3px;
+    margin-left: -1.5px;
+    background: #FFFFFF;
+    box-shadow: 0 0 6px rgba(15, 23, 42, 0.55);
+    pointer-events: none;
+  }}
+  .swipe-handle {{
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: #0F766E;
+    border: 2.5px solid #FFFFFF;
+    color: #FFFFFF;
+    font-size: 16px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.35);
+    pointer-events: none;
+  }}
+  .swipe-badge {{
+    position: absolute;
+    top: 12px;
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: #F8FAFC;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+    box-shadow: 0 1px 4px rgba(15, 23, 42, 0.35);
+  }}
+  .badge-left {{
+    left: 12px;
+    background: rgba(15, 23, 42, 0.88);
+    border-left: 3px solid #94A3B8;
+  }}
+  .badge-right {{
+    right: 12px;
+    background: rgba(15, 118, 110, 0.92);
+    border-right: 3px solid #F8FAFC;
+  }}
+  .swipe-range {{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: ew-resize;
+    z-index: 10;
+    margin: 0;
+  }}
+</style>
+</head>
+<body>
+  <div class="swipe-shell" id="shell">
+    <img class="swipe-img" src="data:image/png;base64,{b64_t2}" alt="t2" />
+    <div class="swipe-left-wrap" id="leftWrap">
+      <img class="swipe-img" src="data:image/png;base64,{b64_t1}" alt="t1" />
+    </div>
+    <div class="swipe-divider" id="divider"></div>
+    <div class="swipe-handle" id="handle">&#8596;</div>
+    <div class="swipe-badge badge-left">{safe_t1}</div>
+    <div class="swipe-badge badge-right">{safe_t2}</div>
+    <input class="swipe-range" id="slider" type="range" min="0" max="100" value="50" aria-label="Before After Swipe" />
+  </div>
+  <script>
+    const slider = document.getElementById('slider');
+    const leftWrap = document.getElementById('leftWrap');
+    const divider = document.getElementById('divider');
+    const handle = document.getElementById('handle');
+    function updatePos(val) {{
+      const pct = Math.max(0, Math.min(100, Number(val)));
+      leftWrap.style.clipPath = `inset(0 ${{100 - pct}}% 0 0)`;
+      divider.style.left = pct + '%';
+      handle.style.left = pct + '%';
+    }}
+    slider.addEventListener('input', (e) => updatePos(e.target.value));
+    slider.addEventListener('change', (e) => updatePos(e.target.value));
+    updatePos(50);
+  </script>
+</body>
+</html>"""
+    components.html(html_doc, height=height, scrolling=False)
 
 
 def _build_index_histogram(
@@ -2531,6 +2801,232 @@ def main() -> None:
                             help=t("help_download_index_tif", idx=idx_meta["index_key"], crs=idx_meta["crs"]),
                         )
 
+            # ---------------------------------------------------------------
+            # DODATNI ORODJI V ZAVIHKU 2: SPEKTRALNI PODPIS IN RABA TAL (HA)
+            # ---------------------------------------------------------------
+            st.divider()
+
+            # 1) Spektralni podpis točke (Spectral Signature Profiler)
+            with st.expander(t("sig_expander"), expanded=False):
+                st.caption(t("sig_caption"))
+                sig_chosen_item = items[t2_scene_idx]
+                sig_chosen_row = summary_df.iloc[t2_scene_idx]
+
+                if st.button(
+                    t("btn_load_sig"),
+                    type="primary",
+                    width="stretch",
+                    key="tab2_load_sig_btn",
+                ):
+                    with st.spinner(t("spinner_sig", date=sig_chosen_row["date_str"])):
+                        try:
+                            st.session_state["tab2_sig_ds"] = None
+                            gc.collect()
+                            sig_bands = [b for b, _, _ in OPTICAL_SIGNATURE_BANDS]
+                            if t2_mask_clouds:
+                                sig_bands.append("QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL")
+
+                            ds_sig_raw = load_scene(
+                                sensor=active_sensor,
+                                item=sig_chosen_item,
+                                bbox_4326=active_bbox,
+                                bands=sig_bands,
+                                target_epsg=target_crs,
+                                resolution=float(selected_resolution),
+                                aoi_polygon_4326=active_polygon,
+                            )
+                            ds_sig_clean, _ = apply_cloud_mask(ds_sig_raw, mask_clouds=t2_mask_clouds)
+                            del ds_sig_raw
+                            gc.collect()
+
+                            st.session_state["tab2_sig_ds"] = ds_sig_clean
+                            st.session_state["tab2_sig_meta"] = {
+                                "sensor": active_sensor,
+                                "sensor_name": active_sensor_cfg["short_name"],
+                                "date_str": str(sig_chosen_row["date_str"]),
+                                "crs": target_crs,
+                                "scene_id": str(sig_chosen_row["id"]),
+                                "resolution_m": int(selected_resolution),
+                            }
+                        except Exception as exc:
+                            st.error(t("sig_error", err=exc))
+
+                sig_ds: xr.Dataset | None = st.session_state["tab2_sig_ds"]
+                sig_meta: dict[str, Any] | None = st.session_state["tab2_sig_meta"]
+                if (
+                    sig_ds is not None
+                    and sig_meta is not None
+                    and sig_meta.get("sensor") == active_sensor
+                ):
+                    x_arr = np.asarray(sig_ds.coords["x"].values, dtype=np.float64)
+                    y_arr = np.asarray(sig_ds.coords["y"].values, dtype=np.float64)
+                    x_min, x_max = float(x_arr.min()), float(x_arr.max())
+                    y_min, y_max = float(y_arr.min()), float(y_arr.max())
+                    x_mid = 0.5 * (x_min + x_max)
+                    y_mid = 0.5 * (y_min + y_max)
+                    step_m = max(1.0, float(sig_meta["resolution_m"]))
+
+                    col_sx, col_sy = st.columns(2)
+                    with col_sx:
+                        sample_x = st.slider(
+                            t("sig_x_label"),
+                            min_value=x_min,
+                            max_value=x_max if x_max > x_min else x_min + step_m,
+                            value=x_mid,
+                            step=step_m,
+                            format="%.0f",
+                            key=f"tab2_sig_x_{sig_meta['scene_id']}",
+                        )
+                    with col_sy:
+                        sample_y = st.slider(
+                            t("sig_y_label"),
+                            min_value=y_min,
+                            max_value=y_max if y_max > y_min else y_min + step_m,
+                            value=y_mid,
+                            step=step_m,
+                            format="%.0f",
+                            key=f"tab2_sig_y_{sig_meta['scene_id']}",
+                        )
+
+                    sig_df = extract_spectral_signature(sig_ds, sample_x, sample_y)
+                    st.caption(
+                        t(
+                            "sig_snapped_caption",
+                            crs=sig_meta["crs"],
+                            x=sig_df.attrs["actual_x"],
+                            y=sig_df.attrs["actual_y"],
+                            date=sig_meta["date_str"],
+                        )
+                    )
+                    if sig_df.empty or sig_df["reflectance"].isna().all():
+                        st.warning(t("sig_nodata_warn"))
+                    else:
+                        sig_fig = _build_spectral_signature_chart(
+                            sig_df=sig_df,
+                            sensor_name=sig_meta["sensor_name"],
+                            date_str=sig_meta["date_str"],
+                        )
+                        st.plotly_chart(sig_fig, width="stretch", key="tab2_sig_plotly_chart")
+
+            # 2) Hitro razvrščanje rabe tal in površine v hektarjih (Quick Land-Cover Breakdown)
+            with st.expander(t("lc_expander"), expanded=False):
+                st.caption(t("lc_caption"))
+                lc_chosen_item = items[t2_scene_idx]
+                lc_chosen_row = summary_df.iloc[t2_scene_idx]
+
+                if st.button(
+                    t("btn_compute_lc"),
+                    type="primary",
+                    width="stretch",
+                    key="tab2_compute_lc_btn",
+                ):
+                    with st.spinner(t("spinner_lc", date=lc_chosen_row["date_str"])):
+                        try:
+                            st.session_state["tab2_lc_df"] = None
+                            st.session_state["tab2_lc_tif_bytes"] = None
+                            gc.collect()
+
+                            # Če je 6-kanalni profil za ta posnetek že v pomnilniku, ga ponovno uporabimo!
+                            reuse_ds = (
+                                st.session_state["tab2_sig_ds"]
+                                if (
+                                    st.session_state["tab2_sig_ds"] is not None
+                                    and st.session_state["tab2_sig_meta"] is not None
+                                    and st.session_state["tab2_sig_meta"].get("scene_id")
+                                    == str(lc_chosen_row["id"])
+                                    and st.session_state["tab2_sig_meta"].get("crs") == target_crs
+                                    and st.session_state["tab2_sig_meta"].get("resolution_m")
+                                    == int(selected_resolution)
+                                )
+                                else None
+                            )
+                            if reuse_ds is not None:
+                                ds_lc_clean = reuse_ds
+                            else:
+                                lc_bands = ["B03", "B04", "B08"]
+                                if t2_mask_clouds:
+                                    lc_bands.append(
+                                        "QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL"
+                                    )
+                                ds_lc_raw = load_scene(
+                                    sensor=active_sensor,
+                                    item=lc_chosen_item,
+                                    bbox_4326=active_bbox,
+                                    bands=lc_bands,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    aoi_polygon_4326=active_polygon,
+                                )
+                                ds_lc_clean, _ = apply_cloud_mask(ds_lc_raw, mask_clouds=t2_mask_clouds)
+                                del ds_lc_raw
+
+                            lc_da, lc_df = compute_quick_land_cover(
+                                ds_lc_clean, resolution_m=float(selected_resolution)
+                            )
+                            if reuse_ds is None:
+                                del ds_lc_clean
+                            lc_tif = export_to_geotiff_bytes(lc_da, target_epsg=target_crs)
+                            del lc_da
+                            gc.collect()
+
+                            epsg_num = target_crs.replace("EPSG:", "")
+                            prefix = active_sensor_cfg["file_prefix"]
+                            st.session_state["tab2_lc_df"] = lc_df
+                            st.session_state["tab2_lc_meta"] = {
+                                "sensor": active_sensor,
+                                "date_str": str(lc_chosen_row["date_str"]),
+                                "crs": target_crs,
+                                "resolution_m": int(selected_resolution),
+                                "valid_area_ha": float(lc_df.attrs.get("valid_area_ha", 0.0)),
+                            }
+                            st.session_state["tab2_lc_tif_bytes"] = lc_tif
+                            st.session_state["tab2_lc_tif_filename"] = (
+                                f"{prefix}_{lc_chosen_row['date_str']}_LandCover_"
+                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                            )
+                        except Exception as exc:
+                            st.error(t("lc_error", err=exc))
+
+                lc_df_show: pd.DataFrame | None = st.session_state["tab2_lc_df"]
+                lc_meta: dict[str, Any] | None = st.session_state["tab2_lc_meta"]
+                if (
+                    lc_df_show is not None
+                    and lc_meta is not None
+                    and lc_meta.get("sensor") == active_sensor
+                ):
+                    if lc_meta["valid_area_ha"] <= 0.0:
+                        st.warning(t("t2_no_valid_pixels"))
+                    else:
+                        lc_table = pd.DataFrame(
+                            {
+                                t("lc_col_class"): [
+                                    t(f"lc_{ck}", lang=lang) for ck in lc_df_show["class_key"]
+                                ],
+                                t("lc_col_rule"): lc_df_show["rule"],
+                                t("lc_col_area"): lc_df_show["area_ha"].map(lambda v: f"{v:,.2f}"),
+                                t("lc_col_share"): lc_df_show["share_pct"].map(lambda v: f"{v:.1f} %"),
+                            }
+                        )
+                        st.dataframe(lc_table, width="stretch", hide_index=True)
+
+                        lc_bar = _build_land_cover_bar_chart(
+                            lc_df=lc_df_show,
+                            date_str=lc_meta["date_str"],
+                            total_valid_ha=lc_meta["valid_area_ha"],
+                            lang=lang,
+                        )
+                        st.plotly_chart(lc_bar, width="stretch", key="tab2_lc_bar_chart")
+
+                        lc_tif_bytes = st.session_state["tab2_lc_tif_bytes"]
+                        if lc_tif_bytes:
+                            st.download_button(
+                                label=t("btn_download_lc_tif"),
+                                data=lc_tif_bytes,
+                                file_name=st.session_state["tab2_lc_tif_filename"] or "land_cover.tif",
+                                mime="image/tiff",
+                                width="stretch",
+                            )
+
     # =======================================================================
     # ZAVIHEK 3: ČASOVNE VRSTE IN ZAZNAVA SPREMEMB (Δ = t2 - t1)
     # =======================================================================
@@ -2783,6 +3279,12 @@ def main() -> None:
                                 aoi_polygon_4326=active_polygon,
                             )
                             diff_tif = export_to_geotiff_bytes(da_diff, target_epsg=target_crs)
+                            swipe_t1_png, swipe_t2_png = render_change_swipe_pair(
+                                da_t1=da_t1,
+                                da_t2=da_t2,
+                                index_key=ch_metric_key,
+                                is_sar=is_sar_t3,
+                            )
                             epsg_num = target_crs.replace("EPSG:", "")
                             prefix = active_sensor_cfg["file_prefix"]
                             diff_fname = (
@@ -2803,6 +3305,8 @@ def main() -> None:
                             }
                             st.session_state["tab3_change_tif_bytes"] = diff_tif
                             st.session_state["tab3_change_tif_filename"] = diff_fname
+                            st.session_state["tab3_swipe_png_t1"] = swipe_t1_png
+                            st.session_state["tab3_swipe_png_t2"] = swipe_t2_png
                             gc.collect()
                         except Exception as exc:
                             st.error(t("change_error", err=exc))
@@ -2897,6 +3401,20 @@ def main() -> None:
                             key="tab3_change_plotly_viewer",
                         )
 
+                        # Interaktivna zavesa Prej / Potem (t₁ ↔ t₂)
+                        swipe_t1 = st.session_state.get("tab3_swipe_png_t1")
+                        swipe_t2 = st.session_state.get("tab3_swipe_png_t2")
+                        if swipe_t1 and swipe_t2:
+                            st.markdown(f"#### {t('swipe_header')}")
+                            st.caption(t("swipe_hint"))
+                            _render_before_after_swipe_html(
+                                png_t1_bytes=swipe_t1,
+                                png_t2_bytes=swipe_t2,
+                                label_t1=f"t₁: {ch_meta['date_t1']} ({idx_lbl})",
+                                label_t2=f"t₂: {ch_meta['date_t2']} ({idx_lbl})",
+                                height=520,
+                            )
+
                         diff_bytes = st.session_state["tab3_change_tif_bytes"]
                         if diff_bytes:
                             st.download_button(
@@ -2905,6 +3423,179 @@ def main() -> None:
                                 file_name=st.session_state["tab3_change_tif_filename"] or "change_map.tif",
                                 mime="image/tiff",
                                 width="stretch",
+                            )
+
+            # ---------------------------------------------------------------
+            # SEKCIJA C: VIZUALNI TIMELAPSE (GIF + INTERAKTIVNI DRSNIK DATUMOV)
+            # ---------------------------------------------------------------
+            st.divider()
+            st.subheader(t("t3_sec_c_header"))
+            st.caption(t("t3_sec_c_caption"))
+
+            if len(items) < 2:
+                st.info(t("tl_need_two_scenes"))
+            else:
+                if is_sar_t3:
+                    tl_layer_options = ["VV", "VH", "VV_VH"]
+                else:
+                    tl_layer_options = ["RGB", "NIR", "NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
+
+                def _fmt_tl_layer(code: str, _lang: str = lang) -> str:
+                    if code == "RGB":
+                        return t("vis_rgb_label", lang=_lang)
+                    if code == "NIR":
+                        return t("vis_nir_label", lang=_lang)
+                    if code in SAR_METRICS:
+                        return t(f"sar_{code}_label", lang=_lang)
+                    return t(f"idx_{code}_label", lang=_lang)
+
+                col_tl_layer, col_tl_n, col_tl_spd = st.columns([1.4, 1.0, 0.8])
+                with col_tl_layer:
+                    tl_layer_code = st.selectbox(
+                        t("tl_layer_label"),
+                        options=tl_layer_options,
+                        index=0,
+                        format_func=_fmt_tl_layer,
+                        key=f"tab3_tl_layer_{active_sensor}",
+                    )
+                with col_tl_n:
+                    avail_tl = len(items)
+                    if avail_tl <= 3:
+                        tl_num_frames = avail_tl
+                        st.caption(f"{t('tl_frames_label')} **{avail_tl}**")
+                    else:
+                        tl_max = min(15, avail_tl)
+                        tl_default = min(8, tl_max)
+                        tl_num_frames = st.slider(
+                            t("tl_frames_label"),
+                            min_value=3,
+                            max_value=tl_max,
+                            value=tl_default,
+                            step=1,
+                            help=t("tl_frames_help"),
+                            key=f"tab3_tl_frames_{active_sensor}",
+                        )
+                with col_tl_spd:
+                    tl_speed_sec = st.selectbox(
+                        t("tl_speed_label"),
+                        options=[0.4, 0.8, 1.2],
+                        index=1,
+                        format_func=lambda s: f"{s:.1f} s",
+                        key="tab3_tl_speed",
+                    )
+
+                tl_clicked = st.button(
+                    t("btn_generate_tl"),
+                    type="primary",
+                    width="stretch",
+                    key="tab3_tl_btn",
+                )
+
+                if tl_clicked and active_bbox is not None:
+                    tl_items = _select_evenly_spaced_items(items, int(tl_num_frames))
+                    tl_prog = st.progress(0.0)
+                    tl_status = st.empty()
+
+                    def _on_tl_progress(step: int, total: int, label: str) -> None:
+                        frac = min(max(step / max(total, 1), 0.0), 1.0)
+                        tl_prog.progress(frac)
+                        if step < total:
+                            tl_status.caption(t("tl_progress", cur=step + 1, tot=total, date=label))
+
+                    try:
+                        st.session_state["tab3_timelapse_data"] = None
+                        gc.collect()
+
+                        tl_result = generate_timelapse_frames(
+                            items=tl_items,
+                            bbox_4326=active_bbox,
+                            layer_mode=tl_layer_code,
+                            target_epsg=target_crs,
+                            resolution=float(selected_resolution),
+                            sensor=active_sensor,
+                            aoi_polygon_4326=active_polygon,
+                            mask_clouds=(not is_sar_t3),
+                            min_valid_pct=10.0,
+                            duration_ms=int(round(tl_speed_sec * 1000)),
+                            max_width=700,
+                            progress_callback=_on_tl_progress,
+                        )
+                        tl_prog.empty()
+                        tl_status.empty()
+
+                        tl_result["duration_ms"] = int(round(tl_speed_sec * 1000))
+                        tl_result["prefix"] = active_sensor_cfg["file_prefix"]
+                        tl_result["resolution_m"] = int(selected_resolution)
+                        st.session_state["tab3_timelapse_data"] = tl_result
+                        gc.collect()
+                    except Exception as exc:
+                        tl_prog.empty()
+                        tl_status.empty()
+                        st.error(t("tl_error", err=exc))
+
+                tl_data: dict[str, Any] | None = st.session_state["tab3_timelapse_data"]
+                if tl_data is not None and tl_data.get("sensor") == active_sensor:
+                    tl_frames: list[dict[str, Any]] = tl_data.get("frames", [])
+                    tl_skipped = tl_data.get("skipped", [])
+
+                    if tl_skipped:
+                        st.info(t("ts_skipped_info", n=len(tl_skipped)))
+
+                    if not tl_frames:
+                        st.warning(t("tl_empty_warn"))
+                    else:
+                        # Ob spremembi hitrosti ponovno sestavimo GIF iz predpomnjenih PNG sličic
+                        desired_ms = int(round(tl_speed_sec * 1000))
+                        if tl_data.get("duration_ms") != desired_ms or not tl_data.get("gif_bytes"):
+                            tl_data["gif_bytes"] = compile_timelapse_gif(
+                                [f["png_bytes"] for f in tl_frames],
+                                duration_ms=desired_ms,
+                            )
+                            tl_data["duration_ms"] = desired_ms
+
+                        col_gif_l, col_gif_c, col_gif_r = st.columns([0.12, 0.76, 0.12])
+                        with col_gif_c:
+                            st.image(tl_data["gif_bytes"], width="stretch")
+
+                        tl_fname = (
+                            f"{tl_data['prefix']}_timelapse_{tl_data['layer_mode']}_"
+                            f"{tl_frames[0]['date_str']}_to_{tl_frames[-1]['date_str']}_"
+                            f"{tl_data['resolution_m']}m.gif"
+                        )
+                        st.download_button(
+                            label=t("btn_download_tl_gif"),
+                            data=tl_data["gif_bytes"],
+                            file_name=tl_fname,
+                            mime="image/gif",
+                            width="stretch",
+                        )
+
+                        # Interaktivni drsnik po datumih (frame-by-frame scrubber)
+                        st.markdown(f"#### {t('tl_scrubber_header')}")
+                        if len(tl_frames) == 1:
+                            chosen_frame = tl_frames[0]
+                        else:
+                            frame_indices = list(range(len(tl_frames)))
+                            scrub_idx = st.select_slider(
+                                t("tl_scrubber_label"),
+                                options=frame_indices,
+                                value=len(tl_frames) - 1,
+                                format_func=lambda idx: f"{tl_frames[idx]['date_str']} ({tl_frames[idx]['platform']})",
+                                key=f"tab3_tl_scrubber_{active_sensor}_{tl_data['layer_mode']}",
+                            )
+                            chosen_frame = tl_frames[int(scrub_idx)]
+
+                        col_sc_l, col_sc_c, col_sc_r = st.columns([0.12, 0.76, 0.12])
+                        with col_sc_c:
+                            st.image(chosen_frame["png_bytes"], width="stretch")
+                            st.caption(
+                                t(
+                                    "tl_frame_caption",
+                                    date=chosen_frame["date_str"],
+                                    platform=chosen_frame["platform"],
+                                    valid=chosen_frame["valid_pct"],
+                                    scene_id=chosen_frame["scene_id"],
+                                )
                             )
 
 

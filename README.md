@@ -12,20 +12,21 @@ Geodetsko natančna spletna aplikacija za obdelavo in analizo večsenzorskih sat
   - **Sentinel-2 L2A (`10 m` | `2015–danes`):** optični posnetki visoke ločljivosti z ESA PB `>= 04.00` kalibracijo in SCL oblačno masko.
   - **Landsat C2 L2 (`30 m` | `1984–danes`):** več kot 40-letni arhiv Landsat 4/5/7/8/9, harmoniziran na logične kanale (`B02/B03/B04/B08/B11/B12`), z uradno USGS kalibracijo odbojnosti (`DN × 0.0000275 − 0.2`), označevanjem/filtriranjem Landsat 7 SLC-off in bitno oblačno masko `QA_PIXEL`.
   - **Sentinel-1 SAR RTC (`10 m` | `Radar — skozi oblake`):** radarski posnetki C-band SAR (neodvisno od oblačnosti) s pretvorbo linearne jakosti v decibele (`10 · log10(max(val, 1e-6))`), vizualizacijo `VV [dB]`, `VH [dB]` in `SAR False Color (R: VV, G: VH, B: VV/VH)`.
-- **5 načinov določitve območja zanimanja (AOI) / 5 AOI Selection Modes:**
-  - Interaktivni zemljevid (klik + metrični radij v `EPSG:3794`)
+- **5 načinov določitve območja zanimanja (AOI) + iskanje krajev / 5 AOI Modes + Place Search:**
+  - Velik 600 px interaktivni zemljevid (klik + metrični radij v `EPSG:3794`) in iskanje po imenu kraja (**Nominatim** s prednostjo za Slovenijo)
   - **Interaktivno risanje poligona / pravokotnika** (`folium.plugins.Draw`) z natančnim izrezom rastrov (`rioxarray.rio.clip`) za vse karte, statistiko in časovne vrste
   - Ročni vnos koordinat v **D96/TM (`e, n [m]`)** ali **WGS84 (`lat, lon [°]`)** s pretvorbo v živo
   - 6 prednastavljenih lokacij v Sloveniji (*Ljubljana*, *Triglav / Bohinjsko jezero*, *Maribor / Pohorje*, *Koper / Sečoveljske soline*, *Kras (požarišče)*, *Mura / Prekmurje*)
   - Nalaganje lastnega **GeoJSON** poligona (`EPSG:4326`, z natančnim `rio.clip` izrezom)
 - **Zavihek 1 — Iskanje posnetkov in pregled (RGB / NIR / SWIR / SAR):**
-  - Iskanje po senzorju, datumu in oblačnosti (pri SAR brez oblačnega filtra), kontrastni razteg (2 %–98 %), gama korekcija, geodetska koordinatna mreža in izvoz večkanalnega **GeoTIFF (.tif)** za QGIS / ArcGIS.
-- **Zavihek 2 — Spektralni indeksi ali SAR maska voda / poplav:**
-  - *Optika (S2 & Landsat):* **NDVI**, **NDWI**, **MNDWI**, **NDBI** in **NBR**, samodejna oblačna maska (`SCL` ali `QA_PIXEL`), statistika v hektarjih (`ha`), interaktivni histogram in izvoz **float32 GeoTIFF**.
+  - Interaktivni **Plotly zoom/pan** prikazovalnik s fiksno višino (`580 px`, merilo 1:1, sever zgoraj), kontrastni razteg (2 %–98 %), gama korekcija in izvoz večkanalnega **GeoTIFF (.tif)** za QGIS / ArcGIS.
+- **Zavihek 2 — Spektralni indeksi, spektralni podpis, raba tal ali SAR maska voda / poplav:**
+  - *Optika (S2 & Landsat):* **NDVI**, **NDWI**, **MNDWI**, **NDBI** in **NBR**, samodejna oblačna maska (`SCL` ali `QA_PIXEL`), **spektralni podpis točke (`490–2190 nm`)**, **hitro razvrščanje rabe tal v 4 razrede (`ha` in `%`)**, interaktivni histogram in izvoz **GeoTIFF**.
   - *Radar (Sentinel-1 SAR):* dinamična maska vodnih površin in poplav (`VV < prag [dB]`, privzeto `-16.0 dB`) z izračunom površine v `ha`, histogramom `VV [dB]` in izvozom dvoklasne maske kot **uint8 GeoTIFF**.
-- **Zavihek 3 — Časovne vrste in zaznava sprememb ($\Delta = t_2 - t_1$):**
-  - Pomnilniško varna sekvenčna obdelava časovne vrste za vse 3 senzorje (ena epoha v RAM-u naenkrat; za optiko samodejno preskakovanje oblačnih epoh z `< 10 %` veljavnih pikslov), interaktivni Plotly graf (`Mean`, `Median`, pas `P10–P90`) z izvozom **CSV**.
-  - Natančna 1-na-1 pikselska zaznava sprememb med dvema datumoma (`rioxarray.reproject_match`), analiza površin porasta/upada v `ha` (vključno z $\Delta\text{VV [dB]}$ za SAR) in izvoz karte sprememb **GeoTIFF**.
+- **Zavihek 3 — Časovne vrste, zaznava sprememb ($\Delta = t_2 - t_1$), Prej/Potem drsnik in Timelapse:**
+  - Pomnilniško varna sekvenčna časovna vrsta za vse 3 senzorje (ena epoha v RAM-u naenkrat), interaktivni Plotly graf (`Mean`, `Median`, pas `P10–P90`) z izvozom **CSV**.
+  - Natančna 1-na-1 pikselska zaznava sprememb med dvema datumoma (`rioxarray.reproject_match`), **interaktivni drsnik Prej / Potem (t₁ ↔ t₂)**, analiza površin porasta/upada v `ha` in izvoz karte sprememb **GeoTIFF**.
+  - **Vizualni Timelapse (GIF + drsnik po datumih):** pomnilniško varna animacija sprememb skozi čas (RGB, NIR, indeksi ali SAR VV dB) z datumskim žigom, prenosom `.gif` in ročnim pregledovanjem posameznih datumov.
 
 ---
 
