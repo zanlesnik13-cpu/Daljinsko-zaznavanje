@@ -13,8 +13,10 @@ from __future__ import annotations
 import base64
 import gc
 import json
+import re
+import unicodedata
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
 import folium
 from folium.plugins import Draw
@@ -296,6 +298,11 @@ div[data-testid="stExpander"] {
     border-radius: var(--geo-radius);
     background-color: var(--geo-surface);
 }
+/* Prepreči prikaz besedilnega kurzorja / virtualne tipkovnice v spustnih menijih na tablicah */
+[data-baseweb="select"] input {
+    caret-color: transparent !important;
+    cursor: pointer !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -307,6 +314,8 @@ div[data-testid="stExpander"] {
 SLOVENIA_CENTER_LAT: float = 46.1512
 SLOVENIA_CENTER_LON: float = 14.9955
 SLOVENIA_DEFAULT_ZOOM: int = 8
+
+PHOTON_SEARCH_URL: str = "https://photon.komoot.io/api/"
 
 NOMINATIM_SEARCH_URL: str = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_USER_AGENT: str = "DaljinskoZaznavanjeSLO/1.0 (https://github.com/zanlesnik13-cpu/Daljinsko-zaznavanje)"
@@ -358,10 +367,63 @@ SLOVENIA_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+SLOVENIA_PLACES_FALLBACK: dict[str, tuple[float, float]] = {
+    "Ljubljana": (46.0569, 14.5058),
+    "Maribor": (46.5547, 15.6459),
+    "Celje": (46.2397, 15.2677),
+    "Kranj": (46.2389, 14.3556),
+    "Koper": (45.5481, 13.7302),
+    "Novo mesto": (45.8040, 15.1689),
+    "Nova Gorica": (45.9560, 13.6484),
+    "Velenje": (46.3592, 15.1103),
+    "Murska Sobota": (46.6625, 16.1664),
+    "Ptuj": (46.4201, 15.8702),
+    "Bled": (46.3683, 14.1146),
+    "Bohinj": (46.2788, 13.8842),
+    "Bohinjsko jezero": (46.2830, 13.8580),
+    "Triglav": (46.3789, 13.8367),
+    "Postojna": (45.7744, 14.2153),
+    "Kamnik": (46.2259, 14.6121),
+    "Domžale": (46.1377, 14.5937),
+    "Škofja Loka": (46.1655, 14.3063),
+    "Jesenice": (46.4306, 14.0669),
+    "Izola": (45.5369, 13.6619),
+    "Piran": (45.5283, 13.5683),
+    "Portorož": (45.5143, 13.5921),
+    "Slovenj Gradec": (46.5103, 15.0804),
+    "Krško": (45.9591, 15.4917),
+    "Brežice": (45.9033, 15.5911),
+    "Kočevje": (45.6433, 14.8633),
+    "Idrija": (46.0028, 14.0306),
+    "Tolmin": (46.1830, 13.7332),
+    "Bovec": (46.3380, 13.5524),
+    "Kranjska Gora": (46.4845, 13.7857),
+    "Logarska dolina": (46.3910, 14.6290),
+    "Kras": (45.8550, 13.6450),
+    "Sečovlje": (45.4930, 13.6130),
+    "Sečoveljske soline": (45.4930, 13.6130),
+    "Pohorje": (46.5180, 15.4750),
+    "Cerknica": (45.7931, 14.3625),
+    "Cerkniško jezero": (45.7520, 14.3750),
+    "Ribnica": (45.7386, 14.7275),
+    "Trbovlje": (46.1550, 15.0533),
+    "Zagorje": (46.1318, 14.9969),
+    "Zagorje ob Savi": (46.1318, 14.9969),
+    "Litija": (46.0586, 14.8225),
+    "Grosuplje": (45.9556, 14.6589),
+    "Vrhnika": (45.9635, 14.2948),
+    "Ajdovščina": (45.8860, 13.9095),
+    "Sežana": (45.7092, 13.8733),
+    "Radovljica": (46.3444, 14.1744),
+    "Ljubljansko barje": (45.9950, 14.4600),
+    "Velika planina": (46.2940, 14.6470),
+}
+
 SENSOR_KEYS: list[str] = [SENSOR_S2, SENSOR_LANDSAT, SENSOR_S1]
 SENSOR_META: dict[str, dict[str, Any]] = {
     SENSOR_S2: {
         "label_key": "sensor_s2_label",
+        "pill_key": "sensor_s2_pill",
         "short_name": "Sentinel-2 L2A",
         "file_prefix": "S2L2A",
         "min_date": date(2015, 6, 23),
@@ -370,6 +432,7 @@ SENSOR_META: dict[str, dict[str, Any]] = {
     },
     SENSOR_LANDSAT: {
         "label_key": "sensor_landsat_label",
+        "pill_key": "sensor_landsat_pill",
         "short_name": "Landsat C2 L2",
         "file_prefix": "LandsatC2L2",
         "min_date": date(1984, 1, 1),
@@ -378,6 +441,7 @@ SENSOR_META: dict[str, dict[str, Any]] = {
     },
     SENSOR_S1: {
         "label_key": "sensor_s1_label",
+        "pill_key": "sensor_s1_pill",
         "short_name": "Sentinel-1 SAR RTC",
         "file_prefix": "S1RTC",
         "min_date": date(2014, 10, 1),
@@ -411,6 +475,13 @@ BASEMAP_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
+LOC_MODE_KEYS: list[str] = ["place", "d96", "wgs84"]
+LOC_MODE_I18N: dict[str, str] = {
+    "place": "loc_mode_place",
+    "d96": "loc_mode_d96",
+    "wgs84": "loc_mode_wgs84",
+}
+
 AOI_MODE_KEYS: list[str] = ["map", "draw", "manual", "preset", "geojson"]
 AOI_MODE_I18N: dict[str, str] = {
     "map": "aoi_mode_map",
@@ -429,21 +500,28 @@ CRS_SHORT_I18N: dict[str, str] = {
     CRS_D96TM: "crs_short_d96",
     CRS_UTM33N: "crs_short_utm",
 }
+CRS_PILL_I18N: dict[str, str] = {
+    CRS_D96TM: "crs_pill_d96",
+    CRS_UTM33N: "crs_pill_utm",
+}
 
 OPTICAL_COMPOSITE_SPECS: dict[str, dict[str, Any]] = {
     "RGB": {
         "bands": ["B04", "B03", "B02"],
         "label_key": "vis_rgb_label",
+        "pill_key": "vis_rgb_pill",
         "desc_key": "vis_rgb_desc",
     },
     "NIR": {
         "bands": ["B08", "B04", "B03"],
         "label_key": "vis_nir_label",
+        "pill_key": "vis_nir_pill",
         "desc_key": "vis_nir_desc",
     },
     "SWIR": {
         "bands": ["B12", "B08", "B04"],
         "label_key": "vis_swir_label",
+        "pill_key": "vis_swir_pill",
         "desc_key": "vis_swir_desc",
     },
 }
@@ -453,18 +531,21 @@ SAR_VIS_SPECS: dict[str, dict[str, Any]] = {
         "bands": ["vv"],
         "var_names": ["VV"],
         "label_key": "sar_vis_vv_label",
+        "pill_key": "sar_vis_vv_pill",
         "desc_key": "sar_vis_vv_desc",
     },
     "VH": {
         "bands": ["vh"],
         "var_names": ["VH"],
         "label_key": "sar_vis_vh_label",
+        "pill_key": "sar_vis_vh_pill",
         "desc_key": "sar_vis_vh_desc",
     },
     "SAR_FC": {
         "bands": ["vv", "vh"],
         "var_names": ["VV", "VH"],
         "label_key": "sar_vis_fc_label",
+        "pill_key": "sar_vis_fc_pill",
         "desc_key": "sar_vis_fc_desc",
     },
 }
@@ -498,6 +579,9 @@ def _init_session_state() -> None:
         "tab3_max_cloud": 20,
         "exclude_l7_slc_off": False,
         "map_basemap": "satellite",
+        "loc_search_mode": "place",
+        "sidebar_aoi_mode": "map",
+        "pending_aoi_mode": None,
         "map_lat": SLOVENIA_CENTER_LAT,
         "map_lon": SLOVENIA_CENTER_LON,
         "map_zoom": 10,
@@ -626,11 +710,15 @@ def _clamp_dates_for_sensor(sensor_key: str) -> None:
 
 def _sync_sensor_state(source_key: str | None = None, explicit_sensor: str | None = None) -> None:
     """Sinhronizira izbrani senzor med stransko vrstico, glavno vrstico AOI in Zavihkom 3."""
-    new_sensor = explicit_sensor if explicit_sensor is not None else st.session_state.get(source_key or "selected_sensor", SENSOR_S2)
-    if new_sensor not in SENSOR_KEYS:
-        return
+    prev_sensor = str(st.session_state.get("selected_sensor", SENSOR_S2))
+    raw_val = (
+        explicit_sensor
+        if explicit_sensor is not None
+        else st.session_state.get(source_key or "selected_sensor", prev_sensor)
+    )
+    # Če uporabnik ponovno tapne že izbran gumb v segmented_control, ohranimo prejšnji senzor
+    new_sensor = raw_val if raw_val in SENSOR_KEYS else prev_sensor
 
-    prev_sensor = st.session_state.get("selected_sensor", SENSOR_S2)
     st.session_state["selected_sensor"] = new_sensor
     st.session_state["active_sensor"] = new_sensor
     st.session_state["sidebar_sensor_select"] = new_sensor
@@ -731,11 +819,210 @@ def _execute_stac_search(
     _clear_loaded_products()
 
 
+def _touch_selector(
+    label: str,
+    options: list[Any],
+    *,
+    default: Any = None,
+    format_func: Callable[[Any], str] | None = None,
+    key: str | None = None,
+    help: str | None = None,
+    on_change: Callable[..., Any] | None = None,
+    args: tuple[Any, ...] | None = None,
+    label_visibility: str = "visible",
+    use_pills: bool = False,
+) -> Any:
+    """Dotiku prijazen izbirnik (segmented_control / pills z rezervnim horizontalnim radio).
+
+    Na tablicah nikoli ne odpre virtualne tipkovnice in vedno vrne veljavno vrednost iz ``options``.
+    """
+    shadow_key = f"__touch_last_{key}" if key is not None else None
+    last_valid = st.session_state.get(shadow_key) if shadow_key is not None else None
+    fallback_val = (
+        last_valid
+        if (last_valid in options)
+        else (default if (default in options) else options[0])
+    )
+    has_preset_state = key is not None and key in st.session_state
+    if has_preset_state and st.session_state[key] not in options:
+        st.session_state[key] = fallback_val
+
+    widget_fn = None
+    if use_pills and hasattr(st, "pills"):
+        widget_fn = st.pills
+    elif hasattr(st, "segmented_control"):
+        widget_fn = st.segmented_control
+
+    if widget_fn is not None:
+        kw: dict[str, Any] = {
+            "label": label,
+            "options": options,
+            "selection_mode": "single",
+            "label_visibility": label_visibility,
+        }
+        if format_func is not None:
+            kw["format_func"] = format_func
+        if key is not None:
+            kw["key"] = key
+        if not has_preset_state:
+            kw["default"] = fallback_val
+        if help is not None:
+            kw["help"] = help
+        if on_change is not None:
+            kw["on_change"] = on_change
+            if args is not None:
+                kw["args"] = args
+        val = widget_fn(**kw)
+        resolved = val if (val in options) else fallback_val
+        if shadow_key is not None:
+            st.session_state[shadow_key] = resolved
+        return resolved
+
+    r_kw: dict[str, Any] = {
+        "label": label,
+        "options": options,
+        "horizontal": True,
+        "label_visibility": label_visibility,
+    }
+    if format_func is not None:
+        r_kw["format_func"] = format_func
+    if key is not None:
+        r_kw["key"] = key
+    if not has_preset_state:
+        r_kw["index"] = options.index(fallback_val)
+    if help is not None:
+        r_kw["help"] = help
+    if on_change is not None:
+        r_kw["on_change"] = on_change
+        if args is not None:
+            r_kw["args"] = args
+    val = st.radio(**r_kw)
+    resolved = val if (val in options) else fallback_val
+    if shadow_key is not None:
+        st.session_state[shadow_key] = resolved
+    return resolved
+
+
+def _inject_tablet_no_keyboard_js() -> None:
+    """Nastavi readonly + inputmode='none' na vse BaseWeb selectbox vnose (prepreči tipkovnico na tablicah)."""
+    components.html(
+        """
+<script>
+(function() {
+  try {
+    const doc = window.parent.document;
+    function lockSelectInputs() {
+      const inputs = doc.querySelectorAll('[data-baseweb="select"] input');
+      inputs.forEach((el) => {
+        if (el.getAttribute('inputmode') !== 'none') {
+          el.setAttribute('readonly', 'readonly');
+          el.setAttribute('inputmode', 'none');
+        }
+      });
+    }
+    lockSelectInputs();
+    if (!window.parent.__dzNoKbdObserver) {
+      const observer = new MutationObserver(lockSelectInputs);
+      observer.observe(doc.body, { childList: true, subtree: true });
+      window.parent.__dzNoKbdObserver = observer;
+    }
+  } catch (e) {}
+})();
+</script>
+""",
+        height=0,
+        width=0,
+    )
+
+
+def _normalize_place_text(text: str) -> str:
+    """Normalizira ime kraja (male črke, brez šumnikov/diakritičnih znakov) za zanesljivo ujemanje."""
+    decomposed = unicodedata.normalize("NFKD", str(text or "").strip().lower())
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
+_COORD_PAIR_RE = re.compile(
+    r"^\s*([+-]?\d+(?:\.\d+)?)\s*[,;\s]+\s*([+-]?\d+(?:\.\d+)?)\s*$"
+)
+
+
+def _parse_direct_coords(query: str) -> tuple[float, float, str] | None:
+    """Zazna prilepljene koordinate WGS84 (lat, lon) ali D96/TM (e, n > 1000)."""
+    match = _COORD_PAIR_RE.match(str(query or "").strip())
+    if not match:
+        return None
+    try:
+        v1 = float(match.group(1))
+        v2 = float(match.group(2))
+    except ValueError:
+        return None
+
+    # D96/TM EPSG:3794 (vrednosti v metrih > 1000)
+    if abs(v1) > 1000.0 and abs(v2) > 1000.0:
+        try:
+            lon, lat = transform_coords(v1, v2, EPSG_D96TM, EPSG_WGS84)
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
+                return float(lat), float(lon), f"D96/TM (e = {v1:,.1f} m, n = {v2:,.1f} m)"
+        except Exception:
+            return None
+        return None
+
+    # WGS84 (lat, lon) v stopinjah
+    if -90.0 <= v1 <= 90.0 and -180.0 <= v2 <= 180.0:
+        return float(v1), float(v2), f"WGS84 ({v1:.5f}°, {v2:.5f}°)"
+    return None
+
+
+def _geocode_photon(query: str) -> tuple[float, float, str] | None:
+    """Primarni spletni geokoder: Photon (Komoot), usmerjen proti Sloveniji."""
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+    params = {
+        "q": query,
+        "limit": 5,
+        "lat": SLOVENIA_CENTER_LAT,
+        "lon": SLOVENIA_CENTER_LON,
+    }
+    resp = requests.get(PHOTON_SEARCH_URL, params=params, headers=headers, timeout=6)
+    resp.raise_for_status()
+    payload = resp.json()
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, list) or not features:
+        return None
+
+    # Prednostno izberi zadetek v Sloveniji (countrycode == SI)
+    chosen = features[0]
+    for feat in features:
+        props = feat.get("properties") or {}
+        cc = str(props.get("countrycode", "")).upper()
+        country = str(props.get("country", "")).lower()
+        if cc == "SI" or "sloveni" in country:
+            chosen = feat
+            break
+
+    coords = (chosen.get("geometry") or {}).get("coordinates") or []
+    if len(coords) < 2:
+        return None
+    lon, lat = float(coords[0]), float(coords[1])
+    props = chosen.get("properties") or {}
+    name_parts = [
+        str(props.get(k, "")).strip()
+        for k in ("name", "city", "county", "country")
+        if str(props.get(k, "")).strip()
+    ]
+    dedup_parts: list[str] = []
+    for p in name_parts:
+        if p not in dedup_parts:
+            dedup_parts.append(p)
+    display_name = ", ".join(dedup_parts) if dedup_parts else query
+    return lat, lon, display_name
+
+
 def geocode_place_nominatim(
     query: str,
     lang: str = "sl",
 ) -> tuple[float, float, str] | None:
-    """Poišče koordinate kraja preko OpenStreetMap Nominatim API (najprej Slovenija, nato svet)."""
+    """Rezervni geokoder 1: OpenStreetMap Nominatim API (najprej Slovenija, nato svet)."""
     clean_q = str(query or "").strip()
     if not clean_q:
         return None
@@ -745,7 +1032,6 @@ def geocode_place_nominatim(
         "Accept-Language": f"{lang},sl;q=0.9,en;q=0.8",
     }
 
-    # 1. Poskus: prednostno iskanje v Sloveniji (countrycodes=si)
     for country_filter in ("si", None):
         params: dict[str, Any] = {
             "q": clean_q,
@@ -760,7 +1046,7 @@ def geocode_place_nominatim(
             NOMINATIM_SEARCH_URL,
             params=params,
             headers=headers,
-            timeout=8,
+            timeout=6,
         )
         resp.raise_for_status()
         results = resp.json()
@@ -772,6 +1058,82 @@ def geocode_place_nominatim(
             return lat, lon, display_name
 
     return None
+
+
+def _geocode_local_slovenia(query: str) -> tuple[float, float, str] | None:
+    """Rezervni geokoder 2: vgrajen seznam 45+ slovenskih krajev in naravnih znamenitosti."""
+    norm_q = _normalize_place_text(query)
+    if not norm_q:
+        return None
+
+    # 1. Natančno ujemanje brez šumnikov
+    for place_name, (lat, lon) in SLOVENIA_PLACES_FALLBACK.items():
+        if _normalize_place_text(place_name) == norm_q:
+            return lat, lon, f"{place_name}, Slovenija"
+
+    # 2. Delno ujemanje (začetek imena ali podniz)
+    for place_name, (lat, lon) in SLOVENIA_PLACES_FALLBACK.items():
+        norm_p = _normalize_place_text(place_name)
+        if norm_p.startswith(norm_q) or norm_q in norm_p or norm_p in norm_q:
+            return lat, lon, f"{place_name}, Slovenija"
+
+    return None
+
+
+def geocode_place(
+    query: str,
+    lang: str = "sl",
+) -> tuple[float, float, str] | None:
+    """Zanesljiv 3-stopenjski geokoder s pametnim zaznavanjem koordinat.
+
+    1. Pametno zaznavanje prilepljenih koordinat WGS84 (`lat, lon`) ali D96/TM (`e, n > 1000`).
+    2. Primarni spletni geokoder: Photon API (Komoot, usmerjen v Slovenijo).
+    3. Rezerva 1: OpenStreetMap Nominatim API.
+    4. Rezerva 2: Vgrajen lokalni slovar 45+ slovenskih krajev (brez šumnikov).
+    """
+    clean_q = str(query or "").strip()
+    if not clean_q:
+        return None
+
+    direct = _parse_direct_coords(clean_q)
+    if direct is not None:
+        return direct
+
+    try:
+        res_photon = _geocode_photon(clean_q)
+        if res_photon is not None:
+            return res_photon
+    except Exception:
+        pass
+
+    try:
+        res_nom = geocode_place_nominatim(clean_q, lang=lang)
+        if res_nom is not None:
+            return res_nom
+    except Exception:
+        pass
+
+    return _geocode_local_slovenia(clean_q)
+
+
+def _jump_to_location(lat: float, lon: float, label: str, zoom: int = 12) -> None:
+    """Premakne središče glavnega zemljevida na ``(lat, lon)``, posodobi AOI in prikaže potrditev."""
+    e_val, n_val = transform_coords(lon, lat, EPSG_WGS84, EPSG_D96TM)
+    st.session_state["map_lat"] = round(float(lat), 6)
+    st.session_state["map_lon"] = round(float(lon), 6)
+    st.session_state["map_zoom"] = int(zoom)
+    st.session_state["live_map_zoom"] = int(zoom)
+    st.session_state["last_processed_click"] = None
+    st.session_state["pending_aoi_mode"] = "map"
+    st.session_state["geocoded_place_msg"] = t(
+        "loc_jumped_banner",
+        name=label,
+        e=e_val,
+        n=n_val,
+        lat=float(lat),
+        lon=float(lon),
+    )
+    st.rerun()
 
 
 def _format_tile_label(tile: str, sensor: str = SENSOR_S2) -> str:
@@ -1974,49 +2336,129 @@ def _render_interactive_aoi_section(
     aoi_polygon_4326: dict[str, Any] | None,
     lang: str,
 ) -> None:
-    """Izriše enotno 3-stolpčno vrstico (Senzor | Kraj | Podlaga) in 600 px zemljevid AOI."""
+    """Izriše enotno vrstico (Senzor | Podlaga | Kraj / D96/TM / WGS84) in 600 px zemljevid AOI."""
     prev_basemap = str(st.session_state.get("map_basemap", "satellite"))
     if prev_basemap not in BASEMAP_KEYS:
         prev_basemap = "satellite"
 
-    with st.container(border=True):
-        col_sensor, col_place, col_bm = st.columns([1.15, 1.55, 1.35], vertical_alignment="bottom")
+    place_search_clicked = False
+    place_query = ""
+    d96_jump_clicked = False
+    e_jump = 0.0
+    n_jump = 0.0
+    wgs_jump_clicked = False
+    lat_jump = center_lat
+    lon_jump = center_lon
 
+    with st.container(border=True):
+        # Vrstica 1: Satelitski senzor + Podlaga zemljevida (dotiku prijazni gumbi brez tipkovnice)
+        col_sensor, col_bm = st.columns([1.35, 1.0], vertical_alignment="bottom")
         with col_sensor:
-            st.selectbox(
+            _touch_selector(
                 t("sensor_select_label"),
                 options=SENSOR_KEYS,
-                format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
+                default=str(st.session_state.get("selected_sensor", SENSOR_S2)),
+                format_func=lambda s, _lang=lang: t(SENSOR_META[s]["pill_key"], lang=_lang),
                 key="main_bar_sensor_select",
                 on_change=_sync_sensor_state,
                 args=("main_bar_sensor_select",),
             )
-
-        with col_place:
-            c_in, c_go = st.columns([2.35, 1.0], vertical_alignment="bottom")
-            with c_in:
-                place_query = st.text_input(
-                    t("place_search_label"),
-                    value="",
-                    placeholder=t("place_search_placeholder"),
-                    key="main_place_search_input",
-                )
-            with c_go:
-                place_search_clicked = st.button(
-                    t("btn_place_search_short"),
-                    width="stretch",
-                    key="main_place_search_btn",
-                )
-
         with col_bm:
-            selected_basemap = st.radio(
+            selected_basemap = _touch_selector(
                 t("basemap_selector_label"),
                 options=BASEMAP_KEYS,
-                index=BASEMAP_KEYS.index(prev_basemap),
-                horizontal=True,
+                default=prev_basemap,
                 format_func=lambda k, _lang=lang: t(BASEMAP_SPECS[k]["short_label_key"], lang=_lang),
-                key="main_map_basemap_radio",
+                key="main_map_basemap_ctrl",
             )
+
+        # Vrstica 2: Preklopnik načina iskanja (Kraj / D96/TM / WGS84) + obrazec za takojšen skok
+        loc_mode = _touch_selector(
+            t("loc_mode_label"),
+            options=LOC_MODE_KEYS,
+            default=str(st.session_state.get("loc_search_mode", "place")),
+            format_func=lambda k, _lang=lang: t(LOC_MODE_I18N[k], lang=_lang),
+            key="main_loc_search_mode_ctrl",
+            label_visibility="collapsed",
+        )
+        st.session_state["loc_search_mode"] = loc_mode
+
+        center_sig = f"{round(center_lat, 5)}_{round(center_lon, 5)}"
+
+        if loc_mode == "place":
+            with st.form("main_place_search_form", border=False):
+                c_in, c_go = st.columns([3.4, 1.0], vertical_alignment="bottom")
+                with c_in:
+                    place_query = st.text_input(
+                        t("place_search_label"),
+                        value="",
+                        placeholder=t("place_search_placeholder_smart"),
+                        label_visibility="collapsed",
+                        key="main_place_search_input",
+                    )
+                with c_go:
+                    place_search_clicked = st.form_submit_button(
+                        t("btn_place_search_short"),
+                        type="primary",
+                        width="stretch",
+                    )
+
+        elif loc_mode == "d96":
+            e_cur, n_cur = transform_coords(center_lon, center_lat, EPSG_WGS84, EPSG_D96TM)
+            with st.form("main_d96_jump_form", border=False):
+                c_e, c_n, c_btn = st.columns([1.2, 1.2, 1.15], vertical_alignment="bottom")
+                with c_e:
+                    e_jump = st.number_input(
+                        t("e_input_label"),
+                        value=round(float(e_cur), 1),
+                        step=100.0,
+                        format="%.1f",
+                        key=f"main_d96_e_{center_sig}",
+                    )
+                with c_n:
+                    n_jump = st.number_input(
+                        t("n_input_label"),
+                        value=round(float(n_cur), 1),
+                        step=100.0,
+                        format="%.1f",
+                        key=f"main_d96_n_{center_sig}",
+                    )
+                with c_btn:
+                    d96_jump_clicked = st.form_submit_button(
+                        t("btn_jump_coords"),
+                        type="primary",
+                        width="stretch",
+                    )
+
+        else:
+            with st.form("main_wgs84_jump_form", border=False):
+                c_lat, c_lon, c_btn = st.columns([1.2, 1.2, 1.15], vertical_alignment="bottom")
+                with c_lat:
+                    lat_jump = st.number_input(
+                        t("lat_input_label"),
+                        min_value=-90.0,
+                        max_value=90.0,
+                        value=round(float(center_lat), 6),
+                        step=0.005,
+                        format="%.6f",
+                        key=f"main_wgs84_lat_{center_sig}",
+                    )
+                with c_lon:
+                    lon_jump = st.number_input(
+                        t("lon_input_label"),
+                        min_value=-180.0,
+                        max_value=180.0,
+                        value=round(float(center_lon), 6),
+                        step=0.005,
+                        format="%.6f",
+                        key=f"main_wgs84_lon_{center_sig}",
+                    )
+                with c_btn:
+                    wgs_jump_clicked = st.form_submit_button(
+                        t("btn_jump_coords"),
+                        type="primary",
+                        width="stretch",
+                    )
 
     if selected_basemap != prev_basemap:
         st.session_state["map_basemap"] = selected_basemap
@@ -2026,27 +2468,37 @@ def _render_interactive_aoi_section(
 
     if place_search_clicked and place_query.strip():
         try:
-            geo_res = geocode_place_nominatim(place_query, lang=lang)
+            geo_res = geocode_place(place_query, lang=lang)
             if geo_res is not None:
                 found_lat, found_lon, found_name = geo_res
-                st.session_state["map_lat"] = round(found_lat, 6)
-                st.session_state["map_lon"] = round(found_lon, 6)
-                st.session_state["map_zoom"] = 13
-                st.session_state["live_map_zoom"] = 13
-                st.session_state["geocoded_place_msg"] = t(
-                    "place_found_msg",
-                    name=found_name,
-                    lat=found_lat,
-                    lon=found_lon,
-                )
-                st.rerun()
+                _jump_to_location(found_lat, found_lon, found_name, zoom=12)
             else:
                 st.warning(t("place_not_found_warn", query=place_query.strip()))
         except Exception as exc:
             st.error(t("place_search_error", err=exc))
 
+    if d96_jump_clicked:
+        try:
+            j_lon, j_lat = transform_coords(float(e_jump), float(n_jump), EPSG_D96TM, EPSG_WGS84)
+            _jump_to_location(
+                float(j_lat),
+                float(j_lon),
+                f"D96/TM ({float(e_jump):,.1f} m, {float(n_jump):,.1f} m)",
+                zoom=12,
+            )
+        except Exception as exc:
+            st.error(t("place_search_error", err=exc))
+
+    if wgs_jump_clicked:
+        _jump_to_location(
+            float(lat_jump),
+            float(lon_jump),
+            f"WGS84 ({float(lat_jump):.5f}°, {float(lon_jump):.5f}°)",
+            zoom=12,
+        )
+
     if st.session_state.get("geocoded_place_msg"):
-        st.caption(f"📍 {st.session_state['geocoded_place_msg']}")
+        st.success(f"📍 {st.session_state['geocoded_place_msg']}")
 
     # Način 1: Interaktivno risanje poligona / pravokotnika na 600 px zemljevidu
     if aoi_mode_key == "draw":
@@ -2144,6 +2596,9 @@ def _render_interactive_aoi_section(
 # ---------------------------------------------------------------------------
 def main() -> None:
     _init_session_state()
+    pending_mode = st.session_state.pop("pending_aoi_mode", None)
+    if pending_mode in AOI_MODE_KEYS:
+        st.session_state["sidebar_aoi_mode"] = pending_mode
     _clamp_dates_for_sensor(str(st.session_state["selected_sensor"]))
 
     # =======================================================================
@@ -2164,13 +2619,15 @@ def main() -> None:
         st.divider()
         st.subheader(t("sec_sensor"))
 
-        sensor = st.selectbox(
+        _touch_selector(
             t("sensor_select_label"),
             options=SENSOR_KEYS,
-            format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
+            default=str(st.session_state.get("selected_sensor", SENSOR_S2)),
+            format_func=lambda s, _lang=lang: t(SENSOR_META[s]["pill_key"], lang=_lang),
             key="sidebar_sensor_select",
             on_change=_sync_sensor_state,
             args=("sidebar_sensor_select",),
+            use_pills=True,
         )
         sensor = str(st.session_state["selected_sensor"])
         sensor_cfg = SENSOR_META[sensor]
@@ -2194,7 +2651,6 @@ def main() -> None:
         aoi_mode_key = st.radio(
             t("aoi_mode_label"),
             options=AOI_MODE_KEYS,
-            index=0,
             format_func=lambda k, _lang=lang: t(AOI_MODE_I18N[k], lang=_lang),
             label_visibility="collapsed",
             key="sidebar_aoi_mode",
@@ -2392,31 +2848,28 @@ def main() -> None:
 
         res_options: list[int] = list(sensor_cfg["res_options"])
         cur_sel_res = st.session_state["selected_resolution"]
-        default_res_idx = res_options.index(cur_sel_res) if cur_sel_res in res_options else 0
+        default_res_val = cur_sel_res if cur_sel_res in res_options else res_options[0]
 
-        col_res, col_crs = st.columns(2)
-        with col_res:
-            selected_resolution = st.selectbox(
-                t("res_label"),
-                options=res_options,
-                index=default_res_idx,
-                format_func=lambda r, _lang=lang: (
-                    t("res_recommended", lang=_lang, r=r)
-                    if (bbox_4326 is not None and r == rec_res)
-                    else t("res_plain", lang=_lang, r=r)
-                ),
-                help=t("res_help"),
-                key=f"sidebar_res_select_{sensor}",
-            )
-            st.session_state["selected_resolution"] = selected_resolution
-        with col_crs:
-            target_crs = st.selectbox(
-                t("output_crs_label"),
-                options=CRS_KEYS,
-                index=0,
-                format_func=lambda c, _lang=lang: t(CRS_SHORT_I18N[c], lang=_lang),
-                key="sidebar_crs_select",
-            )
+        selected_resolution = _touch_selector(
+            t("res_label"),
+            options=res_options,
+            default=default_res_val,
+            format_func=lambda r: (
+                f"{r} m ★" if (bbox_4326 is not None and r == rec_res) else f"{r} m"
+            ),
+            help=t("res_help"),
+            key=f"sidebar_res_select_{sensor}",
+        )
+        st.session_state["selected_resolution"] = int(selected_resolution)
+
+        target_crs = _touch_selector(
+            t("output_crs_label"),
+            options=CRS_KEYS,
+            default=CRS_D96TM,
+            format_func=lambda c, _lang=lang: t(CRS_PILL_I18N[c], lang=_lang),
+            key="sidebar_crs_select",
+            use_pills=True,
+        )
 
         # En sam subtilen inline RAM statusni indikator namesto ponavljajočih se opozoril
         if bbox_4326 is not None and aoi_error is None:
@@ -2676,11 +3129,11 @@ def main() -> None:
                             key=f"tab1_scene_select_{active_sensor}",
                         )
                     with col_vis:
-                        vis_code = st.selectbox(
+                        vis_code = _touch_selector(
                             t("composite_select_label"),
                             options=list(vis_specs.keys()),
-                            index=0,
-                            format_func=lambda code, _lang=lang: t(vis_specs[code]["label_key"], lang=_lang),
+                            default=list(vis_specs.keys())[0],
+                            format_func=lambda code, _lang=lang: t(vis_specs[code]["pill_key"], lang=_lang),
                             key=f"tab1_vis_select_{active_sensor}",
                         )
 
@@ -3016,12 +3469,13 @@ def main() -> None:
                             key=f"tab2_scene_select_{active_sensor}",
                         )
                     with col_i2:
-                        t2_index_key = st.selectbox(
+                        t2_index_key = _touch_selector(
                             t("index_select_label"),
                             options=INDEX_KEYS,
-                            index=0,
-                            format_func=lambda k, _lang=lang: t(f"idx_{k}_label", lang=_lang),
+                            default=INDEX_KEYS[0],
+                            format_func=lambda k: k,
                             key="tab2_index_select",
+                            use_pills=True,
                         )
 
                     st.caption(
@@ -3181,18 +3635,19 @@ def main() -> None:
 
                 def _fmt_comp_mode(code: str, _lang: str = lang) -> str:
                     if code == "RGB_NIR":
-                        return t("comp_mode_rgb_nir", lang=_lang)
-                    return t(f"idx_{code}_label", lang=_lang)
+                        return t("comp_mode_rgb_nir_pill", lang=_lang)
+                    return code
 
                 with st.container(border=True):
-                    col_cm, col_cn, col_cbtn = st.columns([1.45, 1.05, 1.0], vertical_alignment="bottom")
+                    col_cm, col_cn, col_cbtn = st.columns([1.65, 1.0, 0.95], vertical_alignment="bottom")
                     with col_cm:
-                        comp_mode = st.selectbox(
+                        comp_mode = _touch_selector(
                             t("comp_mode_label"),
                             options=comp_mode_options,
-                            index=0,
+                            default=comp_mode_options[0],
                             format_func=_fmt_comp_mode,
                             key=f"tab2_comp_mode_{active_sensor}",
+                            use_pills=True,
                         )
                     with col_cn:
                         avail_comp = len(items)
@@ -3633,18 +4088,19 @@ def main() -> None:
             t3_sensor_cur = str(st.session_state["selected_sensor"])
             t3_min_date: date = SENSOR_META[t3_sensor_cur]["min_date"]
 
-            c_t3_sens, c_t3_d1, c_t3_d2, c_t3_cld = st.columns(
-                [1.35, 0.9, 0.9, 1.05], vertical_alignment="bottom"
+            _touch_selector(
+                t("sensor_select_label"),
+                options=SENSOR_KEYS,
+                default=t3_sensor_cur,
+                format_func=lambda s, _lang=lang: t(SENSOR_META[s]["pill_key"], lang=_lang),
+                key="tab3_sensor_select",
+                on_change=_sync_sensor_state,
+                args=("tab3_sensor_select",),
             )
-            with c_t3_sens:
-                st.selectbox(
-                    t("sensor_select_label"),
-                    options=SENSOR_KEYS,
-                    format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
-                    key="tab3_sensor_select",
-                    on_change=_sync_sensor_state,
-                    args=("tab3_sensor_select",),
-                )
+
+            c_t3_d1, c_t3_d2, c_t3_cld = st.columns(
+                [1.0, 1.0, 1.25], vertical_alignment="bottom"
+            )
             with c_t3_d1:
                 t3_start = st.date_input(
                     t("start_date_label"),
@@ -3776,12 +4232,10 @@ def main() -> None:
                 t("sar_metric_select_label") if is_sar_t3 else t("index_select_label")
             )
 
-            def _fmt_metric(code: str, _lang: str = lang) -> str:
-                return (
-                    t(f"sar_{code}_label", lang=_lang)
-                    if is_sar_t3
-                    else t(f"idx_{code}_label", lang=_lang)
-                )
+            def _fmt_metric_pill(code: str, _lang: str = lang) -> str:
+                if is_sar_t3 and code == "VV_VH":
+                    return t("sar_VV_VH_pill", lang=_lang)
+                return code
 
             sub_ts, sub_change, sub_tl = st.tabs(
                 [t("t3_subtab_ts"), t("t3_subtab_change"), t("t3_subtab_tl")]
@@ -3794,15 +4248,16 @@ def main() -> None:
                 st.caption(t("t3_sec_a_caption"))
                 with st.container(border=True):
                     col_ts_idx, col_ts_ep, col_ts_scl = st.columns(
-                        [1.1, 1.0, 0.9], vertical_alignment="bottom"
+                        [1.35, 0.95, 0.8], vertical_alignment="bottom"
                     )
                     with col_ts_idx:
-                        ts_metric_key = st.selectbox(
+                        ts_metric_key = _touch_selector(
                             metric_label_title,
                             options=metric_options,
-                            index=0,
-                            format_func=_fmt_metric,
+                            default=metric_options[0],
+                            format_func=_fmt_metric_pill,
                             key=f"tab3_ts_metric_{active_sensor}",
+                            use_pills=True,
                         )
                     with col_ts_ep:
                         total_available = len(items)
@@ -3928,15 +4383,16 @@ def main() -> None:
                 else:
                     with st.container(border=True):
                         col_c_idx, col_c_thr, col_c_scl = st.columns(
-                            [1.15, 1.0, 0.85], vertical_alignment="bottom"
+                            [1.35, 0.95, 0.8], vertical_alignment="bottom"
                         )
                         with col_c_idx:
-                            ch_metric_key = st.selectbox(
+                            ch_metric_key = _touch_selector(
                                 metric_label_title,
                                 options=metric_options,
-                                index=0,
-                                format_func=_fmt_metric,
+                                default=metric_options[0],
+                                format_func=_fmt_metric_pill,
                                 key=f"tab3_ch_metric_{active_sensor}",
+                                use_pills=True,
                             )
                         with col_c_thr:
                             if is_sar_t3:
@@ -4182,26 +4638,23 @@ def main() -> None:
                     else:
                         tl_layer_options = ["RGB", "NIR", "NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
 
-                    def _fmt_tl_layer(code: str, _lang: str = lang) -> str:
-                        if code == "RGB":
-                            return t("vis_rgb_label", lang=_lang)
-                        if code == "NIR":
-                            return t("vis_nir_label", lang=_lang)
-                        if code in SAR_METRICS:
-                            return t(f"sar_{code}_label", lang=_lang)
-                        return t(f"idx_{code}_label", lang=_lang)
+                    def _fmt_tl_layer_pill(code: str, _lang: str = lang) -> str:
+                        if code == "VV_VH":
+                            return t("sar_VV_VH_pill", lang=_lang)
+                        return code
 
                     with st.container(border=True):
                         col_tl_layer, col_tl_n, col_tl_spd = st.columns(
-                            [1.4, 1.0, 0.8], vertical_alignment="bottom"
+                            [1.65, 0.9, 0.9], vertical_alignment="bottom"
                         )
                         with col_tl_layer:
-                            tl_layer_code = st.selectbox(
+                            tl_layer_code = _touch_selector(
                                 t("tl_layer_label"),
                                 options=tl_layer_options,
-                                index=0,
-                                format_func=_fmt_tl_layer,
+                                default=tl_layer_options[0],
+                                format_func=_fmt_tl_layer_pill,
                                 key=f"tab3_tl_layer_{active_sensor}",
+                                use_pills=True,
                             )
                         with col_tl_n:
                             avail_tl = len(items)
@@ -4221,10 +4674,10 @@ def main() -> None:
                                     key=f"tab3_tl_frames_{active_sensor}",
                                 )
                         with col_tl_spd:
-                            tl_speed_sec = st.selectbox(
+                            tl_speed_sec = _touch_selector(
                                 t("tl_speed_label"),
                                 options=[0.4, 0.8, 1.2],
-                                index=1,
+                                default=0.8,
                                 format_func=lambda s: f"{s:.1f} s",
                                 key="tab3_tl_speed",
                             )
@@ -4342,6 +4795,9 @@ def main() -> None:
                                         scene_id=chosen_frame["scene_id"],
                                     )
                                 )
+
+    # Prepreči odpiranje virtualne tipkovnice na preostalih dinamičnih selectboxih (tablice/telefoni)
+    _inject_tablet_no_keyboard_js()
 
 
 if __name__ == "__main__":
