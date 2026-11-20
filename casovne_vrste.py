@@ -32,7 +32,7 @@ from analize import (
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
-from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, load_scene
+from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,59 @@ def _item_dt_utc(item: pystac.Item) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _normalize_epoch_groups(
+    items: Sequence[StacItemOrGroup],
+) -> list[list[pystac.Item]]:
+    """Normalize a flat list of STAC items or pre-grouped same-day item lists into chronological date groups."""
+    buckets: dict[str, list[pystac.Item]] = {}
+    seen_ids: dict[str, set[str]] = {}
+
+    for entry in items:
+        sub_items = [entry] if isinstance(entry, pystac.Item) else list(entry)
+        for it in sub_items:
+            if not isinstance(it, pystac.Item):
+                continue
+            date_str = _item_dt_utc(it).strftime("%Y-%m-%d")
+            bucket_ids = seen_ids.setdefault(date_str, set())
+            if it.id not in bucket_ids:
+                bucket_ids.add(it.id)
+                buckets.setdefault(date_str, []).append(it)
+
+    groups: list[list[pystac.Item]] = []
+    for date_str in sorted(buckets.keys()):
+        day_items = buckets[date_str]
+        groups.append(day_items)
+    return groups
+
+
+def _group_metadata(day_items: Sequence[pystac.Item], sensor: str) -> tuple[datetime, str, str, str, float]:
+    """Extract ``(dt_utc, date_str, scene_id, platform, mean_cloud_cover)`` for a same-day item group."""
+    item_list = list(day_items)
+    dt_utc = max(_item_dt_utc(it) for it in item_list)
+    date_str = dt_utc.strftime("%Y-%m-%d")
+    primary_id = item_list[0].id
+    scene_id = primary_id if len(item_list) == 1 else f"{primary_id} (+{len(item_list) - 1})"
+    platforms = sorted({str(it.properties.get("platform", "")).strip() for it in item_list if it.properties.get("platform")})
+    platform = " + ".join(platforms)
+
+    if sensor == SENSOR_S1:
+        cloud_cover = float("nan")
+    else:
+        clouds: list[float] = []
+        for it in item_list:
+            raw_c = it.properties.get("eo:cloud_cover")
+            if raw_c is not None:
+                try:
+                    val = float(raw_c)
+                    if np.isfinite(val):
+                        clouds.append(val)
+                except (TypeError, ValueError):
+                    pass
+        cloud_cover = float(np.mean(clouds)) if clouds else float("nan")
+
+    return dt_utc, date_str, scene_id, platform, cloud_cover
+
+
 def _compute_layer(ds: xr.Dataset, sensor: str, metric_name: str) -> xr.DataArray:
     """Compute either an optical spectral index or a SAR backscatter metric."""
     if sensor == SENSOR_S1:
@@ -76,7 +129,7 @@ def _compute_layer(ds: xr.Dataset, sensor: str, metric_name: str) -> xr.DataArra
 
 
 def extract_time_series(
-    items: Sequence[pystac.Item],
+    items: Sequence[StacItemOrGroup],
     bbox_4326: Sequence[float],
     index_name: str,
     target_epsg: int | str = "EPSG:3794",
@@ -87,25 +140,25 @@ def extract_time_series(
     sensor: str = SENSOR_S2,
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """Extract a multi-temporal index or SAR backscatter time series (1 epoch in RAM).
+    """Extract a multi-temporal index or SAR backscatter time series (1 mosaicked date in RAM).
 
     Streams only the minimal bands needed for ``sensor`` and ``index_name``,
-    clips to ``aoi_polygon_4326`` if provided, applies sensor-appropriate cloud
-    masking (Sentinel-2 SCL or Landsat QA_PIXEL; skipped for all-weather SAR),
-    records statistics, and immediately releases each raster via ``gc.collect()``.
+    mosaics all same-day tiles seamlessly onto the target CRS grid, clips to
+    ``aoi_polygon_4326`` if provided, applies sensor-appropriate cloud masking
+    (Sentinel-2 SCL or Landsat QA_PIXEL; skipped for all-weather SAR), records
+    statistics, and immediately releases each raster via ``gc.collect()``.
     """
     idx_key = index_name.strip().upper()
     use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
     req_bands = get_required_bands_for_sensor(sensor, idx_key, include_cloud_mask=use_cloud_mask)
 
-    sorted_items = sorted(items, key=_item_dt_utc)
-    total = len(sorted_items)
+    epoch_groups = _normalize_epoch_groups(items)
+    total = len(epoch_groups)
     rows: list[dict[str, Any]] = []
     skipped_epochs: list[dict[str, Any]] = []
 
-    for step, item in enumerate(sorted_items):
-        dt_utc = _item_dt_utc(item)
-        date_str = dt_utc.strftime("%Y-%m-%d")
+    for step, day_items in enumerate(epoch_groups):
+        dt_utc, date_str, scene_id, platform, cloud_cover = _group_metadata(day_items, sensor=sensor)
 
         if progress_callback is not None:
             progress_callback(step, total, date_str)
@@ -116,7 +169,7 @@ def extract_time_series(
         try:
             ds = load_scene(
                 sensor=sensor,
-                item=item,
+                item=day_items,
                 bbox_4326=bbox_4326,
                 bands=req_bands,
                 target_epsg=target_epsg,
@@ -132,7 +185,7 @@ def extract_time_series(
                 logger.info(
                     "Skipped %s (%s): %.1f%% valid pixels (clear: %.1f%%, min: %.0f%%).",
                     date_str,
-                    item.id,
+                    scene_id,
                     valid_pct,
                     clear_pct,
                     min_valid_pct,
@@ -140,21 +193,20 @@ def extract_time_series(
                 skipped_epochs.append(
                     {
                         "date_str": date_str,
-                        "scene_id": item.id,
+                        "scene_id": scene_id,
                         "valid_pct": valid_pct,
                         "reason": "low_valid_pixels",
                     }
                 )
             else:
-                cloud_raw = item.properties.get("eo:cloud_cover")
                 rows.append(
                     {
                         "date": pd.Timestamp(dt_utc),
                         "date_str": date_str,
-                        "scene_id": item.id,
-                        "platform": str(item.properties.get("platform", "")),
+                        "scene_id": str(ds.attrs.get("scene_id", scene_id)),
+                        "platform": str(ds.attrs.get("platform", platform)),
                         "mgrs_tile": str(ds.attrs.get("mgrs_tile", "")),
-                        "cloud_cover": float(cloud_raw) if cloud_raw is not None else np.nan,
+                        "cloud_cover": cloud_cover,
                         "mean": stats["mean"],
                         "median": stats["median"],
                         "std": stats["std"],
@@ -168,11 +220,11 @@ def extract_time_series(
                     }
                 )
         except Exception as exc:
-            logger.warning("Failed to process epoch %s (%s): %s", date_str, item.id, exc)
+            logger.warning("Failed to process epoch %s (%s): %s", date_str, scene_id, exc)
             skipped_epochs.append(
                 {
                     "date_str": date_str,
-                    "scene_id": item.id,
+                    "scene_id": scene_id,
                     "valid_pct": 0.0,
                     "reason": str(exc),
                 }
@@ -210,8 +262,8 @@ def _grids_match(da_ref: xr.DataArray, da_other: xr.DataArray) -> bool:
 
 
 def compute_change_detection(
-    item_t1: pystac.Item,
-    item_t2: pystac.Item,
+    item_t1: StacItemOrGroup,
+    item_t2: StacItemOrGroup,
     bbox_4326: Sequence[float],
     index_name: str,
     target_epsg: int | str = "EPSG:3794",
@@ -222,8 +274,9 @@ def compute_change_detection(
 ) -> tuple[xr.DataArray, xr.DataArray, xr.DataArray]:
     """Compute exact 1-to-1 pixel-aligned bi-temporal change: ``Delta = t2 - t1``.
 
-    Works across Sentinel-2 L2A, Landsat C2 L2 (optical indices), and Sentinel-1
-    SAR RTC (backscatter difference in dB, e.g. ``Delta VV [dB]``).
+    Automatically mosaics all same-day tiles when ``item_t1`` / ``item_t2`` are
+    lists of STAC items. Works across Sentinel-2 L2A, Landsat C2 L2, and
+    Sentinel-1 SAR RTC (backscatter difference in dB, e.g. ``Delta VV [dB]``).
     """
     idx_key = index_name.strip().upper()
     use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
@@ -611,7 +664,7 @@ def render_change_swipe_pair(
 
 
 def generate_timelapse_frames(
-    items: Sequence[pystac.Item],
+    items: Sequence[StacItemOrGroup],
     bbox_4326: Sequence[float],
     layer_mode: str = "RGB",
     target_epsg: int | str = "EPSG:3794",
@@ -626,9 +679,9 @@ def generate_timelapse_frames(
 ) -> dict[str, Any]:
     """Generate a memory-safe visual timelapse (compact PNG frames + animated GIF).
 
-    Loads strictly one acquisition at a time, aligns frames onto a consistent
-    pixel grid, stamps each frame with ``YYYY-MM-DD | Platform``, frees raster
-    memory via ``gc.collect()`` after every frame, and compiles a looping GIF.
+    Loads strictly one mosaicked acquisition date at a time, aligns frames onto a
+    consistent pixel grid, stamps each frame with ``YYYY-MM-DD | Platform``, frees
+    raster memory via ``gc.collect()`` after every frame, and compiles a looping GIF.
     """
     mode = layer_mode.strip().upper()
     is_sar = sensor == SENSOR_S1
@@ -649,16 +702,15 @@ def generate_timelapse_frames(
         use_cloud_mask = bool(mask_clouds)
         req_bands = get_required_bands_for_sensor(sensor, mode, include_cloud_mask=use_cloud_mask)
 
-    sorted_items = sorted(items, key=_item_dt_utc)
-    total = len(sorted_items)
+    epoch_groups = _normalize_epoch_groups(items)
+    total = len(epoch_groups)
 
     frames: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     target_pil_size: tuple[int, int] | None = None
 
-    for step, item in enumerate(sorted_items):
-        dt_utc = _item_dt_utc(item)
-        date_str = dt_utc.strftime("%Y-%m-%d")
+    for step, day_items in enumerate(epoch_groups):
+        _, date_str, scene_id, platform_raw, _ = _group_metadata(day_items, sensor=sensor)
         if progress_callback is not None:
             progress_callback(step, total, date_str)
 
@@ -670,7 +722,7 @@ def generate_timelapse_frames(
         try:
             ds = load_scene(
                 sensor=sensor,
-                item=item,
+                item=day_items,
                 bbox_4326=bbox_4326,
                 bands=req_bands,
                 target_epsg=target_epsg,
@@ -678,8 +730,9 @@ def generate_timelapse_frames(
                 aoi_polygon_4326=aoi_polygon_4326,
             )
 
-            platform_lbl = _format_platform_stamp(str(item.properties.get("platform", "")), sensor)
+            platform_lbl = _format_platform_stamp(str(ds.attrs.get("platform", platform_raw)), sensor)
             stamp = f"{date_str} | {platform_lbl} | {mode}"
+            merged_scene_id = str(ds.attrs.get("scene_id", scene_id))
 
             if is_rgb_composite:
                 # Check valid pixel coverage across the 3 composite bands
@@ -689,7 +742,7 @@ def generate_timelapse_frames(
                 valid_pct = float(100.0 * np.count_nonzero(valid) / max(valid.size, 1))
                 if valid_pct < float(min_valid_pct):
                     skipped.append(
-                        {"date_str": date_str, "scene_id": item.id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
+                        {"date_str": date_str, "scene_id": merged_scene_id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
                     )
                     continue
 
@@ -707,7 +760,7 @@ def generate_timelapse_frames(
                 valid_pct = float(stats["valid_pct"])
                 if valid_pct < float(min_valid_pct):
                     skipped.append(
-                        {"date_str": date_str, "scene_id": item.id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
+                        {"date_str": date_str, "scene_id": merged_scene_id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
                     )
                     continue
 
@@ -728,15 +781,15 @@ def generate_timelapse_frames(
                 {
                     "date_str": date_str,
                     "platform": platform_lbl,
-                    "scene_id": item.id,
+                    "scene_id": merged_scene_id,
                     "valid_pct": round(valid_pct, 1),
                     "png_bytes": pil_to_png_bytes(img),
                 }
             )
         except Exception as exc:
-            logger.warning("Timelapse skipped %s (%s): %s", date_str, item.id, exc)
+            logger.warning("Timelapse skipped %s (%s): %s", date_str, scene_id, exc)
             skipped.append(
-                {"date_str": date_str, "scene_id": item.id, "valid_pct": 0.0, "reason": str(exc)}
+                {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)}
             )
         finally:
             del ds, masked_ds, layer_da, img

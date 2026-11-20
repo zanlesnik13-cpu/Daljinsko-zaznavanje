@@ -213,6 +213,216 @@ def _is_landsat7_slc_off(item: pystac.Item) -> bool:
     return False
 
 
+StacItemOrGroup = pystac.Item | Sequence[pystac.Item]
+
+
+def _normalize_item_group(items_or_item: StacItemOrGroup) -> list[pystac.Item]:
+    """Normalize a single STAC Item or a sequence of same-day STAC Items into a non-empty list."""
+    if isinstance(items_or_item, pystac.Item):
+        return [items_or_item]
+    item_list = [it for it in items_or_item if isinstance(it, pystac.Item)]
+    if not item_list:
+        raise ValueError("Expected at least one pystac.Item to load, got an empty sequence.")
+    return item_list
+
+
+def _extract_tile_label(item: pystac.Item, sensor: str) -> str:
+    """Return a clean tile/path-row/orbit label for a STAC item."""
+    if sensor == SENSOR_S2:
+        tile = _extract_mgrs_tile(item)
+        if not tile:
+            return ""
+        return tile if tile.startswith("T") else f"T{tile}"
+    if sensor == SENSOR_LANDSAT:
+        wrs_path = item.properties.get("landsat:wrs_path", "")
+        wrs_row = item.properties.get("landsat:wrs_row", "")
+        return f"P{wrs_path}/R{wrs_row}" if wrs_path and wrs_row else ""
+    if sensor == SENSOR_S1:
+        rel_orbit = item.properties.get("sat:relative_orbit", "")
+        orbit_state = str(item.properties.get("sat:orbit_state", "")).upper()
+        orbit_short = orbit_state[:3] if orbit_state else ""
+        return f"Orb {rel_orbit} ({orbit_short})" if rel_orbit else orbit_short
+    return _extract_mgrs_tile(item)
+
+
+def _extract_platform_label(item: pystac.Item, sensor: str) -> str:
+    """Return a clean platform label for a STAC item."""
+    if sensor == SENSOR_LANDSAT:
+        platform = str(item.properties.get("platform", ""))
+        if _is_landsat7_slc_off(item):
+            platform = f"{platform} (SLC-off)"
+        return platform
+    if sensor == SENSOR_S1:
+        pols = item.properties.get("sar:polarizations") or []
+        pol_str = "+".join(str(p) for p in pols)
+        platform = str(item.properties.get("platform", "sentinel-1"))
+        if pol_str:
+            platform = f"{platform} ({pol_str})"
+        return platform
+    return str(item.properties.get("platform", ""))
+
+
+def _merge_group_metadata(items: Sequence[pystac.Item], sensor: str) -> dict[str, Any]:
+    """Summarize metadata across a group of same-day STAC items."""
+    item_list = list(items)
+    dts = [_extract_item_datetime_utc(it) for it in item_list]
+    max_dt = max(dts)
+    date_str = max_dt.strftime("%Y-%m-%d")
+
+    tiles = sorted({lbl for it in item_list if (lbl := _extract_tile_label(it, sensor))})
+    tile_str = " + ".join(tiles)
+
+    platforms = sorted({lbl for it in item_list if (lbl := _extract_platform_label(it, sensor))})
+    platform_str = " + ".join(platforms)
+
+    if sensor == SENSOR_S1:
+        cloud_mean = np.nan
+        cloud_min = np.nan
+    else:
+        clouds: list[float] = []
+        for it in item_list:
+            raw_c = it.properties.get("eo:cloud_cover")
+            if raw_c is not None:
+                try:
+                    val = float(raw_c)
+                    if np.isfinite(val):
+                        clouds.append(val)
+                except (TypeError, ValueError):
+                    pass
+        cloud_mean = float(np.mean(clouds)) if clouds else np.nan
+        cloud_min = float(np.min(clouds)) if clouds else np.nan
+
+    primary_id = item_list[0].id
+    scene_id = primary_id if len(item_list) == 1 else f"{primary_id} (+{len(item_list) - 1})"
+
+    return {
+        "id": scene_id,
+        "datetime": max_dt,
+        "date_str": date_str,
+        "cloud_cover": cloud_mean,
+        "cloud_cover_min": cloud_min,
+        "mgrs_tile": tile_str,
+        "platform": platform_str,
+        "tile_count": len(item_list),
+    }
+
+
+def group_items_by_date(
+    items: Sequence[pystac.Item],
+    sensor: str,
+    limit: int | None = None,
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Group STAC items by acquisition date (``YYYY-MM-DD``) for seamless tile mosaicking.
+
+    Returns ``(grouped_items, summary_df)`` ordered newest-first, where each entry
+    in ``grouped_items`` is the list of all STAC items from that acquisition date
+    covering the AOI (1-to-1 aligned with ``summary_df`` rows). Also attaches
+    ``summary_df.attrs["items_by_date"] = {date_str: [item_1, item_2, ...]}``.
+    """
+    if not items:
+        empty_df = pd.DataFrame(columns=SUMMARY_COLUMNS)
+        empty_df.attrs["items_by_date"] = {}
+        return [], empty_df
+
+    buckets: dict[str, list[pystac.Item]] = {}
+    for it in items:
+        dt_utc = _extract_item_datetime_utc(it)
+        date_str = dt_utc.strftime("%Y-%m-%d")
+        buckets.setdefault(date_str, []).append(it)
+
+    sorted_dates = sorted(buckets.keys(), reverse=True)
+    if limit is not None and int(limit) > 0:
+        sorted_dates = sorted_dates[: int(limit)]
+
+    grouped_items: list[list[pystac.Item]] = []
+    items_by_date: dict[str, list[pystac.Item]] = {}
+    rows: list[dict[str, object]] = []
+
+    for date_str in sorted_dates:
+        day_items = buckets[date_str]
+        if sensor == SENSOR_S1:
+            day_items.sort(
+                key=lambda it: (_extract_item_datetime_utc(it), it.id),
+                reverse=True,
+            )
+        else:
+            # Prefer clearer and more recently processed tiles first during mosaic fusion
+            def _opt_sort_key(it: pystac.Item) -> tuple[float, float, str]:
+                raw_c = it.properties.get("eo:cloud_cover")
+                try:
+                    c_val = float(raw_c) if raw_c is not None else float("inf")
+                except (TypeError, ValueError):
+                    c_val = float("inf")
+                return (c_val, -_extract_item_datetime_utc(it).timestamp(), it.id)
+
+            day_items.sort(key=_opt_sort_key)
+
+        meta = _merge_group_metadata(day_items, sensor=sensor)
+        grouped_items.append(day_items)
+        items_by_date[date_str] = day_items
+        rows.append(
+            {
+                "id": meta["id"],
+                "datetime": pd.Timestamp(meta["datetime"]),
+                "date_str": meta["date_str"],
+                "cloud_cover": meta["cloud_cover"],
+                "mgrs_tile": meta["mgrs_tile"],
+                "platform": meta["platform"],
+            }
+        )
+
+    summary_df = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
+    summary_df.attrs["items_by_date"] = items_by_date
+    return grouped_items, summary_df
+
+
+def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
+    """Collapse a ``time`` dimension to a single 2D ``(y, x)`` mosaic slice."""
+    if "time" not in raw_ds.dims:
+        return raw_ds
+    if raw_ds.sizes["time"] == 1:
+        return raw_ds.isel(time=0)
+
+    # Fallback mosaic if same-UTC-date items ever span two solar_day bins
+    collapsed: dict[str, xr.DataArray] = {}
+    spatial_coords = {k: v for k, v in raw_ds.coords.items() if "time" not in v.dims}
+    for var_name in raw_ds.data_vars:
+        da = raw_ds[var_name]
+        arr_t = da.values  # (T, Y, X)
+        out = arr_t[0].copy()
+        nodata_val = da.attrs.get("nodata", None)
+
+        def _is_valid(slice_arr: np.ndarray) -> np.ndarray:
+            if sensor == SENSOR_S1:
+                valid = np.isfinite(slice_arr) & (slice_arr > 0.0)
+                if nodata_val is not None and np.isfinite(nodata_val):
+                    valid &= slice_arr != nodata_val
+                return valid
+            if str(var_name) == "qa_pixel":
+                return np.isfinite(slice_arr) & ((slice_arr.astype(np.uint16, copy=False) & 1) == 0)
+            nd = 0 if nodata_val is None else nodata_val
+            return np.isfinite(slice_arr) & (slice_arr != nd)
+
+        filled = _is_valid(out)
+        for t_idx in range(1, arr_t.shape[0]):
+            if np.all(filled):
+                break
+            cand = arr_t[t_idx]
+            take = (~filled) & _is_valid(cand)
+            out[take] = cand[take]
+            filled |= take
+
+        collapsed[str(var_name)] = xr.DataArray(
+            out,
+            dims=da.dims[1:],
+            coords={d: da.coords[d] for d in da.dims[1:] if d in da.coords},
+            name=str(var_name),
+            attrs=dict(da.attrs),
+        )
+
+    return xr.Dataset(data_vars=collapsed, coords=spatial_coords, attrs=dict(raw_ds.attrs))
+
+
 # ---------------------------------------------------------------------------
 # 1. SENTINEL-2 L2A
 # ---------------------------------------------------------------------------
@@ -222,14 +432,15 @@ def search_sentinel2(
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
     limit: int = 50,
-) -> tuple[list[pystac.Item], pd.DataFrame]:
-    """Search Sentinel-2 L2A scenes on Microsoft Planetary Computer STAC API."""
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Search Sentinel-2 L2A scenes on Planetary Computer, grouped by acquisition date."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
 
     datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
+    raw_fetch_limit = max(int(limit) * 4, 150)
 
     catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
     search = catalog.search(
@@ -237,51 +448,31 @@ def search_sentinel2(
         bbox=[float(v) for v in bbox_4326],
         datetime=datetime_range,
         query={"eo:cloud_cover": {"lte": float(max_cloud_cover)}},
-        max_items=int(limit),
+        max_items=raw_fetch_limit,
     )
 
-    items = list(search.items())
-    if not items:
-        return [], pd.DataFrame(columns=SUMMARY_COLUMNS)
-
-    items.sort(key=_extract_item_datetime_utc, reverse=True)
-
-    rows: list[dict[str, object]] = []
-    for item in items:
-        dt_utc = _extract_item_datetime_utc(item)
-        cloud_raw = item.properties.get("eo:cloud_cover")
-        rows.append(
-            {
-                "id": item.id,
-                "datetime": pd.Timestamp(dt_utc),
-                "date_str": dt_utc.strftime("%Y-%m-%d"),
-                "cloud_cover": float(cloud_raw) if cloud_raw is not None else np.nan,
-                "mgrs_tile": _extract_mgrs_tile(item),
-                "platform": str(item.properties.get("platform", "")),
-            }
-        )
-
-    summary_df = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
-    return items, summary_df
+    raw_items = list(search.items())
+    return group_items_by_date(raw_items, sensor=SENSOR_S2, limit=int(limit))
 
 
 def load_sentinel2_scene(
-    item: pystac.Item,
+    item: StacItemOrGroup,
     bbox_4326: Sequence[float],
     bands: Sequence[str],
     target_epsg: int | str = "EPSG:3794",
     resolution: float = 10,
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
-    """Load a clipped, radiometrically calibrated Sentinel-2 L2A scene via COG streaming."""
+    """Load a clipped, radiometrically calibrated Sentinel-2 L2A scene (or same-day tile mosaic)."""
     band_list = [str(b).strip() for b in bands]
     if not band_list:
         raise ValueError("bands must contain at least one Sentinel-2 band name.")
     if resolution <= 0:
         raise ValueError(f"resolution must be positive, got {resolution}.")
 
+    item_list = _normalize_item_group(item)
     crs_str = _normalize_crs_str(target_epsg)
-    signed_item = planetary_computer.sign(item)
+    signed_items = [planetary_computer.sign(it) for it in item_list]
 
     if all(b in CATEGORICAL_BANDS for b in band_list):
         resampling_cfg: str | dict[str, str] = "nearest"
@@ -293,24 +484,29 @@ def load_sentinel2_scene(
 
     _configure_odc_rio()
 
+    # Pass nodata=0 explicitly so overlapping same-day MGRS tiles fuse cleanly without
+    # zero-padded swath edges overwriting valid reflectance or SCL pixels.
     raw_ds = odc.stac.load(
-        [signed_item],
+        signed_items,
         bands=band_list,
         bbox=[float(v) for v in bbox_4326],
         crs=crs_str,
         resolution=float(resolution),
         resampling=resampling_cfg,
+        groupby="solar_day",
+        nodata=0,
     )
+    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_S2)
 
-    if "time" in raw_ds.dims and raw_ds.sizes["time"] == 1:
-        raw_ds = raw_ds.isel(time=0)
-
-    apply_offset = _requires_pb04_offset(signed_item)
+    primary_item = signed_items[0]
+    apply_offset = _requires_pb04_offset(primary_item)
     calibrated_vars: dict[str, xr.DataArray] = {}
 
     for band in band_list:
         if band not in raw_ds.data_vars:
-            raise KeyError(f"Requested band {band!r} was not loaded from STAC item {item.id!r}.")
+            raise KeyError(
+                f"Requested band {band!r} was not loaded from STAC item(s) {[it.id for it in signed_items]!r}."
+            )
 
         raw_da = raw_ds[band]
         if band in OPTICAL_BANDS:
@@ -362,18 +558,19 @@ def load_sentinel2_scene(
         else:
             calibrated_vars[band] = raw_da.rio.write_crs(crs_str, inplace=False)
 
-    dt_utc = _extract_item_datetime_utc(signed_item)
+    meta = _merge_group_metadata(signed_items, sensor=SENSOR_S2)
     ds = xr.Dataset(
         data_vars=calibrated_vars,
         coords=raw_ds.coords,
         attrs={
             "sensor": SENSOR_S2,
-            "scene_id": signed_item.id,
-            "datetime": dt_utc.isoformat(),
-            "cloud_cover": signed_item.properties.get("eo:cloud_cover"),
-            "mgrs_tile": _extract_mgrs_tile(signed_item),
-            "platform": signed_item.properties.get("platform", ""),
-            "processing_baseline": signed_item.properties.get("s2:processing_baseline"),
+            "scene_id": meta["id"],
+            "datetime": meta["datetime"].isoformat(),
+            "cloud_cover": meta["cloud_cover"],
+            "mgrs_tile": meta["mgrs_tile"],
+            "tile_count": meta["tile_count"],
+            "platform": meta["platform"],
+            "processing_baseline": primary_item.properties.get("s2:processing_baseline"),
             "radiometric_offset_applied": apply_offset,
             "resolution_m": float(resolution),
             "crs": crs_str,
@@ -399,8 +596,8 @@ def search_landsat(
     max_cloud_cover: float = 20,
     limit: int = 50,
     exclude_l7_slc_off: bool = False,
-) -> tuple[list[pystac.Item], pd.DataFrame]:
-    """Search Landsat 4/5/7/8/9 Collection 2 Level-2 scenes on Planetary Computer."""
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Search Landsat 4/5/7/8/9 Collection 2 Level-2 scenes, grouped by acquisition date."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
@@ -409,8 +606,8 @@ def search_landsat(
     datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
     catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
 
-    # Fetch extra items if filtering out L7 SLC-off scenes so we still meet limit
-    fetch_limit = int(limit * 2) if exclude_l7_slc_off else int(limit)
+    # Fetch extra items to avoid splitting same-day adjacent paths/rows or starving after L7 filtering
+    fetch_limit = max(int(limit) * 6, 200) if exclude_l7_slc_off else max(int(limit) * 4, 150)
     search = catalog.search(
         collections=[LANDSAT_COLLECTION],
         bbox=[float(v) for v in bbox_4326],
@@ -419,52 +616,22 @@ def search_landsat(
         max_items=fetch_limit,
     )
 
-    items = list(search.items())
+    raw_items = list(search.items())
     if exclude_l7_slc_off:
-        items = [it for it in items if not _is_landsat7_slc_off(it)]
-    items = items[: int(limit)]
+        raw_items = [it for it in raw_items if not _is_landsat7_slc_off(it)]
 
-    if not items:
-        return [], pd.DataFrame(columns=SUMMARY_COLUMNS)
-
-    items.sort(key=_extract_item_datetime_utc, reverse=True)
-
-    rows: list[dict[str, object]] = []
-    for item in items:
-        dt_utc = _extract_item_datetime_utc(item)
-        cloud_raw = item.properties.get("eo:cloud_cover")
-        wrs_path = item.properties.get("landsat:wrs_path", "")
-        wrs_row = item.properties.get("landsat:wrs_row", "")
-        tile_label = f"P{wrs_path}/R{wrs_row}" if wrs_path and wrs_row else ""
-
-        platform = str(item.properties.get("platform", ""))
-        if _is_landsat7_slc_off(item):
-            platform = f"{platform} (SLC-off)"
-
-        rows.append(
-            {
-                "id": item.id,
-                "datetime": pd.Timestamp(dt_utc),
-                "date_str": dt_utc.strftime("%Y-%m-%d"),
-                "cloud_cover": float(cloud_raw) if cloud_raw is not None else np.nan,
-                "mgrs_tile": tile_label,
-                "platform": platform,
-            }
-        )
-
-    summary_df = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
-    return items, summary_df
+    return group_items_by_date(raw_items, sensor=SENSOR_LANDSAT, limit=int(limit))
 
 
 def load_landsat_scene(
-    item: pystac.Item,
+    item: StacItemOrGroup,
     bbox_4326: Sequence[float],
     bands: Sequence[str],
     target_epsg: int | str = "EPSG:3794",
     resolution: float = 30,
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
-    """Load a clipped Landsat C2 L2 scene mapped to harmonized Sentinel-2 logical band names.
+    """Load a clipped Landsat C2 L2 scene (or same-day mosaic) with harmonized band names.
 
     Applies official USGS Collection 2 Level-2 surface reflectance scaling:
     ``reflectance = DN * 0.0000275 - 0.2``, clipped to ``[0.0, 1.0]`` (``float32``),
@@ -490,8 +657,9 @@ def load_landsat_scene(
         if pc_asset not in asset_list:
             asset_list.append(pc_asset)
 
+    item_list = _normalize_item_group(item)
     crs_str = _normalize_crs_str(target_epsg)
-    signed_item = planetary_computer.sign(item)
+    signed_items = [planetary_computer.sign(it) for it in item_list]
 
     if all(a == "qa_pixel" for a in asset_list):
         resampling_cfg: str | dict[str, str] = "nearest"
@@ -503,21 +671,22 @@ def load_landsat_scene(
     _configure_odc_rio()
 
     raw_ds = odc.stac.load(
-        [signed_item],
+        signed_items,
         bands=asset_list,
         bbox=[float(v) for v in bbox_4326],
         crs=crs_str,
         resolution=float(resolution),
         resampling=resampling_cfg,
+        groupby="solar_day",
     )
-
-    if "time" in raw_ds.dims and raw_ds.sizes["time"] == 1:
-        raw_ds = raw_ds.isel(time=0)
+    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_LANDSAT)
 
     calibrated_vars: dict[str, xr.DataArray] = {}
     for asset_name in asset_list:
         if asset_name not in raw_ds.data_vars:
-            raise KeyError(f"Asset {asset_name!r} was not loaded from Landsat item {item.id!r}.")
+            raise KeyError(
+                f"Asset {asset_name!r} was not loaded from Landsat item(s) {[it.id for it in signed_items]!r}."
+            )
 
         logical_name = LANDSAT_ASSET_TO_LOGICAL.get(asset_name, asset_name)
         raw_da = raw_ds[asset_name]
@@ -564,22 +733,19 @@ def load_landsat_scene(
             calibrated_vars[logical_name] = cal_da
             del raw_vals, valid_mask, refl
 
-    dt_utc = _extract_item_datetime_utc(signed_item)
-    wrs_path = signed_item.properties.get("landsat:wrs_path", "")
-    wrs_row = signed_item.properties.get("landsat:wrs_row", "")
-    tile_label = f"P{wrs_path}/R{wrs_row}" if wrs_path and wrs_row else ""
-
+    meta = _merge_group_metadata(signed_items, sensor=SENSOR_LANDSAT)
     ds = xr.Dataset(
         data_vars=calibrated_vars,
         coords=raw_ds.coords,
         attrs={
             "sensor": SENSOR_LANDSAT,
-            "scene_id": signed_item.id,
-            "datetime": dt_utc.isoformat(),
-            "cloud_cover": signed_item.properties.get("eo:cloud_cover"),
-            "mgrs_tile": tile_label,
-            "platform": signed_item.properties.get("platform", ""),
-            "slc_off": _is_landsat7_slc_off(signed_item),
+            "scene_id": meta["id"],
+            "datetime": meta["datetime"].isoformat(),
+            "cloud_cover": meta["cloud_cover"],
+            "mgrs_tile": meta["mgrs_tile"],
+            "tile_count": meta["tile_count"],
+            "platform": meta["platform"],
+            "slc_off": any(_is_landsat7_slc_off(it) for it in signed_items),
             "processing_baseline": "C2-L2",
             "radiometric_offset_applied": True,
             "resolution_m": float(resolution),
@@ -604,66 +770,37 @@ def search_sentinel1(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     limit: int = 50,
-) -> tuple[list[pystac.Item], pd.DataFrame]:
-    """Search Sentinel-1 SAR RTC scenes on Microsoft Planetary Computer (all-weather)."""
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Search Sentinel-1 SAR RTC scenes on Planetary Computer, grouped by acquisition date."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
 
     datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
+    raw_fetch_limit = max(int(limit) * 4, 150)
+
     catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
     search = catalog.search(
         collections=[SENTINEL1_COLLECTION],
         bbox=[float(v) for v in bbox_4326],
         datetime=datetime_range,
-        max_items=int(limit),
+        max_items=raw_fetch_limit,
     )
 
-    items = list(search.items())
-    if not items:
-        return [], pd.DataFrame(columns=SUMMARY_COLUMNS)
-
-    items.sort(key=_extract_item_datetime_utc, reverse=True)
-
-    rows: list[dict[str, object]] = []
-    for item in items:
-        dt_utc = _extract_item_datetime_utc(item)
-        rel_orbit = item.properties.get("sat:relative_orbit", "")
-        orbit_state = str(item.properties.get("sat:orbit_state", "")).upper()
-        orbit_short = orbit_state[:3] if orbit_state else ""
-        tile_label = f"Orb {rel_orbit} ({orbit_short})" if rel_orbit else orbit_short
-
-        pols = item.properties.get("sar:polarizations") or []
-        pol_str = "+".join(str(p) for p in pols)
-        platform = str(item.properties.get("platform", "sentinel-1"))
-        if pol_str:
-            platform = f"{platform} ({pol_str})"
-
-        rows.append(
-            {
-                "id": item.id,
-                "datetime": pd.Timestamp(dt_utc),
-                "date_str": dt_utc.strftime("%Y-%m-%d"),
-                "cloud_cover": np.nan,
-                "mgrs_tile": tile_label,
-                "platform": platform,
-            }
-        )
-
-    summary_df = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
-    return items, summary_df
+    raw_items = list(search.items())
+    return group_items_by_date(raw_items, sensor=SENSOR_S1, limit=int(limit))
 
 
 def load_sentinel1_scene(
-    item: pystac.Item,
+    item: StacItemOrGroup,
     bbox_4326: Sequence[float],
     polarizations: Sequence[str] = ("vv", "vh"),
     target_epsg: int | str = "EPSG:3794",
     resolution: float = 10,
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
-    """Load a clipped Sentinel-1 RTC scene and convert linear backscatter to decibels (dB).
+    """Load a clipped Sentinel-1 RTC scene (or same-day granule mosaic) in decibels (dB).
 
     Converts linear intensity ``val`` to:
     ``sigma0_dB = 10 * log10(max(val, 1e-6))`` (``float32``), keeping non-finite
@@ -673,29 +810,34 @@ def load_sentinel1_scene(
     if resolution <= 0:
         raise ValueError(f"resolution must be positive, got {resolution}.")
 
+    item_list = _normalize_item_group(item)
     req_pols = [str(p).strip().lower() for p in polarizations if str(p).strip()]
-    available_pols = [p for p in req_pols if p in item.assets]
+    available_pols = [p for p in req_pols if any(p in it.assets for it in item_list)]
     if not available_pols:
+        all_assets = sorted({k for it in item_list for k in it.assets.keys()})
         raise KeyError(
-            f"Requested polarizations {req_pols} not available in Sentinel-1 item {item.id!r}. "
-            f"Available assets: {sorted(item.assets.keys())}."
+            f"Requested polarizations {req_pols} not available in Sentinel-1 item(s) "
+            f"{[it.id for it in item_list]!r}. Available assets: {all_assets}."
         )
 
+    usable_items = [it for it in item_list if all(p in it.assets for p in available_pols)]
+    if not usable_items:
+        usable_items = [it for it in item_list if any(p in it.assets for p in available_pols)]
+
     crs_str = _normalize_crs_str(target_epsg)
-    signed_item = planetary_computer.sign(item)
+    signed_items = [planetary_computer.sign(it) for it in usable_items]
     _configure_odc_rio()
 
     raw_ds = odc.stac.load(
-        [signed_item],
+        signed_items,
         bands=available_pols,
         bbox=[float(v) for v in bbox_4326],
         crs=crs_str,
         resolution=float(resolution),
         resampling="bilinear",
+        groupby="solar_day",
     )
-
-    if "time" in raw_ds.dims and raw_ds.sizes["time"] == 1:
-        raw_ds = raw_ds.isel(time=0)
+    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_S1)
 
     calibrated_vars: dict[str, xr.DataArray] = {}
     for pol in available_pols:
@@ -728,21 +870,18 @@ def load_sentinel1_scene(
         calibrated_vars[pol_upper] = pol_da
         del raw_vals, valid_mask, db_vals
 
-    dt_utc = _extract_item_datetime_utc(signed_item)
-    rel_orbit = signed_item.properties.get("sat:relative_orbit", "")
-    orbit_state = str(signed_item.properties.get("sat:orbit_state", "")).upper()
-    tile_label = f"Orb {rel_orbit} ({orbit_state[:3]})" if rel_orbit else orbit_state[:3]
-
+    meta = _merge_group_metadata(signed_items, sensor=SENSOR_S1)
     ds = xr.Dataset(
         data_vars=calibrated_vars,
         coords=raw_ds.coords,
         attrs={
             "sensor": SENSOR_S1,
-            "scene_id": signed_item.id,
-            "datetime": dt_utc.isoformat(),
+            "scene_id": meta["id"],
+            "datetime": meta["datetime"].isoformat(),
             "cloud_cover": np.nan,
-            "mgrs_tile": tile_label,
-            "platform": signed_item.properties.get("platform", "sentinel-1"),
+            "mgrs_tile": meta["mgrs_tile"],
+            "tile_count": meta["tile_count"],
+            "platform": meta["platform"],
             "processing_baseline": "RTC",
             "radiometric_offset_applied": False,
             "resolution_m": float(resolution),
@@ -770,8 +909,8 @@ def search_scenes(
     max_cloud_cover: float = 20,
     limit: int = 50,
     exclude_l7_slc_off: bool = False,
-) -> tuple[list[pystac.Item], pd.DataFrame]:
-    """Dispatch STAC search to Sentinel-2 L2A, Landsat C2 L2, or Sentinel-1 RTC."""
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Dispatch date-grouped STAC search to Sentinel-2 L2A, Landsat C2 L2, or Sentinel-1 RTC."""
     if sensor == SENSOR_S2:
         return search_sentinel2(
             bbox_4326=bbox_4326,
@@ -801,14 +940,14 @@ def search_scenes(
 
 def load_scene(
     sensor: str,
-    item: pystac.Item,
+    item: StacItemOrGroup,
     bbox_4326: Sequence[float],
     bands: Sequence[str],
     target_epsg: int | str = "EPSG:3794",
     resolution: float = 10,
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
-    """Dispatch clipped COG loading and calibration to the selected sensor loader."""
+    """Dispatch clipped COG loading and same-day tile mosaicking to the selected sensor loader."""
     if sensor == SENSOR_S2:
         return load_sentinel2_scene(
             item=item,

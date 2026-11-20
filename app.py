@@ -298,7 +298,7 @@ SENSOR_META: dict[str, dict[str, Any]] = {
         "short_name": "Sentinel-2 L2A",
         "file_prefix": "S2L2A",
         "min_date": date(2015, 6, 23),
-        "res_options": [10, 20, 60],
+        "res_options": [10, 20, 30, 60],
         "default_res": 10,
     },
     SENSOR_LANDSAT: {
@@ -314,8 +314,30 @@ SENSOR_META: dict[str, dict[str, Any]] = {
         "short_name": "Sentinel-1 SAR RTC",
         "file_prefix": "S1RTC",
         "min_date": date(2014, 10, 1),
-        "res_options": [10, 20, 60],
+        "res_options": [10, 20, 30, 60],
         "default_res": 10,
+    },
+}
+
+BASEMAP_KEYS: list[str] = ["satellite", "topo", "osm"]
+BASEMAP_SPECS: dict[str, dict[str, Any]] = {
+    "satellite": {
+        "label_key": "basemap_satellite",
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Esri World Imagery",
+        "max_zoom": 19,
+    },
+    "topo": {
+        "label_key": "basemap_topo",
+        "tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        "attr": "Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)",
+        "max_zoom": 17,
+    },
+    "osm": {
+        "label_key": "basemap_osm",
+        "tiles": "OpenStreetMap",
+        "attr": None,
+        "max_zoom": 19,
     },
 }
 
@@ -385,9 +407,11 @@ def _init_session_state() -> None:
     defaults: dict[str, Any] = {
         "lang": "sl",
         "active_sensor": SENSOR_S2,
+        "map_basemap": "satellite",
         "map_lat": SLOVENIA_CENTER_LAT,
         "map_lon": SLOVENIA_CENTER_LON,
         "map_zoom": 10,
+        "live_map_zoom": 10,
         "map_radius_m": 2000,
         "last_processed_click": None,
         "geocoded_place_msg": None,
@@ -525,7 +549,9 @@ def _format_tile_label(tile: str, sensor: str = SENSOR_S2) -> str:
     if not clean:
         return "—"
     if sensor == SENSOR_S2:
-        return clean if clean.startswith("T") else f"T{clean}"
+        parts = [p.strip() for p in clean.split("+") if p.strip()]
+        formatted = [p if p.startswith("T") else f"T{p}" for p in parts]
+        return " + ".join(formatted) if formatted else "—"
     return clean
 
 
@@ -587,6 +613,37 @@ def _extract_drawn_polygon(map_out: Any) -> dict[str, Any] | None:
     return None
 
 
+def _create_base_folium_map(
+    center_lat: float,
+    center_lon: float,
+    zoom_start: int = 10,
+    basemap_key: str = "satellite",
+) -> folium.Map:
+    """Ustvari Folium zemljevid z natanko eno izbrano podlago (brez ponastavljanja ob kliku)."""
+    spec = BASEMAP_SPECS.get(basemap_key, BASEMAP_SPECS["satellite"])
+    max_z = int(spec["max_zoom"])
+    clamped_zoom = max(1, min(int(zoom_start), max_z))
+
+    fmap = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=clamped_zoom,
+        tiles=None,
+        control_scale=True,
+        max_zoom=max_z,
+    )
+    tile_kwargs: dict[str, Any] = {
+        "tiles": spec["tiles"],
+        "name": t(spec["label_key"]),
+        "overlay": False,
+        "control": False,
+        "max_zoom": max_z,
+    }
+    if spec["attr"]:
+        tile_kwargs["attr"] = spec["attr"]
+    folium.TileLayer(**tile_kwargs).add_to(fmap)
+    return fmap
+
+
 def _build_aoi_folium_map(
     center_lat: float,
     center_lon: float,
@@ -595,21 +652,15 @@ def _build_aoi_folium_map(
     polygon_geojson_4326: dict[str, Any] | None = None,
     zoom_start: int = 10,
     interactive_hint: bool = True,
+    basemap_key: str = "satellite",
 ) -> folium.Map:
     """Ustvari Folium zemljevid s kartografsko oznako AOI v temno petrol-zeleni barvi."""
-    fmap = folium.Map(
-        location=[center_lat, center_lon],
+    fmap = _create_base_folium_map(
+        center_lat=center_lat,
+        center_lon=center_lon,
         zoom_start=zoom_start,
-        tiles="OpenStreetMap",
-        control_scale=True,
+        basemap_key=basemap_key,
     )
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name=t("map_layer_sat"),
-        overlay=False,
-        control=True,
-    ).add_to(fmap)
 
     if polygon_geojson_4326 is not None:
         folium.GeoJson(
@@ -657,7 +708,6 @@ def _build_aoi_folium_map(
         tooltip=tooltip_txt,
     ).add_to(fmap)
 
-    folium.LayerControl(collapsed=False).add_to(fmap)
     return fmap
 
 
@@ -666,21 +716,15 @@ def _build_draw_folium_map(
     center_lon: float,
     existing_polygon_4326: dict[str, Any] | None = None,
     zoom_start: int = 11,
+    basemap_key: str = "satellite",
 ) -> folium.Map:
     """Ustvari interaktivni Folium zemljevid z orodjem Draw (poligon in pravokotnik)."""
-    fmap = folium.Map(
-        location=[center_lat, center_lon],
+    fmap = _create_base_folium_map(
+        center_lat=center_lat,
+        center_lon=center_lon,
         zoom_start=zoom_start,
-        tiles="OpenStreetMap",
-        control_scale=True,
+        basemap_key=basemap_key,
     )
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name=t("map_layer_sat"),
-        overlay=False,
-        control=True,
-    ).add_to(fmap)
 
     if existing_polygon_4326 is not None:
         folium.GeoJson(
@@ -724,7 +768,6 @@ def _build_draw_folium_map(
         edit_options={"edit": True, "remove": True},
     ).add_to(fmap)
 
-    folium.LayerControl(collapsed=False).add_to(fmap)
     return fmap
 
 
@@ -1666,11 +1709,20 @@ def _build_time_series_chart(
     return fig
 
 
+def _epoch_sort_key(item_or_group: Any) -> str:
+    """Izvleče ISO časovni žig za kronološko razvrščanje posameznih ali združenih STAC posnetkov."""
+    first = item_or_group[0] if isinstance(item_or_group, (list, tuple)) else item_or_group
+    dt = getattr(first, "datetime", None)
+    if dt is not None:
+        return dt.isoformat()
+    return str(first.properties.get("datetime", ""))
+
+
 def _select_evenly_spaced_items(items: list[Any], max_epochs: int) -> list[Any]:
     """Kronološko izbere največ ``max_epochs`` enakomerno razporejenih posnetkov."""
     if len(items) <= max_epochs:
         return list(items)
-    ordered = sorted(items, key=lambda it: it.datetime or it.properties.get("datetime", ""))
+    ordered = sorted(items, key=_epoch_sort_key)
     indices = np.linspace(0, len(ordered) - 1, num=max_epochs, dtype=int)
     seen: set[int] = set()
     selected = []
@@ -1692,7 +1744,7 @@ def _render_interactive_aoi_section(
     aoi_polygon_4326: dict[str, Any] | None,
     lang: str,
 ) -> None:
-    """Izriše vrstico za iskanje kraja (Nominatim) in velik 600 px interaktivni zemljevid AOI."""
+    """Izriše vrstico za iskanje kraja (Nominatim), trajno izbiro podlage in 600 px zemljevid AOI."""
     col_q, col_btn = st.columns([3.2, 1.0])
     with col_q:
         place_query = st.text_input(
@@ -1717,6 +1769,7 @@ def _render_interactive_aoi_section(
                 st.session_state["map_lat"] = round(found_lat, 6)
                 st.session_state["map_lon"] = round(found_lon, 6)
                 st.session_state["map_zoom"] = 13
+                st.session_state["live_map_zoom"] = 13
                 st.session_state["geocoded_place_msg"] = t(
                     "place_found_msg",
                     name=found_name,
@@ -1732,27 +1785,57 @@ def _render_interactive_aoi_section(
     if st.session_state.get("geocoded_place_msg"):
         st.caption(f"📍 {st.session_state['geocoded_place_msg']}")
 
+    # Trajna izbira podlage zemljevida (privzeto: Satelitska podlaga Esri) — ne ponastavi se ob kliku!
+    prev_basemap = str(st.session_state.get("map_basemap", "satellite"))
+    if prev_basemap not in BASEMAP_KEYS:
+        prev_basemap = "satellite"
+    selected_basemap = st.radio(
+        t("basemap_selector_label"),
+        options=BASEMAP_KEYS,
+        index=BASEMAP_KEYS.index(prev_basemap),
+        horizontal=True,
+        format_func=lambda k, _lang=lang: t(BASEMAP_SPECS[k]["label_key"], lang=_lang),
+        key="main_map_basemap_radio",
+    )
+    if selected_basemap != prev_basemap:
+        st.session_state["map_basemap"] = selected_basemap
+        live_z = st.session_state.get("live_map_zoom")
+        if live_z is not None:
+            st.session_state["map_zoom"] = int(live_z)
+
     # Način 1: Interaktivno risanje poligona / pravokotnika na 600 px zemljevidu
     if aoi_mode_key == "draw":
         st.caption(t("draw_main_hint"))
+        draw_zoom = int(st.session_state.get("map_zoom", 11))
         draw_map = _build_draw_folium_map(
             center_lat=center_lat,
             center_lon=center_lon,
             existing_polygon_4326=st.session_state.get("drawn_polygon_4326"),
-            zoom_start=12 if st.session_state.get("drawn_polygon_4326") is not None else int(st.session_state.get("map_zoom", 10)),
+            zoom_start=draw_zoom,
+            basemap_key=selected_basemap,
         )
         draw_ver = int(st.session_state.get("draw_map_version", 0))
         draw_out = st_folium(
             draw_map,
             height=600,
             use_container_width=True,
-            returned_objects=["last_active_drawing", "all_drawings"],
-            key=f"aoi_draw_map_{draw_ver}",
+            returned_objects=["last_active_drawing", "all_drawings", "zoom"],
+            key=f"aoi_draw_map_{draw_ver}_{selected_basemap}",
         )
+        if isinstance(draw_out, dict) and draw_out.get("zoom") is not None:
+            try:
+                st.session_state["live_map_zoom"] = int(draw_out["zoom"])
+            except (TypeError, ValueError):
+                pass
         extracted_poly = _extract_drawn_polygon(draw_out)
         if extracted_poly is not None:
             prev_poly = st.session_state.get("drawn_polygon_4326")
             if json.dumps(extracted_poly, sort_keys=True) != json.dumps(prev_poly, sort_keys=True):
+                if isinstance(draw_out, dict) and draw_out.get("zoom") is not None:
+                    try:
+                        st.session_state["map_zoom"] = int(draw_out["zoom"])
+                    except (TypeError, ValueError):
+                        pass
                 st.session_state["drawn_polygon_4326"] = extracted_poly
                 st.rerun()
 
@@ -1762,7 +1845,7 @@ def _render_interactive_aoi_section(
         if is_click_mode:
             st.caption(t("map_click_hint"))
 
-        zoom_val = int(st.session_state.get("map_zoom", 11))
+        zoom_val = int(st.session_state.get("map_zoom", 10))
         main_map = _build_aoi_folium_map(
             center_lat=center_lat,
             center_lon=center_lon,
@@ -1771,28 +1854,44 @@ def _render_interactive_aoi_section(
             polygon_geojson_4326=aoi_polygon_4326,
             zoom_start=zoom_val,
             interactive_hint=is_click_mode,
+            basemap_key=selected_basemap,
         )
-        returned_objs = ["last_clicked"] if is_click_mode else []
+        returned_objs = ["last_clicked", "zoom"] if is_click_mode else ["zoom"]
         map_out = st_folium(
             main_map,
             height=600,
             use_container_width=True,
             returned_objects=returned_objs,
-            key="main_interactive_aoi_map",
+            key=f"main_interactive_aoi_map_{selected_basemap}",
         )
-        if is_click_mode and isinstance(map_out, dict):
-            clicked = map_out.get("last_clicked")
-            if isinstance(clicked, dict) and "lat" in clicked and "lng" in clicked:
-                new_lat = round(float(clicked["lat"]), 6)
-                new_lon = round(float(clicked["lng"]), 6)
-                click_sig = (new_lat, new_lon)
-                if click_sig != st.session_state.get("last_processed_click"):
-                    st.session_state["last_processed_click"] = click_sig
-                    if abs(new_lat - center_lat) > 1e-6 or abs(new_lon - center_lon) > 1e-6:
-                        st.session_state["map_lat"] = new_lat
-                        st.session_state["map_lon"] = new_lon
-                        st.session_state["geocoded_place_msg"] = None
-                        st.rerun()
+        if isinstance(map_out, dict):
+            raw_zoom = map_out.get("zoom")
+            if raw_zoom is not None:
+                try:
+                    st.session_state["live_map_zoom"] = int(raw_zoom)
+                except (TypeError, ValueError):
+                    pass
+
+            if is_click_mode:
+                clicked = map_out.get("last_clicked")
+                if isinstance(clicked, dict) and "lat" in clicked and "lng" in clicked:
+                    new_lat = round(float(clicked["lat"]), 6)
+                    new_lon = round(float(clicked["lng"]), 6)
+                    click_sig = (new_lat, new_lon)
+                    if click_sig != st.session_state.get("last_processed_click"):
+                        st.session_state["last_processed_click"] = click_sig
+                        if abs(new_lat - center_lat) > 1e-6 or abs(new_lon - center_lon) > 1e-6:
+                            st.session_state["map_lat"] = new_lat
+                            st.session_state["map_lon"] = new_lon
+                            if raw_zoom is not None:
+                                try:
+                                    st.session_state["map_zoom"] = int(raw_zoom)
+                                except (TypeError, ValueError):
+                                    pass
+                            elif st.session_state.get("live_map_zoom") is not None:
+                                st.session_state["map_zoom"] = int(st.session_state["live_map_zoom"])
+                            st.session_state["geocoded_place_msg"] = None
+                            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -2048,10 +2147,11 @@ def main() -> None:
             c_km.metric(t("metric_area_km2"), f"{area_km2:,.2f}")
             c_ha.metric(t("metric_area_ha"), f"{area_ha:,.1f}")
 
-            res_key = f"{sensor}_{round(area_km2, 1)}_{rec_res}"
+            res_key = f"{sensor}_{rec_res}"
             if st.session_state["last_rec_res_key"] != res_key:
                 st.session_state["last_rec_res_key"] = res_key
                 st.session_state["selected_resolution"] = rec_res
+                st.session_state[f"sidebar_res_select_{sensor}"] = rec_res
 
             if not aoi_valid:
                 st.error(t("aoi_too_large", area=area_km2))

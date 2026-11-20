@@ -65,7 +65,8 @@ SUPPORTED_CRS: dict[str, dict[str, object]] = {
 
 # RAM-safe resolution step-down thresholds (km^2) for 1 GB Streamlit Cloud limit
 _RES_10M_MAX_KM2: float = 100.0
-_RES_20M_MAX_KM2: float = 400.0
+_RES_20M_MAX_KM2: float = 350.0
+_RES_30M_MAX_KM2: float = 750.0
 
 
 def normalize_crs(epsg_or_crs: int | str | CRS) -> CRS:
@@ -222,13 +223,24 @@ def bbox_from_point_wgs84(
     return bbox_from_point_d96tm(e, n, radius_m)
 
 
+def _recommended_resolution_for_area(area_km2: float) -> int:
+    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for AOI area."""
+    if area_km2 <= _RES_10M_MAX_KM2:
+        return 10
+    if area_km2 <= _RES_20M_MAX_KM2:
+        return 20
+    if area_km2 <= _RES_30M_MAX_KM2:
+        return 30
+    return 60
+
+
 def validate_aoi_size(
     bbox_4326: Sequence[float],
     max_area_km2: float = 900.0,
 ) -> tuple[float, bool, int]:
     """Validate an EPSG:4326 AOI bounding box by computing exact area in EPSG:3794.
 
-    Also recommends a RAM-safe Sentinel-2 target resolution (10 m -> 20 m -> 60 m)
+    Also recommends a RAM-safe target resolution (10 m -> 20 m -> 30 m -> 60 m)
     to stay comfortably within Streamlit Community Cloud's 1 GB RAM limit.
 
     Parameters
@@ -263,13 +275,7 @@ def validate_aoi_size(
     area_km2 = float(geom_3794.area / 1_000_000.0)
 
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
-
-    if area_km2 <= _RES_10M_MAX_KM2:
-        recommended_resolution_m = 10
-    elif area_km2 <= _RES_20M_MAX_KM2:
-        recommended_resolution_m = 20
-    else:
-        recommended_resolution_m = 60
+    recommended_resolution_m = _recommended_resolution_for_area(area_km2)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
 
@@ -295,13 +301,7 @@ def validate_aoi_geometry(
     geom_3794 = shapely_transform(transformer.transform, geom_dense)
     area_km2 = float(geom_3794.area / 1_000_000.0)
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
-
-    if area_km2 <= _RES_10M_MAX_KM2:
-        recommended_resolution_m = 10
-    elif area_km2 <= _RES_20M_MAX_KM2:
-        recommended_resolution_m = 20
-    else:
-        recommended_resolution_m = 60
+    recommended_resolution_m = _recommended_resolution_for_area(area_km2)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
 
