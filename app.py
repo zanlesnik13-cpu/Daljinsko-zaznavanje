@@ -48,6 +48,7 @@ from casovne_vrste import (
     compile_timelapse_gif,
     compute_change_detection,
     compute_change_summary,
+    compute_cloud_free_composite,
     extract_time_series,
     generate_timelapse_frames,
     render_change_swipe_pair,
@@ -98,42 +99,53 @@ st.markdown(
     --geo-border: #E2E8F0;
     --geo-surface: #FFFFFF;
     --geo-bg: #F8FAFC;
+    --geo-radius: 8px;
 }
 
 .block-container {
-    padding-top: 3.4rem !important;
-    padding-bottom: 2.25rem !important;
-    max-width: 1400px;
+    padding-top: 2.85rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 1440px;
 }
 
-/* Čist tehnični naslovni pas */
+/* Kompakten, čist horizontalni naslovni pas */
 .geo-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.65rem 1.25rem;
     background-color: var(--geo-surface);
     border: 1px solid var(--geo-border);
     border-left: 4px solid var(--geo-teal);
-    border-radius: 6px;
-    padding: 0.95rem 1.25rem;
-    margin-bottom: 1rem;
+    border-radius: var(--geo-radius);
+    padding: 0.65rem 1.05rem;
+    margin-bottom: 0.8rem;
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
+.geo-header-left {
+    min-width: 240px;
+    flex: 1 1 auto;
+}
 .geo-header-title {
-    font-size: 1.45rem;
+    font-size: 1.2rem;
     font-weight: 700;
     color: var(--geo-slate);
     letter-spacing: -0.015em;
-    margin: 0 0 0.25rem 0;
-    line-height: 1.3;
+    margin: 0;
+    line-height: 1.25;
 }
 .geo-header-sub {
-    font-size: 0.9rem;
+    font-size: 0.8rem;
     color: var(--geo-muted);
-    margin: 0 0 0.55rem 0;
-    line-height: 1.4;
+    margin: 0.12rem 0 0 0;
+    line-height: 1.3;
 }
 .geo-badges {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.45rem;
+    align-items: center;
+    gap: 0.4rem;
 }
 .geo-badge {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -142,64 +154,112 @@ st.markdown(
     color: var(--geo-teal-dark);
     background-color: var(--geo-teal-soft);
     border: 1px solid rgba(15, 118, 110, 0.22);
-    border-radius: 4px;
-    padding: 0.14rem 0.5rem;
+    border-radius: 6px;
+    padding: 0.2rem 0.55rem;
+    white-space: nowrap;
+}
+.geo-badge-slate {
+    color: var(--geo-slate);
+    background-color: #F1F5F9;
+    border: 1px solid #CBD5E1;
+}
+
+/* Inline RAM statusni indikator v stranski vrstici */
+.ram-pill {
+    font-size: 0.78rem;
+    font-weight: 600;
+    border-radius: 6px;
+    padding: 0.34rem 0.6rem;
+    margin: 0.35rem 0 0.45rem 0;
+    line-height: 1.35;
+}
+.ram-pill-ok {
+    color: #166534;
+    background-color: #F0FDF4;
+    border: 1px solid #BBF7D0;
+}
+.ram-pill-warn {
+    color: #92400E;
+    background-color: #FFFBEB;
+    border: 1px solid #FDE68A;
+}
+.ram-pill-err {
+    color: #991B1B;
+    background-color: #FEF2F2;
+    border: 1px solid #FECACA;
 }
 
 /* Monospace kartica za geodetske koordinate */
 .coord-box {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.78rem;
-    line-height: 1.5;
+    font-size: 0.76rem;
+    line-height: 1.48;
     color: var(--geo-slate);
     background-color: var(--geo-surface);
     border: 1px solid var(--geo-border);
     border-left: 3px solid var(--geo-teal);
-    border-radius: 5px;
-    padding: 0.5rem 0.65rem;
-    margin: 0.35rem 0 0.5rem 0;
+    border-radius: 6px;
+    padding: 0.45rem 0.62rem;
+    margin: 0.3rem 0 0.45rem 0;
 }
 .coord-box strong {
     color: var(--geo-teal-dark);
+}
+
+/* Strukturirane kartice z obrobo (st.container(border=True)) */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background-color: var(--geo-surface);
+    border: 1px solid var(--geo-border) !important;
+    border-radius: var(--geo-radius) !important;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
 
 /* Kartice metrik */
 div[data-testid="stMetric"] {
     background-color: var(--geo-surface);
     border: 1px solid var(--geo-border);
-    border-radius: 6px;
-    padding: 0.65rem 0.85rem;
+    border-radius: var(--geo-radius);
+    padding: 0.6rem 0.85rem;
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
 div[data-testid="stMetric"] label {
     color: var(--geo-muted);
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     font-weight: 600;
 }
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {
     color: var(--geo-slate);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 1.25rem;
+    font-size: 1.18rem;
     font-weight: 700;
 }
 
-/* Stranska vrstica z jasno ločnico */
+/* Stranska vrstica z jasno ločnico in kompaktnim razmikom (tablice) */
 section[data-testid="stSidebar"] {
     border-right: 1px solid #CBD5E1;
+}
+section[data-testid="stSidebar"] .block-container {
+    padding-top: 1.1rem !important;
 }
 section[data-testid="stSidebar"] h2,
 section[data-testid="stSidebar"] h3 {
     color: var(--geo-slate);
+    font-size: 0.98rem;
     letter-spacing: -0.01em;
+    margin-bottom: 0.25rem;
 }
 
-/* Gumbi prilagojeni tudi za tablice (touchscreen) */
+/* Gumbi prilagojeni za namizja in tablice (Samsung Galaxy Tab S11 Ultra) */
 .stButton > button, .stDownloadButton > button {
     min-height: 2.65rem;
     font-weight: 600;
-    border-radius: 6px;
+    border-radius: var(--geo-radius);
     border: 1px solid var(--geo-border);
-    transition: background-color 0.15s ease, border-color 0.15s ease;
+    transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.stButton > button:hover {
+    border-color: var(--geo-teal);
+    color: var(--geo-teal-dark);
 }
 .stButton > button[kind="primary"] {
     background-color: var(--geo-teal);
@@ -209,6 +269,7 @@ section[data-testid="stSidebar"] h3 {
 .stButton > button[kind="primary"]:hover {
     background-color: var(--geo-teal-dark);
     border-color: var(--geo-teal-dark);
+    color: #FFFFFF;
 }
 .stDownloadButton > button {
     background-color: var(--geo-surface);
@@ -220,14 +281,20 @@ section[data-testid="stSidebar"] h3 {
     border-color: var(--geo-teal-dark);
 }
 
-/* Zavihki */
+/* Zavihki in podzavihki */
 button[data-baseweb="tab"] {
     font-weight: 600;
     color: var(--geo-muted);
-    padding: 0.55rem 0.9rem;
+    min-height: 2.55rem;
+    padding: 0.45rem 0.95rem;
 }
 button[data-baseweb="tab"][aria-selected="true"] {
     color: var(--geo-teal-dark);
+}
+div[data-testid="stExpander"] {
+    border: 1px solid var(--geo-border);
+    border-radius: var(--geo-radius);
+    background-color: var(--geo-surface);
 }
 </style>
 """,
@@ -323,18 +390,21 @@ BASEMAP_KEYS: list[str] = ["satellite", "topo", "osm"]
 BASEMAP_SPECS: dict[str, dict[str, Any]] = {
     "satellite": {
         "label_key": "basemap_satellite",
+        "short_label_key": "basemap_satellite_short",
         "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         "attr": "Esri World Imagery",
         "max_zoom": 19,
     },
     "topo": {
         "label_key": "basemap_topo",
+        "short_label_key": "basemap_topo_short",
         "tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
         "attr": "Map data: © OpenStreetMap contributors, SRTM | Map style: © OpenTopoMap (CC-BY-SA)",
         "max_zoom": 17,
     },
     "osm": {
         "label_key": "basemap_osm",
+        "short_label_key": "basemap_osm_short",
         "tiles": "OpenStreetMap",
         "attr": None,
         "max_zoom": 19,
@@ -354,6 +424,10 @@ CRS_KEYS: list[str] = [CRS_D96TM, CRS_UTM33N]
 CRS_I18N: dict[str, str] = {
     CRS_D96TM: "crs_d96_label",
     CRS_UTM33N: "crs_utm_label",
+}
+CRS_SHORT_I18N: dict[str, str] = {
+    CRS_D96TM: "crs_short_d96",
+    CRS_UTM33N: "crs_short_utm",
 }
 
 OPTICAL_COMPOSITE_SPECS: dict[str, dict[str, Any]] = {
@@ -400,13 +474,29 @@ SAR_METRIC_KEYS: list[str] = ["VV", "VH", "VV_VH"]
 
 
 # ---------------------------------------------------------------------------
-# Pomožne funkcije: stanje seje, geokodiranje, zemljevid, Plotly prikazovalnik
+# Pomožne funkcije: stanje seje, sinhronizacija senzorja/datumov, iskanje STAC
 # ---------------------------------------------------------------------------
 def _init_session_state() -> None:
     """Inicializira spremenljivke seje."""
+    today = date.today()
+    default_start = today - timedelta(days=183)
     defaults: dict[str, Any] = {
         "lang": "sl",
+        "selected_sensor": SENSOR_S2,
         "active_sensor": SENSOR_S2,
+        "sidebar_sensor_select": SENSOR_S2,
+        "main_bar_sensor_select": SENSOR_S2,
+        "tab3_sensor_select": SENSOR_S2,
+        "search_start_date": default_start,
+        "search_end_date": today,
+        "sidebar_start_date": default_start,
+        "sidebar_end_date": today,
+        "tab3_start_date": default_start,
+        "tab3_end_date": today,
+        "search_max_cloud": 20,
+        "sidebar_max_cloud": 20,
+        "tab3_max_cloud": 20,
+        "exclude_l7_slc_off": False,
         "map_basemap": "satellite",
         "map_lat": SLOVENIA_CENTER_LAT,
         "map_lon": SLOVENIA_CENTER_LON,
@@ -430,12 +520,16 @@ def _init_session_state() -> None:
         "loaded_scene_meta": None,
         "loaded_tif_bytes": None,
         "loaded_tif_filename": None,
-        # Tab 2 state (optical & SAR)
+        # Tab 2 state (optical, cloud-free composite & SAR)
         "tab2_index_da": None,
         "tab2_index_stats": None,
         "tab2_index_meta": None,
         "tab2_tif_bytes": None,
         "tab2_tif_filename": None,
+        "tab2_comp_obj": None,
+        "tab2_comp_meta": None,
+        "tab2_comp_tif_bytes": None,
+        "tab2_comp_tif_filename": None,
         "tab2_sar_ds": None,
         "tab2_sar_meta": None,
         "tab2_sig_ds": None,
@@ -477,6 +571,10 @@ def _clear_loaded_products() -> None:
         "tab2_index_meta",
         "tab2_tif_bytes",
         "tab2_tif_filename",
+        "tab2_comp_obj",
+        "tab2_comp_meta",
+        "tab2_comp_tif_bytes",
+        "tab2_comp_tif_filename",
         "tab2_sar_ds",
         "tab2_sar_meta",
         "tab2_sig_ds",
@@ -499,6 +597,138 @@ def _clear_loaded_products() -> None:
     ):
         st.session_state[key] = None
     gc.collect()
+
+
+def _clamp_dates_for_sensor(sensor_key: str) -> None:
+    """Zagotovi, da sta začetni in končni datum znotraj veljavnega razpona za izbrani senzor."""
+    today = date.today()
+    min_d: date = SENSOR_META[sensor_key]["min_date"]
+    cur_start: date = st.session_state.get("search_start_date", today - timedelta(days=183))
+    cur_end: date = st.session_state.get("search_end_date", today)
+    if cur_start < min_d:
+        cur_start = min_d
+    if cur_start > today:
+        cur_start = today
+    if cur_end < min_d:
+        cur_end = today
+    if cur_end > today:
+        cur_end = today
+    if cur_start > cur_end:
+        cur_start = min_d
+
+    st.session_state["search_start_date"] = cur_start
+    st.session_state["search_end_date"] = cur_end
+    st.session_state["sidebar_start_date"] = cur_start
+    st.session_state["sidebar_end_date"] = cur_end
+    st.session_state["tab3_start_date"] = cur_start
+    st.session_state["tab3_end_date"] = cur_end
+
+
+def _sync_sensor_state(source_key: str | None = None, explicit_sensor: str | None = None) -> None:
+    """Sinhronizira izbrani senzor med stransko vrstico, glavno vrstico AOI in Zavihkom 3."""
+    new_sensor = explicit_sensor if explicit_sensor is not None else st.session_state.get(source_key or "selected_sensor", SENSOR_S2)
+    if new_sensor not in SENSOR_KEYS:
+        return
+
+    prev_sensor = st.session_state.get("selected_sensor", SENSOR_S2)
+    st.session_state["selected_sensor"] = new_sensor
+    st.session_state["active_sensor"] = new_sensor
+    st.session_state["sidebar_sensor_select"] = new_sensor
+    st.session_state["main_bar_sensor_select"] = new_sensor
+    st.session_state["tab3_sensor_select"] = new_sensor
+
+    if new_sensor != prev_sensor:
+        st.session_state["stac_items"] = []
+        st.session_state["stac_summary_df"] = pd.DataFrame()
+        st.session_state["search_performed"] = False
+        st.session_state["search_sensor"] = new_sensor
+        st.session_state["last_rec_res_key"] = None
+        default_res = SENSOR_META[new_sensor]["default_res"]
+        st.session_state["selected_resolution"] = default_res
+        st.session_state[f"sidebar_res_select_{new_sensor}"] = default_res
+        _clamp_dates_for_sensor(new_sensor)
+        _clear_loaded_products()
+
+
+def _sync_start_date_state(source_key: str) -> None:
+    new_d = st.session_state.get(source_key)
+    if isinstance(new_d, date):
+        st.session_state["search_start_date"] = new_d
+        st.session_state["sidebar_start_date"] = new_d
+        st.session_state["tab3_start_date"] = new_d
+
+
+def _sync_end_date_state(source_key: str) -> None:
+    new_d = st.session_state.get(source_key)
+    if isinstance(new_d, date):
+        st.session_state["search_end_date"] = new_d
+        st.session_state["sidebar_end_date"] = new_d
+        st.session_state["tab3_end_date"] = new_d
+
+
+def _sync_max_cloud_state(source_key: str) -> None:
+    val = st.session_state.get(source_key)
+    if val is not None:
+        c_int = int(val)
+        st.session_state["search_max_cloud"] = c_int
+        st.session_state["sidebar_max_cloud"] = c_int
+        st.session_state["tab3_max_cloud"] = c_int
+
+
+def _apply_tab3_date_preset(preset_code: str) -> None:
+    """Hitro nastavi časovno obdobje (in pri 1990+ samodejno preklopi na Landsat) v Zavihku 3."""
+    today = date.today()
+    if preset_code == "1990_landsat":
+        _sync_sensor_state(explicit_sensor=SENSOR_LANDSAT)
+        target_start = date(1990, 1, 1)
+    else:
+        days_map = {"6m": 183, "2y": 730, "5y": 1826}
+        target_start = today - timedelta(days=days_map.get(preset_code, 183))
+        cur_sensor = st.session_state.get("selected_sensor", SENSOR_S2)
+        min_d = SENSOR_META[cur_sensor]["min_date"]
+        if target_start < min_d:
+            target_start = min_d
+
+    st.session_state["search_start_date"] = target_start
+    st.session_state["search_end_date"] = today
+    st.session_state["sidebar_start_date"] = target_start
+    st.session_state["sidebar_end_date"] = today
+    st.session_state["tab3_start_date"] = target_start
+    st.session_state["tab3_end_date"] = today
+
+
+def _execute_stac_search(
+    *,
+    sensor: str,
+    bbox_4326: list[float],
+    bbox_3794: list[float] | None,
+    aoi_polygon_4326: dict[str, Any] | None,
+    area_km2: float,
+    start_date: date,
+    end_date: date,
+    max_cloud_cover: float,
+    exclude_l7_slc_off: bool,
+    limit: int = 50,
+) -> None:
+    """Izvede STAC iskanje in shrani združene datume posnetkov v stanje seje."""
+    items_res, summary_res = search_scenes(
+        sensor=sensor,
+        bbox_4326=bbox_4326,
+        start_date=start_date,
+        end_date=end_date,
+        max_cloud_cover=float(max_cloud_cover),
+        limit=limit,
+        exclude_l7_slc_off=exclude_l7_slc_off,
+    )
+    st.session_state["stac_items"] = items_res
+    st.session_state["stac_summary_df"] = summary_res
+    st.session_state["search_performed"] = True
+    st.session_state["search_sensor"] = sensor
+    st.session_state["search_bbox_4326"] = list(bbox_4326)
+    st.session_state["search_bbox_3794"] = list(bbox_3794) if bbox_3794 else None
+    st.session_state["search_polygon_4326"] = aoi_polygon_4326
+    st.session_state["search_area_km2"] = area_km2
+    _clear_loaded_products()
 
 
 def geocode_place_nominatim(
@@ -1744,22 +1974,55 @@ def _render_interactive_aoi_section(
     aoi_polygon_4326: dict[str, Any] | None,
     lang: str,
 ) -> None:
-    """Izriše vrstico za iskanje kraja (Nominatim), trajno izbiro podlage in 600 px zemljevid AOI."""
-    col_q, col_btn = st.columns([3.2, 1.0])
-    with col_q:
-        place_query = st.text_input(
-            t("place_search_label"),
-            value="",
-            placeholder=t("place_search_placeholder"),
-            label_visibility="collapsed",
-            key="main_place_search_input",
-        )
-    with col_btn:
-        place_search_clicked = st.button(
-            t("btn_place_search"),
-            width="stretch",
-            key="main_place_search_btn",
-        )
+    """Izriše enotno 3-stolpčno vrstico (Senzor | Kraj | Podlaga) in 600 px zemljevid AOI."""
+    prev_basemap = str(st.session_state.get("map_basemap", "satellite"))
+    if prev_basemap not in BASEMAP_KEYS:
+        prev_basemap = "satellite"
+
+    with st.container(border=True):
+        col_sensor, col_place, col_bm = st.columns([1.15, 1.55, 1.35], vertical_alignment="bottom")
+
+        with col_sensor:
+            st.selectbox(
+                t("sensor_select_label"),
+                options=SENSOR_KEYS,
+                format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
+                key="main_bar_sensor_select",
+                on_change=_sync_sensor_state,
+                args=("main_bar_sensor_select",),
+            )
+
+        with col_place:
+            c_in, c_go = st.columns([2.35, 1.0], vertical_alignment="bottom")
+            with c_in:
+                place_query = st.text_input(
+                    t("place_search_label"),
+                    value="",
+                    placeholder=t("place_search_placeholder"),
+                    key="main_place_search_input",
+                )
+            with c_go:
+                place_search_clicked = st.button(
+                    t("btn_place_search_short"),
+                    width="stretch",
+                    key="main_place_search_btn",
+                )
+
+        with col_bm:
+            selected_basemap = st.radio(
+                t("basemap_selector_label"),
+                options=BASEMAP_KEYS,
+                index=BASEMAP_KEYS.index(prev_basemap),
+                horizontal=True,
+                format_func=lambda k, _lang=lang: t(BASEMAP_SPECS[k]["short_label_key"], lang=_lang),
+                key="main_map_basemap_radio",
+            )
+
+    if selected_basemap != prev_basemap:
+        st.session_state["map_basemap"] = selected_basemap
+        live_z = st.session_state.get("live_map_zoom")
+        if live_z is not None:
+            st.session_state["map_zoom"] = int(live_z)
 
     if place_search_clicked and place_query.strip():
         try:
@@ -1784,24 +2047,6 @@ def _render_interactive_aoi_section(
 
     if st.session_state.get("geocoded_place_msg"):
         st.caption(f"📍 {st.session_state['geocoded_place_msg']}")
-
-    # Trajna izbira podlage zemljevida (privzeto: Satelitska podlaga Esri) — ne ponastavi se ob kliku!
-    prev_basemap = str(st.session_state.get("map_basemap", "satellite"))
-    if prev_basemap not in BASEMAP_KEYS:
-        prev_basemap = "satellite"
-    selected_basemap = st.radio(
-        t("basemap_selector_label"),
-        options=BASEMAP_KEYS,
-        index=BASEMAP_KEYS.index(prev_basemap),
-        horizontal=True,
-        format_func=lambda k, _lang=lang: t(BASEMAP_SPECS[k]["label_key"], lang=_lang),
-        key="main_map_basemap_radio",
-    )
-    if selected_basemap != prev_basemap:
-        st.session_state["map_basemap"] = selected_basemap
-        live_z = st.session_state.get("live_map_zoom")
-        if live_z is not None:
-            st.session_state["map_zoom"] = int(live_z)
 
     # Način 1: Interaktivno risanje poligona / pravokotnika na 600 px zemljevidu
     if aoi_mode_key == "draw":
@@ -1899,6 +2144,7 @@ def _render_interactive_aoi_section(
 # ---------------------------------------------------------------------------
 def main() -> None:
     _init_session_state()
+    _clamp_dates_for_sensor(str(st.session_state["selected_sensor"]))
 
     # =======================================================================
     # STRANSKA VRSTICA (SIDEBAR): JEZIK, SENZOR, AOI, GEODETSKE NASTAVITVE
@@ -1914,39 +2160,32 @@ def main() -> None:
         )
         st.session_state["lang"] = lang
 
-        # --- 1. Satelitski senzor ---
+        # --- 1. Satelitski senzor (sinhroniziran z glavno vrstico in Zavihkom 3) ---
         st.divider()
         st.subheader(t("sec_sensor"))
 
         sensor = st.selectbox(
             t("sensor_select_label"),
             options=SENSOR_KEYS,
-            index=SENSOR_KEYS.index(st.session_state["active_sensor"]),
             format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
             key="sidebar_sensor_select",
+            on_change=_sync_sensor_state,
+            args=("sidebar_sensor_select",),
         )
-
-        if sensor != st.session_state["active_sensor"]:
-            st.session_state["active_sensor"] = sensor
-            st.session_state["stac_items"] = []
-            st.session_state["stac_summary_df"] = pd.DataFrame()
-            st.session_state["search_performed"] = False
-            st.session_state["search_sensor"] = sensor
-            st.session_state["last_rec_res_key"] = None
-            st.session_state["selected_resolution"] = SENSOR_META[sensor]["default_res"]
-            _clear_loaded_products()
-
+        sensor = str(st.session_state["selected_sensor"])
         sensor_cfg = SENSOR_META[sensor]
+
         exclude_l7_slc_off = False
         if sensor == SENSOR_LANDSAT:
             exclude_l7_slc_off = st.checkbox(
                 t("l7_exclude_label"),
-                value=False,
+                value=bool(st.session_state.get("exclude_l7_slc_off", False)),
                 help=t("l7_exclude_help"),
                 key="sidebar_l7_slc_exclude",
             )
+            st.session_state["exclude_l7_slc_off"] = exclude_l7_slc_off
         elif sensor == SENSOR_S1:
-            st.info(t("sar_allweather_note"))
+            st.caption(f"📡 {t('sar_allweather_note')}")
 
         # --- 2. Območje zanimanja (AOI) ---
         st.divider()
@@ -1985,7 +2224,6 @@ def main() -> None:
             center_lon = float(st.session_state["map_lon"])
             bbox_4326, bbox_3794 = bbox_from_point_wgs84(center_lat, center_lon, float(radius_m))
 
-            st.caption(t("map_click_hint"))
             e_c, n_c = transform_coords(center_lon, center_lat, EPSG_WGS84, EPSG_D96TM)
             st.markdown(
                 f"<div class='coord-box'>"
@@ -2119,7 +2357,7 @@ def main() -> None:
             else:
                 st.info(t("geojson_prompt"))
 
-        # --- 3. Geodetske in RAM nastavitve ---
+        # --- 3. Geodetske in RAM nastavitve (kompaktno za tablice) ---
         st.divider()
         st.subheader(t("sec_geodetic"))
 
@@ -2130,7 +2368,7 @@ def main() -> None:
         if bbox_4326 is not None and aoi_error is None:
             if aoi_polygon_4326 is not None:
                 area_km2, aoi_valid, base_rec_res = validate_aoi_geometry(aoi_polygon_4326)
-                bbox_area_km2, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326)
+                _, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326)
                 aoi_valid = aoi_valid and bbox_ok
                 base_rec_res = max(base_rec_res, bbox_rec_res)
             else:
@@ -2142,7 +2380,6 @@ def main() -> None:
                 rec_res = base_rec_res
 
             area_ha = area_km2 * 100.0
-
             c_km, c_ha = st.columns(2)
             c_km.metric(t("metric_area_km2"), f"{area_km2:,.2f}")
             c_ha.metric(t("metric_area_ha"), f"{area_ha:,.1f}")
@@ -2153,13 +2390,69 @@ def main() -> None:
                 st.session_state["selected_resolution"] = rec_res
                 st.session_state[f"sidebar_res_select_{sensor}"] = rec_res
 
-            if not aoi_valid:
-                st.error(t("aoi_too_large", area=area_km2))
-            elif area_km2 > 100.0:
-                st.warning(t("aoi_large_warn", area=area_km2, res=rec_res))
+        res_options: list[int] = list(sensor_cfg["res_options"])
+        cur_sel_res = st.session_state["selected_resolution"]
+        default_res_idx = res_options.index(cur_sel_res) if cur_sel_res in res_options else 0
 
-            if bbox_3794 is not None:
-                with st.expander(t("bbox_expander"), expanded=False):
+        col_res, col_crs = st.columns(2)
+        with col_res:
+            selected_resolution = st.selectbox(
+                t("res_label"),
+                options=res_options,
+                index=default_res_idx,
+                format_func=lambda r, _lang=lang: (
+                    t("res_recommended", lang=_lang, r=r)
+                    if (bbox_4326 is not None and r == rec_res)
+                    else t("res_plain", lang=_lang, r=r)
+                ),
+                help=t("res_help"),
+                key=f"sidebar_res_select_{sensor}",
+            )
+            st.session_state["selected_resolution"] = selected_resolution
+        with col_crs:
+            target_crs = st.selectbox(
+                t("output_crs_label"),
+                options=CRS_KEYS,
+                index=0,
+                format_func=lambda c, _lang=lang: t(CRS_SHORT_I18N[c], lang=_lang),
+                key="sidebar_crs_select",
+            )
+
+        # En sam subtilen inline RAM statusni indikator namesto ponavljajočih se opozoril
+        if bbox_4326 is not None and aoi_error is None:
+            if not aoi_valid:
+                st.markdown(
+                    f'<div class="ram-pill ram-pill-err">{t("ram_status_err", area=area_km2)}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif selected_resolution < rec_res:
+                st.markdown(
+                    f'<div class="ram-pill ram-pill-warn">'
+                    f'{t("ram_status_finer", sel=selected_resolution, rec=rec_res, area=area_km2)}</div>',
+                    unsafe_allow_html=True,
+                )
+            elif area_km2 > 100.0:
+                st.markdown(
+                    f'<div class="ram-pill ram-pill-warn">'
+                    f'{t("ram_status_warn", area=area_km2, rec=rec_res)}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="ram-pill ram-pill-ok">'
+                    f'{t("ram_status_ok", area=area_km2, res=selected_resolution)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with st.expander(t("sidebar_geo_details_expander"), expanded=False):
+                st.caption(f"**CRS:** {t(CRS_I18N[target_crs])}")
+                if not aoi_valid:
+                    st.caption(t("aoi_too_large", area=area_km2))
+                elif selected_resolution < rec_res:
+                    st.caption(t("res_finer_warn", sel=selected_resolution, rec=rec_res, area=area_km2))
+                elif area_km2 > 100.0:
+                    st.caption(t("aoi_large_warn", area=area_km2, res=rec_res))
+                if bbox_3794 is not None:
                     st.markdown(
                         f"<div class='coord-box'>"
                         f"<strong>EPSG:3794 [m]</strong><br>"
@@ -2172,60 +2465,31 @@ def main() -> None:
                         unsafe_allow_html=True,
                     )
 
-        res_options: list[int] = list(sensor_cfg["res_options"])
-        cur_sel_res = st.session_state["selected_resolution"]
-        default_res_idx = res_options.index(cur_sel_res) if cur_sel_res in res_options else 0
-        selected_resolution = st.selectbox(
-            t("res_label"),
-            options=res_options,
-            index=default_res_idx,
-            format_func=lambda r, _lang=lang: (
-                t("res_recommended", lang=_lang, r=r)
-                if (bbox_4326 is not None and r == rec_res)
-                else t("res_plain", lang=_lang, r=r)
-            ),
-            help=t("res_help"),
-            key=f"sidebar_res_select_{sensor}",
-        )
-        st.session_state["selected_resolution"] = selected_resolution
-
-        if bbox_4326 is not None and aoi_valid and selected_resolution < rec_res:
-            st.warning(t("res_finer_warn", sel=selected_resolution, rec=rec_res, area=area_km2))
-
-        target_crs = st.selectbox(
-            t("output_crs_label"),
-            options=CRS_KEYS,
-            index=0,
-            format_func=lambda c, _lang=lang: t(CRS_I18N[c], lang=_lang),
-            key="sidebar_crs_select",
-        )
-
-        # --- 4. Časovno obdobje in oblačnost ---
+        # --- 4. Časovno obdobje in oblačnost (sinhronizirano z Zavihkom 3) ---
         st.divider()
         st.subheader(t("sec_time"))
 
         today = date.today()
         min_sensor_date: date = sensor_cfg["min_date"]
-        default_start = today - timedelta(days=365 if sensor == SENSOR_LANDSAT else 183)
-        if default_start < min_sensor_date:
-            default_start = min_sensor_date
 
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             start_date = st.date_input(
                 t("start_date_label"),
-                value=default_start,
                 min_value=min_sensor_date,
                 max_value=today,
-                key=f"start_date_{sensor}",
+                key="sidebar_start_date",
+                on_change=_sync_start_date_state,
+                args=("sidebar_start_date",),
             )
         with col_d2:
             end_date = st.date_input(
                 t("end_date_label"),
-                value=today,
                 min_value=min_sensor_date,
                 max_value=today,
-                key=f"end_date_{sensor}",
+                key="sidebar_end_date",
+                on_change=_sync_end_date_state,
+                args=("sidebar_end_date",),
             )
 
         dates_valid = start_date <= end_date
@@ -2239,9 +2503,10 @@ def main() -> None:
                 t("max_cloud_label"),
                 min_value=0,
                 max_value=100,
-                value=20,
                 step=1,
                 key="sidebar_max_cloud",
+                on_change=_sync_max_cloud_state,
+                args=("sidebar_max_cloud",),
             )
 
         can_search = (bbox_4326 is not None) and aoi_valid and dates_valid and (aoi_error is None)
@@ -2256,43 +2521,41 @@ def main() -> None:
         if search_clicked and bbox_4326 is not None:
             with st.spinner(t("spinner_search", sensor=sensor_cfg["short_name"])):
                 try:
-                    items, summary_df = search_scenes(
+                    _execute_stac_search(
                         sensor=sensor,
                         bbox_4326=bbox_4326,
+                        bbox_3794=bbox_3794,
+                        aoi_polygon_4326=aoi_polygon_4326,
+                        area_km2=area_km2,
                         start_date=start_date,
                         end_date=end_date,
                         max_cloud_cover=float(max_cloud_cover),
-                        limit=50,
                         exclude_l7_slc_off=exclude_l7_slc_off,
+                        limit=50,
                     )
-                    st.session_state["stac_items"] = items
-                    st.session_state["stac_summary_df"] = summary_df
-                    st.session_state["search_performed"] = True
-                    st.session_state["search_sensor"] = sensor
-                    st.session_state["search_bbox_4326"] = list(bbox_4326)
-                    st.session_state["search_bbox_3794"] = list(bbox_3794) if bbox_3794 else None
-                    st.session_state["search_polygon_4326"] = aoi_polygon_4326
-                    st.session_state["search_area_km2"] = area_km2
-                    _clear_loaded_products()
                 except Exception as exc:
                     st.error(t("search_error", err=exc))
 
     # =======================================================================
-    # GLAVNI DEL APLIKACIJE: TEHNIČNA GLAVA (BREZ ZAMIKA HTML!) IN ZAVIHKI
+    # GLAVNI DEL APLIKACIJE: KOMPAKTEN HORIZONTALNI PAS Z AKTIVNIMI ZNAČKAMI
     # =======================================================================
     active_polygon_badge = (
         f'<span class="geo-badge">✂️ {t("polygon_clip_badge")}</span>'
         if (aoi_polygon_4326 is not None or st.session_state.get("search_polygon_4326") is not None)
         else ""
     )
+    area_pill_val = f"{area_km2:,.1f} km²" if bbox_4326 is not None else "—"
     header_html = (
         f'<div class="geo-header">'
+        f'<div class="geo-header-left">'
         f'<div class="geo-header-title">{t("app_title")}</div>'
-        f'<div class="geo-header-sub">{t("app_subtitle")}</div>'
+        f'<div class="geo-header-sub">{t("app_subtitle_short")}</div>'
+        f"</div>"
         f'<div class="geo-badges">'
-        f'<span class="geo-badge">{t("badge_crs")}</span>'
-        f'<span class="geo-badge">{t("badge_sensor")}</span>'
-        f'<span class="geo-badge">{t("badge_radiometry")}</span>'
+        f'<span class="geo-badge">🛰️ {sensor_cfg["short_name"]}</span>'
+        f'<span class="geo-badge geo-badge-slate">{t(CRS_SHORT_I18N[target_crs])}</span>'
+        f'<span class="geo-badge geo-badge-slate">{selected_resolution} m</span>'
+        f'<span class="geo-badge geo-badge-slate">{area_pill_val}</span>'
         f"{active_polygon_badge}"
         f"</div>"
         f"</div>"
@@ -2397,59 +2660,59 @@ def main() -> None:
                     height=min(310, 42 + 35 * len(display_df)),
                 )
 
-                st.divider()
                 st.subheader(t("t1_vis_header"))
 
                 is_sar_active = active_sensor == SENSOR_S1
                 vis_specs = SAR_VIS_SPECS if is_sar_active else OPTICAL_COMPOSITE_SPECS
 
-                col_sel, col_vis = st.columns([1.15, 1.0])
-                with col_sel:
-                    selected_idx = st.selectbox(
-                        t("scene_select_label"),
-                        options=list(range(len(items))),
-                        index=default_scene_idx,
-                        format_func=lambda idx: scene_labels[idx],
-                        key=f"tab1_scene_select_{active_sensor}",
-                    )
-                with col_vis:
-                    vis_code = st.selectbox(
-                        t("composite_select_label"),
-                        options=list(vis_specs.keys()),
-                        index=0,
-                        format_func=lambda code, _lang=lang: t(vis_specs[code]["label_key"], lang=_lang),
-                        key=f"tab1_vis_select_{active_sensor}",
-                    )
+                with st.container(border=True):
+                    col_sel, col_vis = st.columns([1.15, 1.0])
+                    with col_sel:
+                        selected_idx = st.selectbox(
+                            t("scene_select_label"),
+                            options=list(range(len(items))),
+                            index=default_scene_idx,
+                            format_func=lambda idx: scene_labels[idx],
+                            key=f"tab1_scene_select_{active_sensor}",
+                        )
+                    with col_vis:
+                        vis_code = st.selectbox(
+                            t("composite_select_label"),
+                            options=list(vis_specs.keys()),
+                            index=0,
+                            format_func=lambda code, _lang=lang: t(vis_specs[code]["label_key"], lang=_lang),
+                            key=f"tab1_vis_select_{active_sensor}",
+                        )
 
-                vis_spec = vis_specs[vis_code]
-                st.caption(t(vis_spec["desc_key"]))
+                    vis_spec = vis_specs[vis_code]
+                    st.caption(t(vis_spec["desc_key"]))
 
-                col_btn, col_stretch, col_gamma = st.columns([1.2, 0.9, 1.0])
-                with col_btn:
-                    load_clicked = st.button(
-                        t("btn_load_scene"),
-                        type="primary",
-                        width="stretch",
-                        key="tab1_load_btn",
-                    )
-                with col_stretch:
-                    use_percentile = st.checkbox(
-                        t("stretch_label"),
-                        value=True,
-                        help=t("stretch_help"),
-                        key="tab1_stretch",
-                    )
-                with col_gamma:
-                    gamma_disabled = is_sar_active and vis_code in ("VV", "VH")
-                    gamma_val = st.slider(
-                        t("gamma_label"),
-                        min_value=0.5,
-                        max_value=2.2,
-                        value=1.0,
-                        step=0.05,
-                        disabled=gamma_disabled,
-                        key="tab1_gamma",
-                    )
+                    col_btn, col_stretch, col_gamma = st.columns([1.2, 0.9, 1.0], vertical_alignment="center")
+                    with col_btn:
+                        load_clicked = st.button(
+                            t("btn_load_scene"),
+                            type="primary",
+                            width="stretch",
+                            key="tab1_load_btn",
+                        )
+                    with col_stretch:
+                        use_percentile = st.checkbox(
+                            t("stretch_label"),
+                            value=True,
+                            help=t("stretch_help"),
+                            key="tab1_stretch",
+                        )
+                    with col_gamma:
+                        gamma_disabled = is_sar_active and vis_code in ("VV", "VH")
+                        gamma_val = st.slider(
+                            t("gamma_label"),
+                            min_value=0.5,
+                            max_value=2.2,
+                            value=1.0,
+                            step=0.05,
+                            disabled=gamma_disabled,
+                            key="tab1_gamma",
+                        )
 
                 if load_clicked and active_bbox is not None:
                     chosen_item = items[selected_idx]
@@ -2732,407 +2995,780 @@ def main() -> None:
                         width="stretch",
                     )
 
-        # --- Način 2B: Optični spektralni indeksi (Sentinel-2 & Landsat C2 L2) ---
+        # --- Način 2B: Optični spektralni indeksi, Brezoblačni mozaik & Orodja ---
         else:
-            st.subheader(t("t2_header"))
-
-            col_s2, col_i2 = st.columns([1.15, 1.0])
-            with col_s2:
-                t2_scene_idx = st.selectbox(
-                    t("scene_select_label"),
-                    options=list(range(len(items))),
-                    index=default_scene_idx,
-                    format_func=lambda idx: scene_labels[idx],
-                    key=f"tab2_scene_select_{active_sensor}",
-                )
-            with col_i2:
-                t2_index_key = st.selectbox(
-                    t("index_select_label"),
-                    options=INDEX_KEYS,
-                    index=0,
-                    format_func=lambda k, _lang=lang: t(f"idx_{k}_label", lang=_lang),
-                    key="tab2_index_select",
-                )
-
-            st.caption(
-                f"{t(f'idx_{t2_index_key}_desc')} — `{SPECTRAL_INDICES[t2_index_key]['formula']}`"
+            t2_sub_idx, t2_sub_comp, t2_sub_tools = st.tabs(
+                [t("t2_subtab_index"), t("t2_subtab_composite"), t("t2_subtab_tools")]
             )
 
-            col_scl2, col_btn2 = st.columns([1.15, 1.0])
-            with col_scl2:
-                t2_mask_clouds = st.checkbox(
-                    t("scl_toggle_label"),
-                    value=True,
-                    help=t("scl_toggle_help"),
-                    key="tab2_scl_mask",
-                )
-            with col_btn2:
-                t2_compute_clicked = st.button(
-                    t("btn_compute_index"),
-                    type="primary",
-                    width="stretch",
-                    key="tab2_compute_btn",
-                )
-
-            if t2_compute_clicked and active_bbox is not None:
-                chosen_item = items[t2_scene_idx]
-                chosen_row = summary_df.iloc[t2_scene_idx]
-                req_bands = get_required_bands_for_sensor(
-                    active_sensor, t2_index_key, include_cloud_mask=t2_mask_clouds
-                )
-
-                with st.spinner(
-                    t("spinner_index", bands=", ".join(req_bands), idx=t2_index_key, date=chosen_row["date_str"])
-                ):
-                    try:
-                        st.session_state["tab2_index_da"] = None
-                        st.session_state["tab2_tif_bytes"] = None
-                        gc.collect()
-
-                        ds_raw = load_scene(
-                            sensor=active_sensor,
-                            item=chosen_item,
-                            bbox_4326=active_bbox,
-                            bands=req_bands,
-                            target_epsg=target_crs,
-                            resolution=float(selected_resolution),
-                            aoi_polygon_4326=active_polygon,
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 2.1: SPEKTRALNI INDEKSI (POSAMEZEN DATUM)
+            # ---------------------------------------------------------------
+            with t2_sub_idx:
+                with st.container(border=True):
+                    col_s2, col_i2 = st.columns([1.15, 1.0])
+                    with col_s2:
+                        t2_scene_idx = st.selectbox(
+                            t("scene_select_label"),
+                            options=list(range(len(items))),
+                            index=default_scene_idx,
+                            format_func=lambda idx: scene_labels[idx],
+                            key=f"tab2_scene_select_{active_sensor}",
                         )
-                        ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
-                        index_da = compute_index(ds_masked, t2_index_key)
-                        stats = compute_index_stats(index_da, resolution_m=float(selected_resolution))
-                        del ds_raw, ds_masked
-                        gc.collect()
-
-                        tif_bytes = export_to_geotiff_bytes(index_da, target_epsg=target_crs)
-                        epsg_num = target_crs.replace("EPSG:", "")
-                        prefix = active_sensor_cfg["file_prefix"]
-                        tif_filename = (
-                            f"{prefix}_{chosen_row['date_str']}_{t2_index_key}_"
-                            f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                    with col_i2:
+                        t2_index_key = st.selectbox(
+                            t("index_select_label"),
+                            options=INDEX_KEYS,
+                            index=0,
+                            format_func=lambda k, _lang=lang: t(f"idx_{k}_label", lang=_lang),
+                            key="tab2_index_select",
                         )
-
-                        st.session_state["tab2_index_da"] = index_da
-                        st.session_state["tab2_index_stats"] = stats
-                        st.session_state["tab2_index_meta"] = {
-                            "sensor": active_sensor,
-                            "sensor_name": active_sensor_cfg["short_name"],
-                            "index_key": t2_index_key,
-                            "date_str": str(chosen_row["date_str"]),
-                            "mgrs_tile": _format_tile_label(
-                                str(chosen_row["mgrs_tile"]), sensor=active_sensor
-                            ),
-                            "crs": target_crs,
-                            "resolution_m": int(selected_resolution),
-                            "mask_clouds": bool(t2_mask_clouds),
-                        }
-                        st.session_state["tab2_tif_bytes"] = tif_bytes
-                        st.session_state["tab2_tif_filename"] = tif_filename
-                        gc.collect()
-                    except Exception as exc:
-                        st.error(t("index_error", err=exc))
-
-            idx_da: xr.DataArray | None = st.session_state["tab2_index_da"]
-            idx_stats: dict[str, Any] | None = st.session_state["tab2_index_stats"]
-            idx_meta: dict[str, Any] | None = st.session_state["tab2_index_meta"]
-
-            if (
-                idx_da is not None
-                and idx_stats is not None
-                and idx_meta is not None
-                and idx_meta.get("sensor") == active_sensor
-            ):
-                st.divider()
-                if idx_stats["valid_pixels"] == 0:
-                    st.warning(t("t2_no_valid_pixels"))
-                else:
-                    k1, k2, k3, k4, k5 = st.columns(5)
-                    k1.metric(t("m_mean"), f"{idx_stats['mean']:.3f}")
-                    k2.metric(t("m_median"), f"{idx_stats['median']:.3f}")
-                    k3.metric(t("m_std"), f"{idx_stats['std']:.3f}")
-                    k4.metric(t("m_valid_pct"), f"{idx_stats['valid_pct']:.1f} %")
-                    k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
-
-                    st.caption(t("viewer_zoom_hint"))
-                    fig_idx = _build_index_plotly(
-                        index_da=idx_da,
-                        index_key=idx_meta["index_key"],
-                        target_crs=idx_meta["crs"],
-                        date_str=idx_meta["date_str"],
-                        tile_lbl=idx_meta["mgrs_tile"],
-                        resolution_m=float(idx_meta["resolution_m"]),
-                        sensor_name=idx_meta["sensor_name"],
-                    )
-                    st.plotly_chart(
-                        fig_idx,
-                        width="stretch",
-                        config=PLOTLY_VIEWER_CONFIG,
-                        key="tab2_index_plotly_viewer",
-                    )
 
                     st.caption(
-                        t(
-                            "t2_stats_caption",
-                            formula=SPECTRAL_INDICES[idx_meta["index_key"]]["formula"],
-                            vmin=idx_stats["min"],
-                            vmax=idx_stats["max"],
-                            p10=idx_stats["p10"],
-                            p90=idx_stats["p90"],
-                            scl=t("yes") if idx_meta["mask_clouds"] else t("no"),
+                        f"{t(f'idx_{t2_index_key}_desc')} — `{SPECTRAL_INDICES[t2_index_key]['formula']}`"
+                    )
+
+                    col_scl2, col_btn2 = st.columns([1.15, 1.0], vertical_alignment="center")
+                    with col_scl2:
+                        t2_mask_clouds = st.checkbox(
+                            t("scl_toggle_label"),
+                            value=True,
+                            help=t("scl_toggle_help"),
+                            key="tab2_scl_mask",
                         )
-                    )
-
-                    hist_fig = _build_index_histogram(
-                        index_da=idx_da,
-                        stats=idx_stats,
-                        index_key=idx_meta["index_key"],
-                        date_str=idx_meta["date_str"],
-                    )
-                    st.plotly_chart(hist_fig, width="stretch", key="tab2_index_hist")
-
-                    idx_tif = st.session_state["tab2_tif_bytes"]
-                    if idx_tif:
-                        st.download_button(
-                            label=t("btn_download_index_tif"),
-                            data=idx_tif,
-                            file_name=st.session_state["tab2_tif_filename"] or "index.tif",
-                            mime="image/tiff",
+                    with col_btn2:
+                        t2_compute_clicked = st.button(
+                            t("btn_compute_index"),
+                            type="primary",
                             width="stretch",
-                            help=t("help_download_index_tif", idx=idx_meta["index_key"], crs=idx_meta["crs"]),
+                            key="tab2_compute_btn",
                         )
 
-            # ---------------------------------------------------------------
-            # DODATNI ORODJI V ZAVIHKU 2: SPEKTRALNI PODPIS IN RABA TAL (HA)
-            # ---------------------------------------------------------------
-            st.divider()
+                if t2_compute_clicked and active_bbox is not None:
+                    chosen_item = items[t2_scene_idx]
+                    chosen_row = summary_df.iloc[t2_scene_idx]
+                    req_bands = get_required_bands_for_sensor(
+                        active_sensor, t2_index_key, include_cloud_mask=t2_mask_clouds
+                    )
 
-            # 1) Spektralni podpis točke (Spectral Signature Profiler)
-            with st.expander(t("sig_expander"), expanded=False):
-                st.caption(t("sig_caption"))
-                sig_chosen_item = items[t2_scene_idx]
-                sig_chosen_row = summary_df.iloc[t2_scene_idx]
-
-                if st.button(
-                    t("btn_load_sig"),
-                    type="primary",
-                    width="stretch",
-                    key="tab2_load_sig_btn",
-                ):
-                    with st.spinner(t("spinner_sig", date=sig_chosen_row["date_str"])):
+                    with st.spinner(
+                        t("spinner_index", bands=", ".join(req_bands), idx=t2_index_key, date=chosen_row["date_str"])
+                    ):
                         try:
-                            st.session_state["tab2_sig_ds"] = None
+                            st.session_state["tab2_index_da"] = None
+                            st.session_state["tab2_tif_bytes"] = None
                             gc.collect()
-                            sig_bands = [b for b, _, _ in OPTICAL_SIGNATURE_BANDS]
-                            if t2_mask_clouds:
-                                sig_bands.append("QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL")
 
-                            ds_sig_raw = load_scene(
+                            ds_raw = load_scene(
                                 sensor=active_sensor,
-                                item=sig_chosen_item,
+                                item=chosen_item,
                                 bbox_4326=active_bbox,
-                                bands=sig_bands,
+                                bands=req_bands,
                                 target_epsg=target_crs,
                                 resolution=float(selected_resolution),
                                 aoi_polygon_4326=active_polygon,
                             )
-                            ds_sig_clean, _ = apply_cloud_mask(ds_sig_raw, mask_clouds=t2_mask_clouds)
-                            del ds_sig_raw
+                            ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
+                            index_da = compute_index(ds_masked, t2_index_key)
+                            stats = compute_index_stats(index_da, resolution_m=float(selected_resolution))
+                            del ds_raw, ds_masked
                             gc.collect()
 
-                            st.session_state["tab2_sig_ds"] = ds_sig_clean
-                            st.session_state["tab2_sig_meta"] = {
+                            tif_bytes = export_to_geotiff_bytes(index_da, target_epsg=target_crs)
+                            epsg_num = target_crs.replace("EPSG:", "")
+                            prefix = active_sensor_cfg["file_prefix"]
+                            tif_filename = (
+                                f"{prefix}_{chosen_row['date_str']}_{t2_index_key}_"
+                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                            )
+
+                            st.session_state["tab2_index_da"] = index_da
+                            st.session_state["tab2_index_stats"] = stats
+                            st.session_state["tab2_index_meta"] = {
                                 "sensor": active_sensor,
                                 "sensor_name": active_sensor_cfg["short_name"],
-                                "date_str": str(sig_chosen_row["date_str"]),
+                                "index_key": t2_index_key,
+                                "date_str": str(chosen_row["date_str"]),
+                                "mgrs_tile": _format_tile_label(
+                                    str(chosen_row["mgrs_tile"]), sensor=active_sensor
+                                ),
                                 "crs": target_crs,
-                                "scene_id": str(sig_chosen_row["id"]),
                                 "resolution_m": int(selected_resolution),
+                                "mask_clouds": bool(t2_mask_clouds),
                             }
+                            st.session_state["tab2_tif_bytes"] = tif_bytes
+                            st.session_state["tab2_tif_filename"] = tif_filename
+                            gc.collect()
                         except Exception as exc:
-                            st.error(t("sig_error", err=exc))
+                            st.error(t("index_error", err=exc))
 
-                sig_ds: xr.Dataset | None = st.session_state["tab2_sig_ds"]
-                sig_meta: dict[str, Any] | None = st.session_state["tab2_sig_meta"]
+                idx_da: xr.DataArray | None = st.session_state["tab2_index_da"]
+                idx_stats: dict[str, Any] | None = st.session_state["tab2_index_stats"]
+                idx_meta: dict[str, Any] | None = st.session_state["tab2_index_meta"]
+
                 if (
-                    sig_ds is not None
-                    and sig_meta is not None
-                    and sig_meta.get("sensor") == active_sensor
+                    idx_da is not None
+                    and idx_stats is not None
+                    and idx_meta is not None
+                    and idx_meta.get("sensor") == active_sensor
                 ):
-                    x_arr = np.asarray(sig_ds.coords["x"].values, dtype=np.float64)
-                    y_arr = np.asarray(sig_ds.coords["y"].values, dtype=np.float64)
-                    x_min, x_max = float(x_arr.min()), float(x_arr.max())
-                    y_min, y_max = float(y_arr.min()), float(y_arr.max())
-                    x_mid = 0.5 * (x_min + x_max)
-                    y_mid = 0.5 * (y_min + y_max)
-                    step_m = max(1.0, float(sig_meta["resolution_m"]))
+                    if idx_stats["valid_pixels"] == 0:
+                        st.warning(t("t2_no_valid_pixels"))
+                    else:
+                        k1, k2, k3, k4, k5 = st.columns(5)
+                        k1.metric(t("m_mean"), f"{idx_stats['mean']:.3f}")
+                        k2.metric(t("m_median"), f"{idx_stats['median']:.3f}")
+                        k3.metric(t("m_std"), f"{idx_stats['std']:.3f}")
+                        k4.metric(t("m_valid_pct"), f"{idx_stats['valid_pct']:.1f} %")
+                        k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
 
-                    col_sx, col_sy = st.columns(2)
-                    with col_sx:
-                        sample_x = st.slider(
-                            t("sig_x_label"),
-                            min_value=x_min,
-                            max_value=x_max if x_max > x_min else x_min + step_m,
-                            value=x_mid,
-                            step=step_m,
-                            format="%.0f",
-                            key=f"tab2_sig_x_{sig_meta['scene_id']}",
+                        st.caption(t("viewer_zoom_hint"))
+                        fig_idx = _build_index_plotly(
+                            index_da=idx_da,
+                            index_key=idx_meta["index_key"],
+                            target_crs=idx_meta["crs"],
+                            date_str=idx_meta["date_str"],
+                            tile_lbl=idx_meta["mgrs_tile"],
+                            resolution_m=float(idx_meta["resolution_m"]),
+                            sensor_name=idx_meta["sensor_name"],
                         )
-                    with col_sy:
-                        sample_y = st.slider(
-                            t("sig_y_label"),
-                            min_value=y_min,
-                            max_value=y_max if y_max > y_min else y_min + step_m,
-                            value=y_mid,
-                            step=step_m,
-                            format="%.0f",
-                            key=f"tab2_sig_y_{sig_meta['scene_id']}",
+                        st.plotly_chart(
+                            fig_idx,
+                            width="stretch",
+                            config=PLOTLY_VIEWER_CONFIG,
+                            key="tab2_index_plotly_viewer",
                         )
 
-                    sig_df = extract_spectral_signature(sig_ds, sample_x, sample_y)
+                        st.caption(
+                            t(
+                                "t2_stats_caption",
+                                formula=SPECTRAL_INDICES[idx_meta["index_key"]]["formula"],
+                                vmin=idx_stats["min"],
+                                vmax=idx_stats["max"],
+                                p10=idx_stats["p10"],
+                                p90=idx_stats["p90"],
+                                scl=t("yes") if idx_meta["mask_clouds"] else t("no"),
+                            )
+                        )
+
+                        hist_fig = _build_index_histogram(
+                            index_da=idx_da,
+                            stats=idx_stats,
+                            index_key=idx_meta["index_key"],
+                            date_str=idx_meta["date_str"],
+                        )
+                        st.plotly_chart(hist_fig, width="stretch", key="tab2_index_hist")
+
+                        idx_tif = st.session_state["tab2_tif_bytes"]
+                        if idx_tif:
+                            st.download_button(
+                                label=t("btn_download_index_tif"),
+                                data=idx_tif,
+                                file_name=st.session_state["tab2_tif_filename"] or "index.tif",
+                                mime="image/tiff",
+                                width="stretch",
+                                help=t("help_download_index_tif", idx=idx_meta["index_key"], crs=idx_meta["crs"]),
+                            )
+
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 2.2: BREZOBLAČNI MEDIANI MOZAIK OBDOBJA
+            # ---------------------------------------------------------------
+            with t2_sub_comp:
+                st.markdown(f"#### {t('comp_header')}")
+                st.caption(t("comp_caption"))
+
+                comp_mode_options = ["RGB_NIR", *INDEX_KEYS]
+
+                def _fmt_comp_mode(code: str, _lang: str = lang) -> str:
+                    if code == "RGB_NIR":
+                        return t("comp_mode_rgb_nir", lang=_lang)
+                    return t(f"idx_{code}_label", lang=_lang)
+
+                with st.container(border=True):
+                    col_cm, col_cn, col_cbtn = st.columns([1.45, 1.05, 1.0], vertical_alignment="bottom")
+                    with col_cm:
+                        comp_mode = st.selectbox(
+                            t("comp_mode_label"),
+                            options=comp_mode_options,
+                            index=0,
+                            format_func=_fmt_comp_mode,
+                            key=f"tab2_comp_mode_{active_sensor}",
+                        )
+                    with col_cn:
+                        avail_comp = len(items)
+                        if avail_comp <= 3:
+                            comp_n_scenes = avail_comp
+                            st.caption(f"{t('comp_scenes_label')} **{avail_comp}**")
+                        else:
+                            comp_max = min(12, avail_comp)
+                            comp_default = min(6, comp_max)
+                            comp_n_scenes = st.slider(
+                                t("comp_scenes_label"),
+                                min_value=3,
+                                max_value=comp_max,
+                                value=comp_default,
+                                step=1,
+                                help=t("comp_scenes_help"),
+                                key=f"tab2_comp_n_{active_sensor}",
+                            )
+                    with col_cbtn:
+                        comp_clicked = st.button(
+                            t("comp_btn_compute"),
+                            type="primary",
+                            width="stretch",
+                            key="tab2_comp_btn",
+                        )
+
+                if comp_clicked and active_bbox is not None:
+                    comp_prog = st.progress(0.0)
+                    comp_status = st.empty()
+
+                    def _on_comp_progress(step: int, total: int, label: str) -> None:
+                        frac = min(max(step / max(total, 1), 0.0), 1.0)
+                        comp_prog.progress(frac)
+                        if step < total:
+                            comp_status.caption(t("comp_progress", cur=step + 1, tot=total, date=label))
+
+                    try:
+                        st.session_state["tab2_comp_obj"] = None
+                        st.session_state["tab2_comp_meta"] = None
+                        st.session_state["tab2_comp_tif_bytes"] = None
+                        gc.collect()
+
+                        comp_xr, comp_meta = compute_cloud_free_composite(
+                            items=items,
+                            bbox_4326=active_bbox,
+                            mode=comp_mode,
+                            target_epsg=target_crs,
+                            resolution=float(selected_resolution),
+                            sensor=active_sensor,
+                            aoi_polygon_4326=active_polygon,
+                            max_scenes=int(comp_n_scenes),
+                            progress_callback=_on_comp_progress,
+                        )
+                        comp_prog.empty()
+                        comp_status.empty()
+
+                        if comp_xr is None or comp_meta["scenes_used"] == 0:
+                            st.warning(t("comp_empty_warn"))
+                        else:
+                            comp_tif = export_to_geotiff_bytes(comp_xr, target_epsg=target_crs)
+                            epsg_num = target_crs.replace("EPSG:", "")
+                            prefix = active_sensor_cfg["file_prefix"]
+                            comp_fname = (
+                                f"{prefix}_CloudFreeMedian_{comp_meta['mode']}_"
+                                f"{comp_meta['date_start']}_to_{comp_meta['date_end']}_"
+                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                            )
+                            comp_meta["sensor_name"] = active_sensor_cfg["short_name"]
+                            comp_meta["crs"] = target_crs
+                            comp_meta["resolution_m"] = int(selected_resolution)
+
+                            st.session_state["tab2_comp_obj"] = comp_xr
+                            st.session_state["tab2_comp_meta"] = comp_meta
+                            st.session_state["tab2_comp_tif_bytes"] = comp_tif
+                            st.session_state["tab2_comp_tif_filename"] = comp_fname
+                            gc.collect()
+                    except Exception as exc:
+                        comp_prog.empty()
+                        comp_status.empty()
+                        st.error(t("comp_error", err=exc))
+
+                comp_obj = st.session_state["tab2_comp_obj"]
+                comp_meta_show: dict[str, Any] | None = st.session_state["tab2_comp_meta"]
+                if (
+                    comp_obj is not None
+                    and comp_meta_show is not None
+                    and comp_meta_show.get("sensor") == active_sensor
+                ):
+                    cm1, cm2, cm3, cm4 = st.columns(4)
+                    cm1.metric(
+                        t("comp_m_scenes"),
+                        f"{comp_meta_show['scenes_used']} / {comp_meta_show['scenes_requested']}",
+                    )
+                    cm2.metric(t("comp_m_obs"), f"{comp_meta_show['median_obs_per_px']:.1f}")
+                    cm3.metric(t("m_valid_pct"), f"{comp_meta_show['valid_pct']:.1f} %")
+                    cm4.metric(t("m_valid_ha"), f"{comp_meta_show['valid_area_ha']:,.2f} ha")
+
+                    if comp_meta_show["mode"] == "RGB_NIR" and isinstance(comp_obj, xr.Dataset):
+                        col_cd, col_cs, col_cg = st.columns([1.3, 0.85, 0.95], vertical_alignment="center")
+                        with col_cd:
+                            comp_disp = st.radio(
+                                t("comp_display_toggle"),
+                                options=["RGB", "NIR"],
+                                index=0,
+                                horizontal=True,
+                                format_func=lambda k, _lang=lang: (
+                                    t("comp_display_rgb", lang=_lang)
+                                    if k == "RGB"
+                                    else t("comp_display_nir", lang=_lang)
+                                ),
+                                key="tab2_comp_rgb_nir_toggle",
+                            )
+                        with col_cs:
+                            comp_stretch = st.checkbox(
+                                t("stretch_label"),
+                                value=True,
+                                key="tab2_comp_stretch",
+                            )
+                        with col_cg:
+                            comp_gamma = st.slider(
+                                t("gamma_label"),
+                                min_value=0.5,
+                                max_value=2.2,
+                                value=1.0,
+                                step=0.05,
+                                key="tab2_comp_gamma",
+                            )
+
+                        comp_bands = ["B04", "B03", "B02"] if comp_disp == "RGB" else ["B08", "B04", "B03"]
+                        rgb_u8 = _compose_rgb_uint8(
+                            comp_obj, comp_bands, use_percentile_stretch=comp_stretch, gamma=comp_gamma
+                        )
+                        title_key = "comp_title_rgb" if comp_disp == "RGB" else "comp_title_nir"
+                        comp_title = (
+                            f"<b>{comp_meta_show['sensor_name']} — "
+                            f"{t(title_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
+                            f"<span style='font-size:12px;color:#475569'>"
+                            f"{t('fig_res_bands', crs=comp_meta_show['crs'], res=float(comp_meta_show['resolution_m']), bands='-'.join(comp_bands))}</span>"
+                        )
+                        st.caption(t("viewer_zoom_hint"))
+                        fig_comp = render_interactive_raster_plotly(
+                            mode="rgb",
+                            x_coords=comp_obj.coords["x"].values,
+                            y_coords=comp_obj.coords["y"].values,
+                            rgb_uint8=rgb_u8,
+                            title=comp_title,
+                            target_crs=comp_meta_show["crs"],
+                        )
+                        st.plotly_chart(
+                            fig_comp,
+                            width="stretch",
+                            config=PLOTLY_VIEWER_CONFIG,
+                            key="tab2_comp_plotly_viewer",
+                        )
+                    elif isinstance(comp_obj, xr.DataArray):
+                        c_idx_key = str(comp_meta_show["mode"])
+                        c_spec = SPECTRAL_INDICES[c_idx_key]
+                        c_stats = compute_index_stats(comp_obj, resolution_m=float(comp_meta_show["resolution_m"]))
+                        comp_title = (
+                            f"<b>{comp_meta_show['sensor_name']} — "
+                            f"{t('comp_title_idx', idx=c_idx_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
+                            f"<span style='font-size:12px;color:#475569'>"
+                            f"{comp_meta_show['crs']} | {comp_meta_show['resolution_m']} m | "
+                            f"{t('m_mean')}: {c_stats['mean']:.3f} · {t('m_median')}: {c_stats['median']:.3f}</span>"
+                        )
+                        st.caption(t("viewer_zoom_hint"))
+                        fig_comp = render_interactive_raster_plotly(
+                            mode="heatmap",
+                            x_coords=comp_obj.coords["x"].values,
+                            y_coords=comp_obj.coords["y"].values,
+                            z_data=comp_obj.values,
+                            cmap_name=str(c_spec["cmap"]),
+                            zmin=float(c_spec["vmin"]),
+                            zmax=float(c_spec["vmax"]),
+                            cbar_title=c_idx_key,
+                            title=comp_title,
+                            target_crs=comp_meta_show["crs"],
+                        )
+                        st.plotly_chart(
+                            fig_comp,
+                            width="stretch",
+                            config=PLOTLY_VIEWER_CONFIG,
+                            key="tab2_comp_plotly_viewer",
+                        )
+
                     st.caption(
                         t(
-                            "sig_snapped_caption",
-                            crs=sig_meta["crs"],
-                            x=sig_df.attrs["actual_x"],
-                            y=sig_df.attrs["actual_y"],
-                            date=sig_meta["date_str"],
+                            "comp_dates_caption",
+                            n=comp_meta_show["scenes_used"],
+                            dates=", ".join(comp_meta_show["dates_used"]),
                         )
                     )
-                    if sig_df.empty or sig_df["reflectance"].isna().all():
-                        st.warning(t("sig_nodata_warn"))
-                    else:
-                        sig_fig = _build_spectral_signature_chart(
-                            sig_df=sig_df,
-                            sensor_name=sig_meta["sensor_name"],
-                            date_str=sig_meta["date_str"],
+
+                    comp_tif_bytes = st.session_state["tab2_comp_tif_bytes"]
+                    if comp_tif_bytes:
+                        st.download_button(
+                            label=t("comp_btn_download_tif"),
+                            data=comp_tif_bytes,
+                            file_name=st.session_state["tab2_comp_tif_filename"] or "cloud_free_composite.tif",
+                            mime="image/tiff",
+                            width="stretch",
                         )
-                        st.plotly_chart(sig_fig, width="stretch", key="tab2_sig_plotly_chart")
 
-            # 2) Hitro razvrščanje rabe tal in površine v hektarjih (Quick Land-Cover Breakdown)
-            with st.expander(t("lc_expander"), expanded=False):
-                st.caption(t("lc_caption"))
-                lc_chosen_item = items[t2_scene_idx]
-                lc_chosen_row = summary_df.iloc[t2_scene_idx]
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 2.3: SPEKTRALNI PODPIS TOČKE IN RABA TAL [HA]
+            # ---------------------------------------------------------------
+            with t2_sub_tools:
+                # 1) Spektralni podpis točke (Spectral Signature Profiler)
+                with st.container(border=True):
+                    st.markdown(f"#### {t('sig_expander')}")
+                    st.caption(t("sig_caption"))
+                    sig_chosen_item = items[t2_scene_idx]
+                    sig_chosen_row = summary_df.iloc[t2_scene_idx]
 
-                if st.button(
-                    t("btn_compute_lc"),
-                    type="primary",
-                    width="stretch",
-                    key="tab2_compute_lc_btn",
-                ):
-                    with st.spinner(t("spinner_lc", date=lc_chosen_row["date_str"])):
-                        try:
-                            st.session_state["tab2_lc_df"] = None
-                            st.session_state["tab2_lc_tif_bytes"] = None
-                            gc.collect()
-
-                            # Če je 6-kanalni profil za ta posnetek že v pomnilniku, ga ponovno uporabimo!
-                            reuse_ds = (
-                                st.session_state["tab2_sig_ds"]
-                                if (
-                                    st.session_state["tab2_sig_ds"] is not None
-                                    and st.session_state["tab2_sig_meta"] is not None
-                                    and st.session_state["tab2_sig_meta"].get("scene_id")
-                                    == str(lc_chosen_row["id"])
-                                    and st.session_state["tab2_sig_meta"].get("crs") == target_crs
-                                    and st.session_state["tab2_sig_meta"].get("resolution_m")
-                                    == int(selected_resolution)
-                                )
-                                else None
-                            )
-                            if reuse_ds is not None:
-                                ds_lc_clean = reuse_ds
-                            else:
-                                lc_bands = ["B03", "B04", "B08"]
+                    if st.button(
+                        t("btn_load_sig"),
+                        type="primary",
+                        width="stretch",
+                        key="tab2_load_sig_btn",
+                    ):
+                        with st.spinner(t("spinner_sig", date=sig_chosen_row["date_str"])):
+                            try:
+                                st.session_state["tab2_sig_ds"] = None
+                                gc.collect()
+                                sig_bands = [b for b, _, _ in OPTICAL_SIGNATURE_BANDS]
                                 if t2_mask_clouds:
-                                    lc_bands.append(
-                                        "QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL"
-                                    )
-                                ds_lc_raw = load_scene(
+                                    sig_bands.append("QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL")
+
+                                ds_sig_raw = load_scene(
                                     sensor=active_sensor,
-                                    item=lc_chosen_item,
+                                    item=sig_chosen_item,
                                     bbox_4326=active_bbox,
-                                    bands=lc_bands,
+                                    bands=sig_bands,
                                     target_epsg=target_crs,
                                     resolution=float(selected_resolution),
                                     aoi_polygon_4326=active_polygon,
                                 )
-                                ds_lc_clean, _ = apply_cloud_mask(ds_lc_raw, mask_clouds=t2_mask_clouds)
-                                del ds_lc_raw
+                                ds_sig_clean, _ = apply_cloud_mask(ds_sig_raw, mask_clouds=t2_mask_clouds)
+                                del ds_sig_raw
+                                gc.collect()
 
-                            lc_da, lc_df = compute_quick_land_cover(
-                                ds_lc_clean, resolution_m=float(selected_resolution)
+                                st.session_state["tab2_sig_ds"] = ds_sig_clean
+                                st.session_state["tab2_sig_meta"] = {
+                                    "sensor": active_sensor,
+                                    "sensor_name": active_sensor_cfg["short_name"],
+                                    "date_str": str(sig_chosen_row["date_str"]),
+                                    "crs": target_crs,
+                                    "scene_id": str(sig_chosen_row["id"]),
+                                    "resolution_m": int(selected_resolution),
+                                }
+                            except Exception as exc:
+                                st.error(t("sig_error", err=exc))
+
+                    sig_ds: xr.Dataset | None = st.session_state["tab2_sig_ds"]
+                    sig_meta: dict[str, Any] | None = st.session_state["tab2_sig_meta"]
+                    if (
+                        sig_ds is not None
+                        and sig_meta is not None
+                        and sig_meta.get("sensor") == active_sensor
+                    ):
+                        x_arr = np.asarray(sig_ds.coords["x"].values, dtype=np.float64)
+                        y_arr = np.asarray(sig_ds.coords["y"].values, dtype=np.float64)
+                        x_min, x_max = float(x_arr.min()), float(x_arr.max())
+                        y_min, y_max = float(y_arr.min()), float(y_arr.max())
+                        x_mid = 0.5 * (x_min + x_max)
+                        y_mid = 0.5 * (y_min + y_max)
+                        step_m = max(1.0, float(sig_meta["resolution_m"]))
+
+                        col_sx, col_sy = st.columns(2)
+                        with col_sx:
+                            sample_x = st.slider(
+                                t("sig_x_label"),
+                                min_value=x_min,
+                                max_value=x_max if x_max > x_min else x_min + step_m,
+                                value=x_mid,
+                                step=step_m,
+                                format="%.0f",
+                                key=f"tab2_sig_x_{sig_meta['scene_id']}",
                             )
-                            if reuse_ds is None:
-                                del ds_lc_clean
-                            lc_tif = export_to_geotiff_bytes(lc_da, target_epsg=target_crs)
-                            del lc_da
-                            gc.collect()
-
-                            epsg_num = target_crs.replace("EPSG:", "")
-                            prefix = active_sensor_cfg["file_prefix"]
-                            st.session_state["tab2_lc_df"] = lc_df
-                            st.session_state["tab2_lc_meta"] = {
-                                "sensor": active_sensor,
-                                "date_str": str(lc_chosen_row["date_str"]),
-                                "crs": target_crs,
-                                "resolution_m": int(selected_resolution),
-                                "valid_area_ha": float(lc_df.attrs.get("valid_area_ha", 0.0)),
-                            }
-                            st.session_state["tab2_lc_tif_bytes"] = lc_tif
-                            st.session_state["tab2_lc_tif_filename"] = (
-                                f"{prefix}_{lc_chosen_row['date_str']}_LandCover_"
-                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                        with col_sy:
+                            sample_y = st.slider(
+                                t("sig_y_label"),
+                                min_value=y_min,
+                                max_value=y_max if y_max > y_min else y_min + step_m,
+                                value=y_mid,
+                                step=step_m,
+                                format="%.0f",
+                                key=f"tab2_sig_y_{sig_meta['scene_id']}",
                             )
-                        except Exception as exc:
-                            st.error(t("lc_error", err=exc))
 
-                lc_df_show: pd.DataFrame | None = st.session_state["tab2_lc_df"]
-                lc_meta: dict[str, Any] | None = st.session_state["tab2_lc_meta"]
-                if (
-                    lc_df_show is not None
-                    and lc_meta is not None
-                    and lc_meta.get("sensor") == active_sensor
-                ):
-                    if lc_meta["valid_area_ha"] <= 0.0:
-                        st.warning(t("t2_no_valid_pixels"))
-                    else:
-                        lc_table = pd.DataFrame(
-                            {
-                                t("lc_col_class"): [
-                                    t(f"lc_{ck}", lang=lang) for ck in lc_df_show["class_key"]
-                                ],
-                                t("lc_col_rule"): lc_df_show["rule"],
-                                t("lc_col_area"): lc_df_show["area_ha"].map(lambda v: f"{v:,.2f}"),
-                                t("lc_col_share"): lc_df_show["share_pct"].map(lambda v: f"{v:.1f} %"),
-                            }
+                        sig_df = extract_spectral_signature(sig_ds, sample_x, sample_y)
+                        st.caption(
+                            t(
+                                "sig_snapped_caption",
+                                crs=sig_meta["crs"],
+                                x=sig_df.attrs["actual_x"],
+                                y=sig_df.attrs["actual_y"],
+                                date=sig_meta["date_str"],
+                            )
                         )
-                        st.dataframe(lc_table, width="stretch", hide_index=True)
-
-                        lc_bar = _build_land_cover_bar_chart(
-                            lc_df=lc_df_show,
-                            date_str=lc_meta["date_str"],
-                            total_valid_ha=lc_meta["valid_area_ha"],
-                            lang=lang,
-                        )
-                        st.plotly_chart(lc_bar, width="stretch", key="tab2_lc_bar_chart")
-
-                        lc_tif_bytes = st.session_state["tab2_lc_tif_bytes"]
-                        if lc_tif_bytes:
-                            st.download_button(
-                                label=t("btn_download_lc_tif"),
-                                data=lc_tif_bytes,
-                                file_name=st.session_state["tab2_lc_tif_filename"] or "land_cover.tif",
-                                mime="image/tiff",
-                                width="stretch",
+                        if sig_df.empty or sig_df["reflectance"].isna().all():
+                            st.warning(t("sig_nodata_warn"))
+                        else:
+                            sig_fig = _build_spectral_signature_chart(
+                                sig_df=sig_df,
+                                sensor_name=sig_meta["sensor_name"],
+                                date_str=sig_meta["date_str"],
                             )
+                            st.plotly_chart(sig_fig, width="stretch", key="tab2_sig_plotly_chart")
+
+                # 2) Hitro razvrščanje rabe tal in površine v hektarjih (Quick Land-Cover Breakdown)
+                with st.container(border=True):
+                    st.markdown(f"#### {t('lc_expander')}")
+                    st.caption(t("lc_caption"))
+                    lc_chosen_item = items[t2_scene_idx]
+                    lc_chosen_row = summary_df.iloc[t2_scene_idx]
+
+                    if st.button(
+                        t("btn_compute_lc"),
+                        type="primary",
+                        width="stretch",
+                        key="tab2_compute_lc_btn",
+                    ):
+                        with st.spinner(t("spinner_lc", date=lc_chosen_row["date_str"])):
+                            try:
+                                st.session_state["tab2_lc_df"] = None
+                                st.session_state["tab2_lc_tif_bytes"] = None
+                                gc.collect()
+
+                                reuse_ds = (
+                                    st.session_state["tab2_sig_ds"]
+                                    if (
+                                        st.session_state["tab2_sig_ds"] is not None
+                                        and st.session_state["tab2_sig_meta"] is not None
+                                        and st.session_state["tab2_sig_meta"].get("scene_id")
+                                        == str(lc_chosen_row["id"])
+                                        and st.session_state["tab2_sig_meta"].get("crs") == target_crs
+                                        and st.session_state["tab2_sig_meta"].get("resolution_m")
+                                        == int(selected_resolution)
+                                    )
+                                    else None
+                                )
+                                if reuse_ds is not None:
+                                    ds_lc_clean = reuse_ds
+                                else:
+                                    lc_bands = ["B03", "B04", "B08"]
+                                    if t2_mask_clouds:
+                                        lc_bands.append(
+                                            "QA_PIXEL" if active_sensor == SENSOR_LANDSAT else "SCL"
+                                        )
+                                    ds_lc_raw = load_scene(
+                                        sensor=active_sensor,
+                                        item=lc_chosen_item,
+                                        bbox_4326=active_bbox,
+                                        bands=lc_bands,
+                                        target_epsg=target_crs,
+                                        resolution=float(selected_resolution),
+                                        aoi_polygon_4326=active_polygon,
+                                    )
+                                    ds_lc_clean, _ = apply_cloud_mask(ds_lc_raw, mask_clouds=t2_mask_clouds)
+                                    del ds_lc_raw
+
+                                lc_da, lc_df = compute_quick_land_cover(
+                                    ds_lc_clean, resolution_m=float(selected_resolution)
+                                )
+                                if reuse_ds is None:
+                                    del ds_lc_clean
+                                lc_tif = export_to_geotiff_bytes(lc_da, target_epsg=target_crs)
+                                del lc_da
+                                gc.collect()
+
+                                epsg_num = target_crs.replace("EPSG:", "")
+                                prefix = active_sensor_cfg["file_prefix"]
+                                st.session_state["tab2_lc_df"] = lc_df
+                                st.session_state["tab2_lc_meta"] = {
+                                    "sensor": active_sensor,
+                                    "date_str": str(lc_chosen_row["date_str"]),
+                                    "crs": target_crs,
+                                    "resolution_m": int(selected_resolution),
+                                    "valid_area_ha": float(lc_df.attrs.get("valid_area_ha", 0.0)),
+                                }
+                                st.session_state["tab2_lc_tif_bytes"] = lc_tif
+                                st.session_state["tab2_lc_tif_filename"] = (
+                                    f"{prefix}_{lc_chosen_row['date_str']}_LandCover_"
+                                    f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                                )
+                            except Exception as exc:
+                                st.error(t("lc_error", err=exc))
+
+                    lc_df_show: pd.DataFrame | None = st.session_state["tab2_lc_df"]
+                    lc_meta: dict[str, Any] | None = st.session_state["tab2_lc_meta"]
+                    if (
+                        lc_df_show is not None
+                        and lc_meta is not None
+                        and lc_meta.get("sensor") == active_sensor
+                    ):
+                        if lc_meta["valid_area_ha"] <= 0.0:
+                            st.warning(t("t2_no_valid_pixels"))
+                        else:
+                            lc_table = pd.DataFrame(
+                                {
+                                    t("lc_col_class"): [
+                                        t(f"lc_{ck}", lang=lang) for ck in lc_df_show["class_key"]
+                                    ],
+                                    t("lc_col_rule"): lc_df_show["rule"],
+                                    t("lc_col_area"): lc_df_show["area_ha"].map(lambda v: f"{v:,.2f}"),
+                                    t("lc_col_share"): lc_df_show["share_pct"].map(lambda v: f"{v:.1f} %"),
+                                }
+                            )
+                            st.dataframe(lc_table, width="stretch", hide_index=True)
+
+                            lc_bar = _build_land_cover_bar_chart(
+                                lc_df=lc_df_show,
+                                date_str=lc_meta["date_str"],
+                                total_valid_ha=lc_meta["valid_area_ha"],
+                                lang=lang,
+                            )
+                            st.plotly_chart(lc_bar, width="stretch", key="tab2_lc_bar_chart")
+
+                            lc_tif_bytes = st.session_state["tab2_lc_tif_bytes"]
+                            if lc_tif_bytes:
+                                st.download_button(
+                                    label=t("btn_download_lc_tif"),
+                                    data=lc_tif_bytes,
+                                    file_name=st.session_state["tab2_lc_tif_filename"] or "land_cover.tif",
+                                    mime="image/tiff",
+                                    width="stretch",
+                                )
 
     # =======================================================================
-    # ZAVIHEK 3: ČASOVNE VRSTE IN ZAZNAVA SPREMEMB (Δ = t2 - t1)
+    # ZAVIHEK 3: ČASOVNE VRSTE, ZAZNAVA SPREMEMB IN TIMELAPSE
     # =======================================================================
     with tab3:
+        # --- Vgrajena nadzorna kartica za senzor, datume, hitre gumbe in osvežitev ---
+        with st.container(border=True):
+            st.markdown(f"**{t('t3_ctrl_header')}**")
+            t3_today = date.today()
+            t3_sensor_cur = str(st.session_state["selected_sensor"])
+            t3_min_date: date = SENSOR_META[t3_sensor_cur]["min_date"]
+
+            c_t3_sens, c_t3_d1, c_t3_d2, c_t3_cld = st.columns(
+                [1.35, 0.9, 0.9, 1.05], vertical_alignment="bottom"
+            )
+            with c_t3_sens:
+                st.selectbox(
+                    t("sensor_select_label"),
+                    options=SENSOR_KEYS,
+                    format_func=lambda s, _lang=lang: t(SENSOR_META[s]["label_key"], lang=_lang),
+                    key="tab3_sensor_select",
+                    on_change=_sync_sensor_state,
+                    args=("tab3_sensor_select",),
+                )
+            with c_t3_d1:
+                t3_start = st.date_input(
+                    t("start_date_label"),
+                    min_value=t3_min_date,
+                    max_value=t3_today,
+                    key="tab3_start_date",
+                    on_change=_sync_start_date_state,
+                    args=("tab3_start_date",),
+                )
+            with c_t3_d2:
+                t3_end = st.date_input(
+                    t("end_date_label"),
+                    min_value=t3_min_date,
+                    max_value=t3_today,
+                    key="tab3_end_date",
+                    on_change=_sync_end_date_state,
+                    args=("tab3_end_date",),
+                )
+            with c_t3_cld:
+                if t3_sensor_cur == SENSOR_S1:
+                    t3_max_cloud = 100
+                    st.caption(f"📡 {t('sar_allweather_note')}")
+                else:
+                    t3_max_cloud = st.slider(
+                        t("max_cloud_label"),
+                        min_value=0,
+                        max_value=100,
+                        step=1,
+                        key="tab3_max_cloud",
+                        on_change=_sync_max_cloud_state,
+                        args=("tab3_max_cloud",),
+                    )
+
+            # Hitri prednastavljeni časovni gumbi (vključno z 1990–danes za Landsat)
+            p1, p2, p3, p4 = st.columns(4)
+            with p1:
+                st.button(
+                    t("t3_preset_6m"),
+                    width="stretch",
+                    key="t3_btn_preset_6m",
+                    on_click=_apply_tab3_date_preset,
+                    args=("6m",),
+                )
+            with p2:
+                st.button(
+                    t("t3_preset_2y"),
+                    width="stretch",
+                    key="t3_btn_preset_2y",
+                    on_click=_apply_tab3_date_preset,
+                    args=("2y",),
+                )
+            with p3:
+                st.button(
+                    t("t3_preset_5y"),
+                    width="stretch",
+                    key="t3_btn_preset_5y",
+                    on_click=_apply_tab3_date_preset,
+                    args=("5y",),
+                )
+            with p4:
+                st.button(
+                    t("t3_preset_1990"),
+                    width="stretch",
+                    key="t3_btn_preset_1990",
+                    on_click=_apply_tab3_date_preset,
+                    args=("1990_landsat",),
+                )
+
+            t3_dates_ok = t3_start <= t3_end
+            if not t3_dates_ok:
+                st.error(t("date_order_error"))
+
+            t3_target_bbox = bbox_4326 if (bbox_4326 is not None and aoi_valid and aoi_error is None) else active_bbox
+            t3_can_refresh = (t3_target_bbox is not None) and aoi_valid and t3_dates_ok and (aoi_error is None)
+
+            col_ref_btn, col_ref_stat = st.columns([1.35, 1.65], vertical_alignment="center")
+            with col_ref_btn:
+                t3_refresh_clicked = st.button(
+                    t("t3_btn_refresh"),
+                    type="primary",
+                    width="stretch",
+                    disabled=not t3_can_refresh,
+                    key="tab3_refresh_scenes_btn",
+                )
+            with col_ref_stat:
+                if not aoi_valid or t3_target_bbox is None:
+                    st.caption(f"⚠️ {t('t3_no_aoi_warn')}")
+                elif search_performed and not summary_df.empty:
+                    d_min = str(summary_df["date_str"].min())
+                    d_max = str(summary_df["date_str"].max())
+                    st.caption(
+                        t(
+                            "t3_loaded_status",
+                            sensor=active_sensor_cfg["short_name"],
+                            n=len(items),
+                            d1=d_min,
+                            d2=d_max,
+                        )
+                    )
+                else:
+                    st.caption(t("need_search_first"))
+
+        if t3_refresh_clicked and t3_target_bbox is not None:
+            t3_sensor_cfg = SENSOR_META[t3_sensor_cur]
+            with st.spinner(t("spinner_search", sensor=t3_sensor_cfg["short_name"])):
+                try:
+                    _execute_stac_search(
+                        sensor=t3_sensor_cur,
+                        bbox_4326=list(t3_target_bbox),
+                        bbox_3794=bbox_3794,
+                        aoi_polygon_4326=aoi_polygon_4326,
+                        area_km2=area_km2,
+                        start_date=t3_start,
+                        end_date=t3_end,
+                        max_cloud_cover=float(t3_max_cloud),
+                        exclude_l7_slc_off=bool(st.session_state.get("exclude_l7_slc_off", False)),
+                        limit=50,
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(t("search_error", err=exc))
+
         if not search_performed or not items or summary_df.empty:
-            st.info(t("need_search_first"))
+            st.info(t("no_scenes_warn") if search_performed else t("need_search_first"))
         else:
             is_sar_t3 = active_sensor == SENSOR_S1
             metric_options = SAR_METRIC_KEYS if is_sar_t3 else INDEX_KEYS
@@ -3147,556 +3783,565 @@ def main() -> None:
                     else t(f"idx_{code}_label", lang=_lang)
                 )
 
-            # ---------------------------------------------------------------
-            # SEKCIJA A: ČASOVNA VRSTA
-            # ---------------------------------------------------------------
-            st.subheader(t("t3_sec_a_header"))
-            st.caption(t("t3_sec_a_caption"))
-
-            col_ts_idx, col_ts_ep, col_ts_scl = st.columns([1.1, 1.0, 0.9])
-            with col_ts_idx:
-                ts_metric_key = st.selectbox(
-                    metric_label_title,
-                    options=metric_options,
-                    index=0,
-                    format_func=_fmt_metric,
-                    key=f"tab3_ts_metric_{active_sensor}",
-                )
-            with col_ts_ep:
-                total_available = len(items)
-                if total_available <= 5:
-                    max_epochs = total_available
-                    st.caption(f"{t('t3_epochs_slider')} **{total_available}**")
-                else:
-                    upper_ep = min(40, total_available)
-                    default_ep = min(15, upper_ep)
-                    max_epochs = st.slider(
-                        t("t3_epochs_slider"),
-                        min_value=5,
-                        max_value=upper_ep,
-                        value=default_ep,
-                        step=1,
-                        help=t("t3_epochs_help"),
-                        key=f"tab3_max_epochs_{active_sensor}",
-                    )
-            with col_ts_scl:
-                if is_sar_t3:
-                    ts_mask_clouds = False
-                    st.caption(t("sar_allweather_note"))
-                else:
-                    ts_mask_clouds = st.checkbox(
-                        t("scl_toggle_label"),
-                        value=True,
-                        help=t("scl_toggle_help"),
-                        key="tab3_ts_scl",
-                    )
-
-            ts_clicked = st.button(
-                t("btn_compute_ts"),
-                type="primary",
-                width="stretch",
-                key="tab3_ts_btn",
+            sub_ts, sub_change, sub_tl = st.tabs(
+                [t("t3_subtab_ts"), t("t3_subtab_change"), t("t3_subtab_tl")]
             )
 
-            if ts_clicked and active_bbox is not None:
-                selected_items = _select_evenly_spaced_items(items, int(max_epochs))
-                prog_bar = st.progress(0.0)
-                status_slot = st.empty()
-
-                def _on_progress(step: int, total: int, label: str) -> None:
-                    frac = min(max(step / max(total, 1), 0.0), 1.0)
-                    prog_bar.progress(frac)
-                    if step < total:
-                        status_slot.caption(t("ts_progress", cur=step + 1, tot=total, date=label))
-
-                try:
-                    ts_df = extract_time_series(
-                        items=selected_items,
-                        bbox_4326=active_bbox,
-                        index_name=ts_metric_key,
-                        target_epsg=target_crs,
-                        resolution=float(selected_resolution),
-                        mask_clouds=ts_mask_clouds,
-                        min_valid_pct=10.0,
-                        progress_callback=_on_progress,
-                        sensor=active_sensor,
-                        aoi_polygon_4326=active_polygon,
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 3.1: ČASOVNA VRSTA (GRAF)
+            # ---------------------------------------------------------------
+            with sub_ts:
+                st.caption(t("t3_sec_a_caption"))
+                with st.container(border=True):
+                    col_ts_idx, col_ts_ep, col_ts_scl = st.columns(
+                        [1.1, 1.0, 0.9], vertical_alignment="bottom"
                     )
-                    prog_bar.empty()
-                    status_slot.empty()
+                    with col_ts_idx:
+                        ts_metric_key = st.selectbox(
+                            metric_label_title,
+                            options=metric_options,
+                            index=0,
+                            format_func=_fmt_metric,
+                            key=f"tab3_ts_metric_{active_sensor}",
+                        )
+                    with col_ts_ep:
+                        total_available = len(items)
+                        if total_available <= 5:
+                            max_epochs = total_available
+                            st.caption(f"{t('t3_epochs_slider')} **{total_available}**")
+                        else:
+                            upper_ep = min(40, total_available)
+                            default_ep = min(15, upper_ep)
+                            max_epochs = st.slider(
+                                t("t3_epochs_slider"),
+                                min_value=5,
+                                max_value=upper_ep,
+                                value=default_ep,
+                                step=1,
+                                help=t("t3_epochs_help"),
+                                key=f"tab3_max_epochs_{active_sensor}",
+                            )
+                    with col_ts_scl:
+                        if is_sar_t3:
+                            ts_mask_clouds = False
+                            st.caption(t("sar_allweather_note"))
+                        else:
+                            ts_mask_clouds = st.checkbox(
+                                t("scl_toggle_label"),
+                                value=True,
+                                help=t("scl_toggle_help"),
+                                key="tab3_ts_scl",
+                            )
 
-                    st.session_state["tab3_ts_df"] = ts_df
-                    st.session_state["tab3_ts_meta"] = {
-                        "sensor": active_sensor,
-                        "prefix": active_sensor_cfg["file_prefix"],
-                        "index_key": ts_metric_key,
-                        "crs": target_crs,
-                        "resolution_m": int(selected_resolution),
-                        "skipped": ts_df.attrs.get("skipped_epochs", []),
-                    }
-                    gc.collect()
-                except Exception as exc:
-                    prog_bar.empty()
-                    status_slot.empty()
-                    st.error(t("ts_error", err=exc))
-
-            ts_df_show: pd.DataFrame | None = st.session_state["tab3_ts_df"]
-            ts_meta: dict[str, Any] | None = st.session_state["tab3_ts_meta"]
-
-            if ts_df_show is not None and ts_meta is not None and ts_meta.get("sensor") == active_sensor:
-                skipped = ts_meta.get("skipped", [])
-                if skipped:
-                    st.info(t("ts_skipped_info", n=len(skipped)))
-                    with st.expander(t("ts_skipped_expander"), expanded=False):
-                        st.dataframe(pd.DataFrame(skipped), width="stretch", hide_index=True)
-
-                if ts_df_show.empty:
-                    st.warning(t("ts_empty_warn"))
-                else:
-                    ts_unit = " dB" if is_sar_t3 else ""
-                    ts_fig = _build_time_series_chart(
-                        ts_df=ts_df_show,
-                        metric_label=ts_meta["index_key"],
-                        target_crs=ts_meta["crs"],
-                        resolution_m=ts_meta["resolution_m"],
-                        unit_suffix=ts_unit,
-                    )
-                    st.plotly_chart(ts_fig, width="stretch", key="tab3_ts_plotly_chart")
-
-                    csv_bytes = ts_df_show.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        label=t("btn_download_ts_csv"),
-                        data=csv_bytes,
-                        file_name=(
-                            f"{ts_meta['prefix']}_timeseries_{ts_meta['index_key']}_"
-                            f"{ts_meta['resolution_m']}m.csv"
-                        ),
-                        mime="text/csv",
+                    ts_clicked = st.button(
+                        t("btn_compute_ts"),
+                        type="primary",
                         width="stretch",
+                        key="tab3_ts_btn",
                     )
+
+                if ts_clicked and active_bbox is not None:
+                    selected_items = _select_evenly_spaced_items(items, int(max_epochs))
+                    prog_bar = st.progress(0.0)
+                    status_slot = st.empty()
+
+                    def _on_progress(step: int, total: int, label: str) -> None:
+                        frac = min(max(step / max(total, 1), 0.0), 1.0)
+                        prog_bar.progress(frac)
+                        if step < total:
+                            status_slot.caption(t("ts_progress", cur=step + 1, tot=total, date=label))
+
+                    try:
+                        ts_df = extract_time_series(
+                            items=selected_items,
+                            bbox_4326=active_bbox,
+                            index_name=ts_metric_key,
+                            target_epsg=target_crs,
+                            resolution=float(selected_resolution),
+                            mask_clouds=ts_mask_clouds,
+                            min_valid_pct=10.0,
+                            progress_callback=_on_progress,
+                            sensor=active_sensor,
+                            aoi_polygon_4326=active_polygon,
+                        )
+                        prog_bar.empty()
+                        status_slot.empty()
+
+                        st.session_state["tab3_ts_df"] = ts_df
+                        st.session_state["tab3_ts_meta"] = {
+                            "sensor": active_sensor,
+                            "prefix": active_sensor_cfg["file_prefix"],
+                            "index_key": ts_metric_key,
+                            "crs": target_crs,
+                            "resolution_m": int(selected_resolution),
+                            "skipped": ts_df.attrs.get("skipped_epochs", []),
+                        }
+                        gc.collect()
+                    except Exception as exc:
+                        prog_bar.empty()
+                        status_slot.empty()
+                        st.error(t("ts_error", err=exc))
+
+                ts_df_show: pd.DataFrame | None = st.session_state["tab3_ts_df"]
+                ts_meta: dict[str, Any] | None = st.session_state["tab3_ts_meta"]
+
+                if ts_df_show is not None and ts_meta is not None and ts_meta.get("sensor") == active_sensor:
+                    skipped = ts_meta.get("skipped", [])
+                    if skipped:
+                        st.info(t("ts_skipped_info", n=len(skipped)))
+                        with st.expander(t("ts_skipped_expander"), expanded=False):
+                            st.dataframe(pd.DataFrame(skipped), width="stretch", hide_index=True)
+
+                    if ts_df_show.empty:
+                        st.warning(t("ts_empty_warn"))
+                    else:
+                        ts_unit = " dB" if is_sar_t3 else ""
+                        ts_fig = _build_time_series_chart(
+                            ts_df=ts_df_show,
+                            metric_label=ts_meta["index_key"],
+                            target_crs=ts_meta["crs"],
+                            resolution_m=ts_meta["resolution_m"],
+                            unit_suffix=ts_unit,
+                        )
+                        st.plotly_chart(ts_fig, width="stretch", key="tab3_ts_plotly_chart")
+
+                        csv_bytes = ts_df_show.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            label=t("btn_download_ts_csv"),
+                            data=csv_bytes,
+                            file_name=(
+                                f"{ts_meta['prefix']}_timeseries_{ts_meta['index_key']}_"
+                                f"{ts_meta['resolution_m']}m.csv"
+                            ),
+                            mime="text/csv",
+                            width="stretch",
+                        )
 
             # ---------------------------------------------------------------
-            # SEKCIJA B: ZAZNAVA SPREMEMB (Δ = t2 - t1)
+            # PODZAVIHEK 3.2: ZAZNAVA SPREMEMB (Δ = t2 - t1 & PREJ / POTEM)
             # ---------------------------------------------------------------
-            st.divider()
-            st.subheader(t("t3_sec_b_header"))
-            st.caption(t("t3_sec_b_caption"))
+            with sub_change:
+                st.caption(t("t3_sec_b_caption"))
 
-            if len(items) < 2:
-                st.info(t("t3_need_two_scenes"))
-            else:
-                col_c_idx, col_c_thr, col_c_scl = st.columns([1.15, 1.0, 0.85])
-                with col_c_idx:
-                    ch_metric_key = st.selectbox(
-                        metric_label_title,
-                        options=metric_options,
-                        index=0,
-                        format_func=_fmt_metric,
-                        key=f"tab3_ch_metric_{active_sensor}",
-                    )
-                with col_c_thr:
-                    if is_sar_t3:
-                        ch_threshold = st.slider(
-                            f"{t('t3_threshold_label')} [dB]",
-                            min_value=0.5,
-                            max_value=8.0,
-                            value=2.0,
-                            step=0.25,
-                            key="tab3_ch_threshold_sar",
+                if len(items) < 2:
+                    st.info(t("t3_need_two_scenes"))
+                else:
+                    with st.container(border=True):
+                        col_c_idx, col_c_thr, col_c_scl = st.columns(
+                            [1.15, 1.0, 0.85], vertical_alignment="bottom"
                         )
-                    else:
-                        ch_threshold = st.slider(
-                            t("t3_threshold_label"),
-                            min_value=0.05,
-                            max_value=0.40,
-                            value=0.10,
-                            step=0.01,
-                            key="tab3_ch_threshold_opt",
+                        with col_c_idx:
+                            ch_metric_key = st.selectbox(
+                                metric_label_title,
+                                options=metric_options,
+                                index=0,
+                                format_func=_fmt_metric,
+                                key=f"tab3_ch_metric_{active_sensor}",
+                            )
+                        with col_c_thr:
+                            if is_sar_t3:
+                                ch_threshold = st.slider(
+                                    f"{t('t3_threshold_label')} [dB]",
+                                    min_value=0.5,
+                                    max_value=8.0,
+                                    value=2.0,
+                                    step=0.25,
+                                    key="tab3_ch_threshold_sar",
+                                )
+                            else:
+                                ch_threshold = st.slider(
+                                    t("t3_threshold_label"),
+                                    min_value=0.05,
+                                    max_value=0.40,
+                                    value=0.10,
+                                    step=0.01,
+                                    key="tab3_ch_threshold_opt",
+                                )
+                        with col_c_scl:
+                            if is_sar_t3:
+                                ch_mask_clouds = False
+                                st.caption(t("sar_allweather_note"))
+                            else:
+                                ch_mask_clouds = st.checkbox(
+                                    t("scl_toggle_label"),
+                                    value=True,
+                                    help=t("scl_toggle_help"),
+                                    key="tab3_ch_scl",
+                                )
+
+                        col_t1, col_t2 = st.columns(2)
+                        with col_t1:
+                            t1_idx = st.selectbox(
+                                t("t3_select_t1"),
+                                options=list(range(len(items))),
+                                index=len(items) - 1,
+                                format_func=lambda idx: scene_labels[idx],
+                                key=f"tab3_t1_select_{active_sensor}",
+                            )
+                        with col_t2:
+                            t2_idx = st.selectbox(
+                                t("t3_select_t2"),
+                                options=list(range(len(items))),
+                                index=0,
+                                format_func=lambda idx: scene_labels[idx],
+                                key=f"tab3_t2_select_{active_sensor}",
+                            )
+
+                        if t1_idx == t2_idx:
+                            st.warning(t("t3_same_scene_warn"))
+
+                        ch_clicked = st.button(
+                            t("btn_compute_change"),
+                            type="primary",
+                            width="stretch",
+                            disabled=(t1_idx == t2_idx),
+                            key="tab3_ch_btn",
                         )
-                with col_c_scl:
-                    if is_sar_t3:
-                        ch_mask_clouds = False
-                        st.caption(t("sar_allweather_note"))
-                    else:
-                        ch_mask_clouds = st.checkbox(
-                            t("scl_toggle_label"),
-                            value=True,
-                            help=t("scl_toggle_help"),
-                            key="tab3_ch_scl",
-                        )
 
-                col_t1, col_t2 = st.columns(2)
-                with col_t1:
-                    t1_idx = st.selectbox(
-                        t("t3_select_t1"),
-                        options=list(range(len(items))),
-                        index=len(items) - 1,
-                        format_func=lambda idx: scene_labels[idx],
-                        key=f"tab3_t1_select_{active_sensor}",
-                    )
-                with col_t2:
-                    t2_idx = st.selectbox(
-                        t("t3_select_t2"),
-                        options=list(range(len(items))),
-                        index=0,
-                        format_func=lambda idx: scene_labels[idx],
-                        key=f"tab3_t2_select_{active_sensor}",
-                    )
+                    if ch_clicked and active_bbox is not None and t1_idx != t2_idx:
+                        row_t1 = summary_df.iloc[t1_idx]
+                        row_t2 = summary_df.iloc[t2_idx]
+                        with st.spinner(
+                            t("spinner_change", idx=ch_metric_key, d1=row_t1["date_str"], d2=row_t2["date_str"])
+                        ):
+                            try:
+                                st.session_state["tab3_change_t1"] = None
+                                st.session_state["tab3_change_t2"] = None
+                                st.session_state["tab3_change_diff"] = None
+                                st.session_state["tab3_change_tif_bytes"] = None
+                                gc.collect()
 
-                if t1_idx == t2_idx:
-                    st.warning(t("t3_same_scene_warn"))
+                                da_t1, da_t2, da_diff = compute_change_detection(
+                                    item_t1=items[t1_idx],
+                                    item_t2=items[t2_idx],
+                                    bbox_4326=active_bbox,
+                                    index_name=ch_metric_key,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    mask_clouds=ch_mask_clouds,
+                                    sensor=active_sensor,
+                                    aoi_polygon_4326=active_polygon,
+                                )
+                                diff_tif = export_to_geotiff_bytes(da_diff, target_epsg=target_crs)
+                                swipe_t1_png, swipe_t2_png = render_change_swipe_pair(
+                                    da_t1=da_t1,
+                                    da_t2=da_t2,
+                                    index_key=ch_metric_key,
+                                    is_sar=is_sar_t3,
+                                )
+                                epsg_num = target_crs.replace("EPSG:", "")
+                                prefix = active_sensor_cfg["file_prefix"]
+                                diff_fname = (
+                                    f"{prefix}_delta_{ch_metric_key}_{row_t1['date_str']}_to_{row_t2['date_str']}_"
+                                    f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                                )
 
-                ch_clicked = st.button(
-                    t("btn_compute_change"),
-                    type="primary",
-                    width="stretch",
-                    disabled=(t1_idx == t2_idx),
-                    key="tab3_ch_btn",
-                )
+                                st.session_state["tab3_change_t1"] = da_t1
+                                st.session_state["tab3_change_t2"] = da_t2
+                                st.session_state["tab3_change_diff"] = da_diff
+                                st.session_state["tab3_change_meta"] = {
+                                    "sensor": active_sensor,
+                                    "index_key": ch_metric_key,
+                                    "date_t1": str(row_t1["date_str"]),
+                                    "date_t2": str(row_t2["date_str"]),
+                                    "crs": target_crs,
+                                    "resolution_m": int(selected_resolution),
+                                }
+                                st.session_state["tab3_change_tif_bytes"] = diff_tif
+                                st.session_state["tab3_change_tif_filename"] = diff_fname
+                                st.session_state["tab3_swipe_png_t1"] = swipe_t1_png
+                                st.session_state["tab3_swipe_png_t2"] = swipe_t2_png
+                                gc.collect()
+                            except Exception as exc:
+                                st.error(t("change_error", err=exc))
 
-                if ch_clicked and active_bbox is not None and t1_idx != t2_idx:
-                    row_t1 = summary_df.iloc[t1_idx]
-                    row_t2 = summary_df.iloc[t2_idx]
-                    with st.spinner(
-                        t("spinner_change", idx=ch_metric_key, d1=row_t1["date_str"], d2=row_t2["date_str"])
+                    da_t1_s: xr.DataArray | None = st.session_state["tab3_change_t1"]
+                    da_t2_s: xr.DataArray | None = st.session_state["tab3_change_t2"]
+                    da_diff_s: xr.DataArray | None = st.session_state["tab3_change_diff"]
+                    ch_meta: dict[str, Any] | None = st.session_state["tab3_change_meta"]
+
+                    if (
+                        da_t1_s is not None
+                        and da_t2_s is not None
+                        and da_diff_s is not None
+                        and ch_meta is not None
+                        and ch_meta.get("sensor") == active_sensor
                     ):
+                        summary = compute_change_summary(
+                            da_diff_s,
+                            resolution_m=float(ch_meta["resolution_m"]),
+                            threshold=float(ch_threshold),
+                        )
+
+                        if summary["valid_pixels"] == 0:
+                            st.warning(t("t2_no_valid_pixels"))
+                        else:
+                            mean_str = (
+                                f"{summary['mean']:+.2f} dB"
+                                if is_sar_t3
+                                else f"{summary['mean']:+.3f}"
+                            )
+                            c1, c2, c3, c4, c5 = st.columns(5)
+                            c1.metric(t("change_m_mean"), mean_str)
+                            c2.metric(
+                                t("change_m_pos", thr=ch_threshold),
+                                f"{summary['pos_area_ha']:,.2f} ha",
+                                delta=f"{summary['pos_pct']:.1f} %",
+                            )
+                            c3.metric(
+                                t("change_m_neg", thr=ch_threshold),
+                                f"{summary['neg_area_ha']:,.2f} ha",
+                                delta=f"-{summary['neg_pct']:.1f} %",
+                                delta_color="inverse",
+                            )
+                            c4.metric(
+                                t("change_m_stable", thr=ch_threshold),
+                                f"{summary['stable_area_ha']:,.2f} ha",
+                                delta=f"{summary['stable_pct']:.1f} %",
+                                delta_color="off",
+                            )
+                            c5.metric(
+                                t("change_m_valid"),
+                                f"{summary['valid_area_ha']:,.2f} ha",
+                                delta=f"{summary['valid_pct']:.1f} %",
+                                delta_color="off",
+                            )
+
+                            unit_b = " [dB]" if is_sar_t3 else ""
+                            idx_lbl = f"{ch_meta['index_key']}{unit_b}"
+                            layer_labels = {
+                                "diff": t("change_panel_diff", idx=idx_lbl),
+                                "t1": t("change_panel_t1", idx=idx_lbl, d1=ch_meta["date_t1"]),
+                                "t2": t("change_panel_t2", idx=idx_lbl, d2=ch_meta["date_t2"]),
+                            }
+                            view_layer = st.radio(
+                                t("composite_select_label"),
+                                options=["diff", "t1", "t2"],
+                                index=0,
+                                horizontal=True,
+                                format_func=lambda k: layer_labels[k],
+                                label_visibility="collapsed",
+                                key="tab3_change_layer_radio",
+                            )
+
+                            st.caption(t("viewer_zoom_hint"))
+                            fig_ch = _build_change_plotly(
+                                da_t1=da_t1_s,
+                                da_t2=da_t2_s,
+                                da_diff=da_diff_s,
+                                index_key=ch_meta["index_key"],
+                                target_crs=ch_meta["crs"],
+                                date_t1=ch_meta["date_t1"],
+                                date_t2=ch_meta["date_t2"],
+                                resolution_m=float(ch_meta["resolution_m"]),
+                                is_sar=is_sar_t3,
+                                view_layer=view_layer,
+                            )
+                            st.plotly_chart(
+                                fig_ch,
+                                width="stretch",
+                                config=PLOTLY_VIEWER_CONFIG,
+                                key="tab3_change_plotly_viewer",
+                            )
+
+                            # Interaktivna zavesa Prej / Potem (t₁ ↔ t₂)
+                            swipe_t1 = st.session_state.get("tab3_swipe_png_t1")
+                            swipe_t2 = st.session_state.get("tab3_swipe_png_t2")
+                            if swipe_t1 and swipe_t2:
+                                st.markdown(f"#### {t('swipe_header')}")
+                                st.caption(t("swipe_hint"))
+                                _render_before_after_swipe_html(
+                                    png_t1_bytes=swipe_t1,
+                                    png_t2_bytes=swipe_t2,
+                                    label_t1=f"t₁: {ch_meta['date_t1']} ({idx_lbl})",
+                                    label_t2=f"t₂: {ch_meta['date_t2']} ({idx_lbl})",
+                                    height=520,
+                                )
+
+                            diff_bytes = st.session_state["tab3_change_tif_bytes"]
+                            if diff_bytes:
+                                st.download_button(
+                                    label=t("btn_download_change_tif"),
+                                    data=diff_bytes,
+                                    file_name=st.session_state["tab3_change_tif_filename"] or "change_map.tif",
+                                    mime="image/tiff",
+                                    width="stretch",
+                                )
+
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 3.3: VIZUALNI TIMELAPSE (GIF + DRSNIK DATUMOV)
+            # ---------------------------------------------------------------
+            with sub_tl:
+                st.caption(t("t3_sec_c_caption"))
+
+                if len(items) < 2:
+                    st.info(t("tl_need_two_scenes"))
+                else:
+                    if is_sar_t3:
+                        tl_layer_options = ["VV", "VH", "VV_VH"]
+                    else:
+                        tl_layer_options = ["RGB", "NIR", "NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
+
+                    def _fmt_tl_layer(code: str, _lang: str = lang) -> str:
+                        if code == "RGB":
+                            return t("vis_rgb_label", lang=_lang)
+                        if code == "NIR":
+                            return t("vis_nir_label", lang=_lang)
+                        if code in SAR_METRICS:
+                            return t(f"sar_{code}_label", lang=_lang)
+                        return t(f"idx_{code}_label", lang=_lang)
+
+                    with st.container(border=True):
+                        col_tl_layer, col_tl_n, col_tl_spd = st.columns(
+                            [1.4, 1.0, 0.8], vertical_alignment="bottom"
+                        )
+                        with col_tl_layer:
+                            tl_layer_code = st.selectbox(
+                                t("tl_layer_label"),
+                                options=tl_layer_options,
+                                index=0,
+                                format_func=_fmt_tl_layer,
+                                key=f"tab3_tl_layer_{active_sensor}",
+                            )
+                        with col_tl_n:
+                            avail_tl = len(items)
+                            if avail_tl <= 3:
+                                tl_num_frames = avail_tl
+                                st.caption(f"{t('tl_frames_label')} **{avail_tl}**")
+                            else:
+                                tl_max = min(15, avail_tl)
+                                tl_default = min(8, tl_max)
+                                tl_num_frames = st.slider(
+                                    t("tl_frames_label"),
+                                    min_value=3,
+                                    max_value=tl_max,
+                                    value=tl_default,
+                                    step=1,
+                                    help=t("tl_frames_help"),
+                                    key=f"tab3_tl_frames_{active_sensor}",
+                                )
+                        with col_tl_spd:
+                            tl_speed_sec = st.selectbox(
+                                t("tl_speed_label"),
+                                options=[0.4, 0.8, 1.2],
+                                index=1,
+                                format_func=lambda s: f"{s:.1f} s",
+                                key="tab3_tl_speed",
+                            )
+
+                        tl_clicked = st.button(
+                            t("btn_generate_tl"),
+                            type="primary",
+                            width="stretch",
+                            key="tab3_tl_btn",
+                        )
+
+                    if tl_clicked and active_bbox is not None:
+                        tl_items = _select_evenly_spaced_items(items, int(tl_num_frames))
+                        tl_prog = st.progress(0.0)
+                        tl_status = st.empty()
+
+                        def _on_tl_progress(step: int, total: int, label: str) -> None:
+                            frac = min(max(step / max(total, 1), 0.0), 1.0)
+                            tl_prog.progress(frac)
+                            if step < total:
+                                tl_status.caption(t("tl_progress", cur=step + 1, tot=total, date=label))
+
                         try:
-                            st.session_state["tab3_change_t1"] = None
-                            st.session_state["tab3_change_t2"] = None
-                            st.session_state["tab3_change_diff"] = None
-                            st.session_state["tab3_change_tif_bytes"] = None
+                            st.session_state["tab3_timelapse_data"] = None
                             gc.collect()
 
-                            da_t1, da_t2, da_diff = compute_change_detection(
-                                item_t1=items[t1_idx],
-                                item_t2=items[t2_idx],
+                            tl_result = generate_timelapse_frames(
+                                items=tl_items,
                                 bbox_4326=active_bbox,
-                                index_name=ch_metric_key,
+                                layer_mode=tl_layer_code,
                                 target_epsg=target_crs,
                                 resolution=float(selected_resolution),
-                                mask_clouds=ch_mask_clouds,
                                 sensor=active_sensor,
                                 aoi_polygon_4326=active_polygon,
+                                mask_clouds=(not is_sar_t3),
+                                min_valid_pct=10.0,
+                                duration_ms=int(round(tl_speed_sec * 1000)),
+                                max_width=700,
+                                progress_callback=_on_tl_progress,
                             )
-                            diff_tif = export_to_geotiff_bytes(da_diff, target_epsg=target_crs)
-                            swipe_t1_png, swipe_t2_png = render_change_swipe_pair(
-                                da_t1=da_t1,
-                                da_t2=da_t2,
-                                index_key=ch_metric_key,
-                                is_sar=is_sar_t3,
-                            )
-                            epsg_num = target_crs.replace("EPSG:", "")
-                            prefix = active_sensor_cfg["file_prefix"]
-                            diff_fname = (
-                                f"{prefix}_delta_{ch_metric_key}_{row_t1['date_str']}_to_{row_t2['date_str']}_"
-                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
-                            )
+                            tl_prog.empty()
+                            tl_status.empty()
 
-                            st.session_state["tab3_change_t1"] = da_t1
-                            st.session_state["tab3_change_t2"] = da_t2
-                            st.session_state["tab3_change_diff"] = da_diff
-                            st.session_state["tab3_change_meta"] = {
-                                "sensor": active_sensor,
-                                "index_key": ch_metric_key,
-                                "date_t1": str(row_t1["date_str"]),
-                                "date_t2": str(row_t2["date_str"]),
-                                "crs": target_crs,
-                                "resolution_m": int(selected_resolution),
-                            }
-                            st.session_state["tab3_change_tif_bytes"] = diff_tif
-                            st.session_state["tab3_change_tif_filename"] = diff_fname
-                            st.session_state["tab3_swipe_png_t1"] = swipe_t1_png
-                            st.session_state["tab3_swipe_png_t2"] = swipe_t2_png
+                            tl_result["duration_ms"] = int(round(tl_speed_sec * 1000))
+                            tl_result["prefix"] = active_sensor_cfg["file_prefix"]
+                            tl_result["resolution_m"] = int(selected_resolution)
+                            st.session_state["tab3_timelapse_data"] = tl_result
                             gc.collect()
                         except Exception as exc:
-                            st.error(t("change_error", err=exc))
+                            tl_prog.empty()
+                            tl_status.empty()
+                            st.error(t("tl_error", err=exc))
 
-                da_t1_s: xr.DataArray | None = st.session_state["tab3_change_t1"]
-                da_t2_s: xr.DataArray | None = st.session_state["tab3_change_t2"]
-                da_diff_s: xr.DataArray | None = st.session_state["tab3_change_diff"]
-                ch_meta: dict[str, Any] | None = st.session_state["tab3_change_meta"]
+                    tl_data: dict[str, Any] | None = st.session_state["tab3_timelapse_data"]
+                    if tl_data is not None and tl_data.get("sensor") == active_sensor:
+                        tl_frames: list[dict[str, Any]] = tl_data.get("frames", [])
+                        tl_skipped = tl_data.get("skipped", [])
 
-                if (
-                    da_t1_s is not None
-                    and da_t2_s is not None
-                    and da_diff_s is not None
-                    and ch_meta is not None
-                    and ch_meta.get("sensor") == active_sensor
-                ):
-                    st.divider()
-                    summary = compute_change_summary(
-                        da_diff_s,
-                        resolution_m=float(ch_meta["resolution_m"]),
-                        threshold=float(ch_threshold),
-                    )
+                        if tl_skipped:
+                            st.info(t("ts_skipped_info", n=len(tl_skipped)))
 
-                    if summary["valid_pixels"] == 0:
-                        st.warning(t("t2_no_valid_pixels"))
-                    else:
-                        mean_str = (
-                            f"{summary['mean']:+.2f} dB"
-                            if is_sar_t3
-                            else f"{summary['mean']:+.3f}"
-                        )
-                        c1, c2, c3, c4, c5 = st.columns(5)
-                        c1.metric(t("change_m_mean"), mean_str)
-                        c2.metric(
-                            t("change_m_pos", thr=ch_threshold),
-                            f"{summary['pos_area_ha']:,.2f} ha",
-                            delta=f"{summary['pos_pct']:.1f} %",
-                        )
-                        c3.metric(
-                            t("change_m_neg", thr=ch_threshold),
-                            f"{summary['neg_area_ha']:,.2f} ha",
-                            delta=f"-{summary['neg_pct']:.1f} %",
-                            delta_color="inverse",
-                        )
-                        c4.metric(
-                            t("change_m_stable", thr=ch_threshold),
-                            f"{summary['stable_area_ha']:,.2f} ha",
-                            delta=f"{summary['stable_pct']:.1f} %",
-                            delta_color="off",
-                        )
-                        c5.metric(
-                            t("change_m_valid"),
-                            f"{summary['valid_area_ha']:,.2f} ha",
-                            delta=f"{summary['valid_pct']:.1f} %",
-                            delta_color="off",
-                        )
+                        if not tl_frames:
+                            st.warning(t("tl_empty_warn"))
+                        else:
+                            # Ob spremembi hitrosti ponovno sestavimo GIF iz predpomnjenih PNG sličic
+                            desired_ms = int(round(tl_speed_sec * 1000))
+                            if tl_data.get("duration_ms") != desired_ms or not tl_data.get("gif_bytes"):
+                                tl_data["gif_bytes"] = compile_timelapse_gif(
+                                    [f["png_bytes"] for f in tl_frames],
+                                    duration_ms=desired_ms,
+                                )
+                                tl_data["duration_ms"] = desired_ms
 
-                        unit_b = " [dB]" if is_sar_t3 else ""
-                        idx_lbl = f"{ch_meta['index_key']}{unit_b}"
-                        layer_labels = {
-                            "diff": t("change_panel_diff", idx=idx_lbl),
-                            "t1": t("change_panel_t1", idx=idx_lbl, d1=ch_meta["date_t1"]),
-                            "t2": t("change_panel_t2", idx=idx_lbl, d2=ch_meta["date_t2"]),
-                        }
-                        view_layer = st.radio(
-                            t("composite_select_label"),
-                            options=["diff", "t1", "t2"],
-                            index=0,
-                            horizontal=True,
-                            format_func=lambda k: layer_labels[k],
-                            label_visibility="collapsed",
-                            key="tab3_change_layer_radio",
-                        )
+                            col_gif_l, col_gif_c, col_gif_r = st.columns([0.12, 0.76, 0.12])
+                            with col_gif_c:
+                                st.image(tl_data["gif_bytes"], width="stretch")
 
-                        st.caption(t("viewer_zoom_hint"))
-                        fig_ch = _build_change_plotly(
-                            da_t1=da_t1_s,
-                            da_t2=da_t2_s,
-                            da_diff=da_diff_s,
-                            index_key=ch_meta["index_key"],
-                            target_crs=ch_meta["crs"],
-                            date_t1=ch_meta["date_t1"],
-                            date_t2=ch_meta["date_t2"],
-                            resolution_m=float(ch_meta["resolution_m"]),
-                            is_sar=is_sar_t3,
-                            view_layer=view_layer,
-                        )
-                        st.plotly_chart(
-                            fig_ch,
-                            width="stretch",
-                            config=PLOTLY_VIEWER_CONFIG,
-                            key="tab3_change_plotly_viewer",
-                        )
-
-                        # Interaktivna zavesa Prej / Potem (t₁ ↔ t₂)
-                        swipe_t1 = st.session_state.get("tab3_swipe_png_t1")
-                        swipe_t2 = st.session_state.get("tab3_swipe_png_t2")
-                        if swipe_t1 and swipe_t2:
-                            st.markdown(f"#### {t('swipe_header')}")
-                            st.caption(t("swipe_hint"))
-                            _render_before_after_swipe_html(
-                                png_t1_bytes=swipe_t1,
-                                png_t2_bytes=swipe_t2,
-                                label_t1=f"t₁: {ch_meta['date_t1']} ({idx_lbl})",
-                                label_t2=f"t₂: {ch_meta['date_t2']} ({idx_lbl})",
-                                height=520,
+                            tl_fname = (
+                                f"{tl_data['prefix']}_timelapse_{tl_data['layer_mode']}_"
+                                f"{tl_frames[0]['date_str']}_to_{tl_frames[-1]['date_str']}_"
+                                f"{tl_data['resolution_m']}m.gif"
                             )
-
-                        diff_bytes = st.session_state["tab3_change_tif_bytes"]
-                        if diff_bytes:
                             st.download_button(
-                                label=t("btn_download_change_tif"),
-                                data=diff_bytes,
-                                file_name=st.session_state["tab3_change_tif_filename"] or "change_map.tif",
-                                mime="image/tiff",
+                                label=t("btn_download_tl_gif"),
+                                data=tl_data["gif_bytes"],
+                                file_name=tl_fname,
+                                mime="image/gif",
                                 width="stretch",
                             )
 
-            # ---------------------------------------------------------------
-            # SEKCIJA C: VIZUALNI TIMELAPSE (GIF + INTERAKTIVNI DRSNIK DATUMOV)
-            # ---------------------------------------------------------------
-            st.divider()
-            st.subheader(t("t3_sec_c_header"))
-            st.caption(t("t3_sec_c_caption"))
-
-            if len(items) < 2:
-                st.info(t("tl_need_two_scenes"))
-            else:
-                if is_sar_t3:
-                    tl_layer_options = ["VV", "VH", "VV_VH"]
-                else:
-                    tl_layer_options = ["RGB", "NIR", "NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
-
-                def _fmt_tl_layer(code: str, _lang: str = lang) -> str:
-                    if code == "RGB":
-                        return t("vis_rgb_label", lang=_lang)
-                    if code == "NIR":
-                        return t("vis_nir_label", lang=_lang)
-                    if code in SAR_METRICS:
-                        return t(f"sar_{code}_label", lang=_lang)
-                    return t(f"idx_{code}_label", lang=_lang)
-
-                col_tl_layer, col_tl_n, col_tl_spd = st.columns([1.4, 1.0, 0.8])
-                with col_tl_layer:
-                    tl_layer_code = st.selectbox(
-                        t("tl_layer_label"),
-                        options=tl_layer_options,
-                        index=0,
-                        format_func=_fmt_tl_layer,
-                        key=f"tab3_tl_layer_{active_sensor}",
-                    )
-                with col_tl_n:
-                    avail_tl = len(items)
-                    if avail_tl <= 3:
-                        tl_num_frames = avail_tl
-                        st.caption(f"{t('tl_frames_label')} **{avail_tl}**")
-                    else:
-                        tl_max = min(15, avail_tl)
-                        tl_default = min(8, tl_max)
-                        tl_num_frames = st.slider(
-                            t("tl_frames_label"),
-                            min_value=3,
-                            max_value=tl_max,
-                            value=tl_default,
-                            step=1,
-                            help=t("tl_frames_help"),
-                            key=f"tab3_tl_frames_{active_sensor}",
-                        )
-                with col_tl_spd:
-                    tl_speed_sec = st.selectbox(
-                        t("tl_speed_label"),
-                        options=[0.4, 0.8, 1.2],
-                        index=1,
-                        format_func=lambda s: f"{s:.1f} s",
-                        key="tab3_tl_speed",
-                    )
-
-                tl_clicked = st.button(
-                    t("btn_generate_tl"),
-                    type="primary",
-                    width="stretch",
-                    key="tab3_tl_btn",
-                )
-
-                if tl_clicked and active_bbox is not None:
-                    tl_items = _select_evenly_spaced_items(items, int(tl_num_frames))
-                    tl_prog = st.progress(0.0)
-                    tl_status = st.empty()
-
-                    def _on_tl_progress(step: int, total: int, label: str) -> None:
-                        frac = min(max(step / max(total, 1), 0.0), 1.0)
-                        tl_prog.progress(frac)
-                        if step < total:
-                            tl_status.caption(t("tl_progress", cur=step + 1, tot=total, date=label))
-
-                    try:
-                        st.session_state["tab3_timelapse_data"] = None
-                        gc.collect()
-
-                        tl_result = generate_timelapse_frames(
-                            items=tl_items,
-                            bbox_4326=active_bbox,
-                            layer_mode=tl_layer_code,
-                            target_epsg=target_crs,
-                            resolution=float(selected_resolution),
-                            sensor=active_sensor,
-                            aoi_polygon_4326=active_polygon,
-                            mask_clouds=(not is_sar_t3),
-                            min_valid_pct=10.0,
-                            duration_ms=int(round(tl_speed_sec * 1000)),
-                            max_width=700,
-                            progress_callback=_on_tl_progress,
-                        )
-                        tl_prog.empty()
-                        tl_status.empty()
-
-                        tl_result["duration_ms"] = int(round(tl_speed_sec * 1000))
-                        tl_result["prefix"] = active_sensor_cfg["file_prefix"]
-                        tl_result["resolution_m"] = int(selected_resolution)
-                        st.session_state["tab3_timelapse_data"] = tl_result
-                        gc.collect()
-                    except Exception as exc:
-                        tl_prog.empty()
-                        tl_status.empty()
-                        st.error(t("tl_error", err=exc))
-
-                tl_data: dict[str, Any] | None = st.session_state["tab3_timelapse_data"]
-                if tl_data is not None and tl_data.get("sensor") == active_sensor:
-                    tl_frames: list[dict[str, Any]] = tl_data.get("frames", [])
-                    tl_skipped = tl_data.get("skipped", [])
-
-                    if tl_skipped:
-                        st.info(t("ts_skipped_info", n=len(tl_skipped)))
-
-                    if not tl_frames:
-                        st.warning(t("tl_empty_warn"))
-                    else:
-                        # Ob spremembi hitrosti ponovno sestavimo GIF iz predpomnjenih PNG sličic
-                        desired_ms = int(round(tl_speed_sec * 1000))
-                        if tl_data.get("duration_ms") != desired_ms or not tl_data.get("gif_bytes"):
-                            tl_data["gif_bytes"] = compile_timelapse_gif(
-                                [f["png_bytes"] for f in tl_frames],
-                                duration_ms=desired_ms,
-                            )
-                            tl_data["duration_ms"] = desired_ms
-
-                        col_gif_l, col_gif_c, col_gif_r = st.columns([0.12, 0.76, 0.12])
-                        with col_gif_c:
-                            st.image(tl_data["gif_bytes"], width="stretch")
-
-                        tl_fname = (
-                            f"{tl_data['prefix']}_timelapse_{tl_data['layer_mode']}_"
-                            f"{tl_frames[0]['date_str']}_to_{tl_frames[-1]['date_str']}_"
-                            f"{tl_data['resolution_m']}m.gif"
-                        )
-                        st.download_button(
-                            label=t("btn_download_tl_gif"),
-                            data=tl_data["gif_bytes"],
-                            file_name=tl_fname,
-                            mime="image/gif",
-                            width="stretch",
-                        )
-
-                        # Interaktivni drsnik po datumih (frame-by-frame scrubber)
-                        st.markdown(f"#### {t('tl_scrubber_header')}")
-                        if len(tl_frames) == 1:
-                            chosen_frame = tl_frames[0]
-                        else:
-                            frame_indices = list(range(len(tl_frames)))
-                            scrub_idx = st.select_slider(
-                                t("tl_scrubber_label"),
-                                options=frame_indices,
-                                value=len(tl_frames) - 1,
-                                format_func=lambda idx: f"{tl_frames[idx]['date_str']} ({tl_frames[idx]['platform']})",
-                                key=f"tab3_tl_scrubber_{active_sensor}_{tl_data['layer_mode']}",
-                            )
-                            chosen_frame = tl_frames[int(scrub_idx)]
-
-                        col_sc_l, col_sc_c, col_sc_r = st.columns([0.12, 0.76, 0.12])
-                        with col_sc_c:
-                            st.image(chosen_frame["png_bytes"], width="stretch")
-                            st.caption(
-                                t(
-                                    "tl_frame_caption",
-                                    date=chosen_frame["date_str"],
-                                    platform=chosen_frame["platform"],
-                                    valid=chosen_frame["valid_pct"],
-                                    scene_id=chosen_frame["scene_id"],
+                            # Interaktivni drsnik po datumih (frame-by-frame scrubber)
+                            st.markdown(f"#### {t('tl_scrubber_header')}")
+                            if len(tl_frames) == 1:
+                                chosen_frame = tl_frames[0]
+                            else:
+                                frame_indices = list(range(len(tl_frames)))
+                                scrub_idx = st.select_slider(
+                                    t("tl_scrubber_label"),
+                                    options=frame_indices,
+                                    value=len(tl_frames) - 1,
+                                    format_func=lambda idx: f"{tl_frames[idx]['date_str']} ({tl_frames[idx]['platform']})",
+                                    key=f"tab3_tl_scrubber_{active_sensor}_{tl_data['layer_mode']}",
                                 )
-                            )
+                                chosen_frame = tl_frames[int(scrub_idx)]
+
+                            col_sc_l, col_sc_c, col_sc_r = st.columns([0.12, 0.76, 0.12])
+                            with col_sc_c:
+                                st.image(chosen_frame["png_bytes"], width="stretch")
+                                st.caption(
+                                    t(
+                                        "tl_frame_caption",
+                                        date=chosen_frame["date_str"],
+                                        platform=chosen_frame["platform"],
+                                        valid=chosen_frame["valid_pct"],
+                                        scene_id=chosen_frame["scene_id"],
+                                    )
+                                )
 
 
 if __name__ == "__main__":

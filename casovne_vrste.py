@@ -11,6 +11,7 @@ import gc
 import io
 import logging
 import os
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
@@ -811,4 +812,273 @@ def generate_timelapse_frames(
         "layer_mode": mode,
         "sensor": sensor,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cloud-Free Temporal Median Composite (Memory-Safe Sequential Streaming)
+# ---------------------------------------------------------------------------
+COMPOSITE_RGB_NIR_BANDS: tuple[str, ...] = ("B04", "B03", "B02", "B08")
+
+
+def _select_least_cloudy_groups(
+    items: Sequence[StacItemOrGroup],
+    sensor: str,
+    max_scenes: int,
+) -> list[list[pystac.Item]]:
+    """Select up to ``max_scenes`` least-cloudy unique-date STAC groups, returned chronologically."""
+    groups = _normalize_epoch_groups(items)
+    if len(groups) <= max_scenes:
+        return groups
+
+    scored: list[tuple[float, str, list[pystac.Item]]] = []
+    for day_items in groups:
+        _, date_str, _, _, cloud = _group_metadata(day_items, sensor=sensor)
+        sort_cloud = cloud if np.isfinite(cloud) else 999.0
+        scored.append((sort_cloud, date_str, day_items))
+
+    scored.sort(key=lambda tup: (tup[0], tup[1]))
+    chosen = scored[: int(max_scenes)]
+    chosen.sort(key=lambda tup: tup[1])
+    return [g for _, _, g in chosen]
+
+
+def compute_cloud_free_composite(
+    items: Sequence[StacItemOrGroup],
+    bbox_4326: Sequence[float],
+    mode: str = "RGB_NIR",
+    target_epsg: int | str = "EPSG:3794",
+    resolution: float = 10,
+    sensor: str = SENSOR_S2,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    max_scenes: int = 6,
+    min_valid_pct: float = 5.0,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[xr.Dataset | xr.DataArray | None, dict[str, Any]]:
+    """Compute a pixel-wise cloud-free median composite across up to ``max_scenes`` clearest dates.
+
+    Streams strictly one same-day mosaicked acquisition at a time (1 GB RAM safe),
+    applies Sentinel-2 SCL or Landsat ``QA_PIXEL`` cloud/shadow masking, aligns
+    every epoch to the reference pixel grid, and computes the per-pixel ``nanmedian``.
+
+    Parameters
+    ----------
+    mode : str
+        ``"RGB_NIR"`` (loads ``B04, B03, B02, B08`` for True Color RGB & False Color NIR)
+        or an optical spectral index key (``"NDVI"``, ``"NDWI"``, ``"MNDWI"``, ``"NDBI"``, ``"NBR"``).
+    """
+    if sensor == SENSOR_S1:
+        raise ValueError("Cloud-free optical median composite applies to optical sensors (Sentinel-2 / Landsat).")
+
+    mode_key = mode.strip().upper()
+    is_rgb_nir = mode_key in ("RGB_NIR", "RGB", "NIR")
+    if is_rgb_nir:
+        mode_key = "RGB_NIR"
+        mask_band = "QA_PIXEL" if sensor == SENSOR_LANDSAT else "SCL"
+        req_bands = [*COMPOSITE_RGB_NIR_BANDS, mask_band]
+    else:
+        if mode_key not in SPECTRAL_INDICES:
+            raise ValueError(
+                f"Unsupported composite mode {mode!r}. Use 'RGB_NIR' or one of {list(SPECTRAL_INDICES.keys())}."
+            )
+        req_bands = get_required_bands_for_sensor(sensor, mode_key, include_cloud_mask=True)
+
+    selected_groups = _select_least_cloudy_groups(items, sensor=sensor, max_scenes=max(1, int(max_scenes)))
+    total = len(selected_groups)
+
+    ref_da: xr.DataArray | None = None
+    ref_crs = None
+    band_stacks: dict[str, list[np.ndarray]] = (
+        {b: [] for b in COMPOSITE_RGB_NIR_BANDS} if is_rgb_nir else {mode_key: []}
+    )
+    dates_used: list[str] = []
+    skipped_dates: list[dict[str, Any]] = []
+
+    for step, day_items in enumerate(selected_groups):
+        _, date_str, scene_id, _, _ = _group_metadata(day_items, sensor=sensor)
+        if progress_callback is not None:
+            progress_callback(step, total, date_str)
+
+        ds: xr.Dataset | None = None
+        masked_ds: xr.Dataset | None = None
+        layer_da: xr.DataArray | None = None
+        try:
+            ds = load_scene(
+                sensor=sensor,
+                item=day_items,
+                bbox_4326=bbox_4326,
+                bands=req_bands,
+                target_epsg=target_epsg,
+                resolution=float(resolution),
+                aoi_polygon_4326=aoi_polygon_4326,
+            )
+            masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=True)
+            if clear_pct < float(min_valid_pct):
+                skipped_dates.append(
+                    {"date_str": date_str, "scene_id": scene_id, "valid_pct": round(clear_pct, 1), "reason": "cloudy"}
+                )
+                continue
+
+            if is_rgb_nir:
+                if ref_da is None:
+                    ref_da = masked_ds[COMPOSITE_RGB_NIR_BANDS[0]].copy()
+                    ref_crs = masked_ds.rio.crs or ref_da.rio.crs
+                for b in COMPOSITE_RGB_NIR_BANDS:
+                    da_b = masked_ds[b]
+                    if not _grids_match(ref_da, da_b):
+                        da_b = da_b.rio.reproject_match(ref_da, resampling=Resampling.bilinear, nodata=np.nan)
+                    band_stacks[b].append(da_b.values.astype(np.float32, copy=True))
+            else:
+                layer_da = compute_index(masked_ds, mode_key)
+                if ref_da is None:
+                    ref_da = layer_da.copy()
+                    ref_crs = layer_da.rio.crs or masked_ds.rio.crs
+                elif not _grids_match(ref_da, layer_da):
+                    layer_da = layer_da.rio.reproject_match(ref_da, resampling=Resampling.bilinear, nodata=np.nan)
+                band_stacks[mode_key].append(layer_da.values.astype(np.float32, copy=True))
+
+            dates_used.append(date_str)
+        except Exception as exc:
+            logger.warning("Composite skipped %s (%s): %s", date_str, scene_id, exc)
+            skipped_dates.append(
+                {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)}
+            )
+        finally:
+            del ds, masked_ds, layer_da
+            gc.collect()
+
+    if progress_callback is not None:
+        progress_callback(total, total, "done")
+
+    if not dates_used or ref_da is None:
+        return None, {
+            "mode": mode_key,
+            "sensor": sensor,
+            "scenes_requested": total,
+            "scenes_used": 0,
+            "dates_used": [],
+            "skipped_dates": skipped_dates,
+            "date_start": "",
+            "date_end": "",
+            "valid_pct": 0.0,
+            "valid_area_ha": 0.0,
+            "median_obs_per_px": 0.0,
+            "resolution_m": float(resolution),
+            "crs": str(target_epsg),
+        }
+
+    date_start = min(dates_used)
+    date_end = max(dates_used)
+    px_area_ha = (float(resolution) ** 2) / 10_000.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        if is_rgb_nir:
+            med_vars: dict[str, xr.DataArray] = {}
+            obs_counts = None
+            for b in COMPOSITE_RGB_NIR_BANDS:
+                stack = np.stack(band_stacks[b], axis=0)
+                if obs_counts is None:
+                    obs_counts = np.sum(np.isfinite(stack), axis=0)
+                med = np.nanmedian(stack, axis=0).astype(np.float32)
+                del stack
+                band_stacks[b].clear()
+
+                da_med = xr.DataArray(
+                    med,
+                    dims=ref_da.dims,
+                    coords=ref_da.coords,
+                    name=b,
+                    attrs={
+                        "units": "surface_reflectance",
+                        "long_name": f"Cloud-Free Median {b} ({date_start} to {date_end})",
+                    },
+                )
+                if ref_crs is not None:
+                    da_med = da_med.rio.write_crs(ref_crs, inplace=False)
+                da_med = da_med.rio.write_nodata(np.nan, inplace=False)
+                med_vars[b] = da_med
+
+            valid_mask = np.ones(ref_da.shape, dtype=bool)
+            for b in COMPOSITE_RGB_NIR_BANDS:
+                valid_mask &= np.isfinite(med_vars[b].values)
+
+            valid_pixels = int(np.count_nonzero(valid_mask))
+            total_pixels = int(valid_mask.size)
+            valid_pct = round(100.0 * valid_pixels / max(total_pixels, 1), 2)
+            valid_area_ha = round(valid_pixels * px_area_ha, 3)
+            med_obs = float(np.median(obs_counts[valid_mask])) if (obs_counts is not None and valid_pixels > 0) else 0.0
+
+            result_obj: xr.Dataset | xr.DataArray = xr.Dataset(
+                data_vars=med_vars,
+                coords=ref_da.coords,
+                attrs={
+                    "sensor": sensor,
+                    "composite_mode": mode_key,
+                    "datetime": f"{date_start}..{date_end}",
+                    "date_start": date_start,
+                    "date_end": date_end,
+                    "scenes_used": len(dates_used),
+                    "dates_used": ", ".join(dates_used),
+                    "resolution_m": float(resolution),
+                    "crs": str(ref_crs) if ref_crs is not None else str(target_epsg),
+                },
+            )
+            if ref_crs is not None:
+                result_obj = result_obj.rio.write_crs(ref_crs, inplace=False)
+        else:
+            stack = np.stack(band_stacks[mode_key], axis=0)
+            obs_counts = np.sum(np.isfinite(stack), axis=0)
+            med = np.nanmedian(stack, axis=0).astype(np.float32)
+            del stack
+            band_stacks[mode_key].clear()
+
+            valid_mask = np.isfinite(med)
+            valid_pixels = int(np.count_nonzero(valid_mask))
+            total_pixels = int(valid_mask.size)
+            valid_pct = round(100.0 * valid_pixels / max(total_pixels, 1), 2)
+            valid_area_ha = round(valid_pixels * px_area_ha, 3)
+            med_obs = float(np.median(obs_counts[valid_mask])) if valid_pixels > 0 else 0.0
+
+            spec = SPECTRAL_INDICES[mode_key]
+            result_obj = xr.DataArray(
+                med,
+                dims=ref_da.dims,
+                coords=ref_da.coords,
+                name=f"{mode_key}_MEDIAN",
+                attrs={
+                    "sensor": sensor,
+                    "index_name": mode_key,
+                    "formula": spec["formula"],
+                    "units": "dimensionless",
+                    "long_name": f"Cloud-Free Median {mode_key} ({date_start} to {date_end})",
+                    "datetime": f"{date_start}..{date_end}",
+                    "date_start": date_start,
+                    "date_end": date_end,
+                    "scenes_used": len(dates_used),
+                    "resolution_m": float(resolution),
+                },
+            )
+            if ref_crs is not None:
+                result_obj = result_obj.rio.write_crs(ref_crs, inplace=False)
+            result_obj = result_obj.rio.write_nodata(np.nan, inplace=False)
+
+    meta: dict[str, Any] = {
+        "mode": mode_key,
+        "sensor": sensor,
+        "scenes_requested": total,
+        "scenes_used": len(dates_used),
+        "dates_used": dates_used,
+        "skipped_dates": skipped_dates,
+        "date_start": date_start,
+        "date_end": date_end,
+        "valid_pct": valid_pct,
+        "valid_area_ha": valid_area_ha,
+        "median_obs_per_px": round(med_obs, 1),
+        "resolution_m": float(resolution),
+        "crs": str(ref_crs) if ref_crs is not None else str(target_epsg),
+    }
+
+    del ref_da, band_stacks
+    gc.collect()
+    return result_obj, meta
 
