@@ -66,10 +66,43 @@ from stac_loader import (
 # ---------------------------------------------------------------------------
 # Constants, Schema Allowed Values & Quick Example Prompts
 # ---------------------------------------------------------------------------
-GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash:generateContent"
+DEFAULT_GEMINI_MODEL: str = "gemini-2.5-flash"
+
+GEMINI_MODEL_OPTIONS: tuple[dict[str, str], ...] = (
+    {
+        "id": "gemini-2.5-flash",
+        "label_sl": "gemini-2.5-flash (Hiter in zanesljiv — privzeto)",
+        "label_en": "gemini-2.5-flash (Fast & reliable — default)",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "label_sl": "gemini-2.5-pro (Napredno sklepanje)",
+        "label_en": "gemini-2.5-pro (High reasoning)",
+    },
+    {
+        "id": "gemini-3-flash-preview",
+        "label_sl": "gemini-3-flash-preview (Nova generacija 3 Flash)",
+        "label_en": "gemini-3-flash-preview (Next-gen 3 Flash series)",
+    },
+    {
+        "id": "custom",
+        "label_sl": "Po meri (Custom Model ID)",
+        "label_en": "Custom (Custom Model ID)",
+    },
 )
+
+
+def build_gemini_endpoint(model_id: str | None = None) -> str:
+    """Build the Gemini REST API generateContent URL for any selected or custom model ID."""
+    clean = str(model_id or DEFAULT_GEMINI_MODEL).strip()
+    if clean.startswith("models/"):
+        clean = clean[len("models/") :]
+    if not clean or clean == "custom":
+        clean = DEFAULT_GEMINI_MODEL
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{clean}:generateContent"
+
+
+GEMINI_ENDPOINT: str = build_gemini_endpoint(DEFAULT_GEMINI_MODEL)
 
 VALID_SENSORS: tuple[str, ...] = (SENSOR_S2, SENSOR_LANDSAT, SENSOR_S1)
 VALID_TASKS: tuple[str, ...] = (
@@ -375,9 +408,16 @@ Return ONLY valid JSON without markdown code fences."""
 def parse_eo_request_gemini(
     query: str,
     api_key: str,
+    *,
+    model: str = DEFAULT_GEMINI_MODEL,
     timeout: int = 15,
 ) -> dict[str, Any]:
-    """Call Gemini 2.5 Flash REST API with JSON output mode and validate the resulting plan."""
+    """Call Gemini REST API with JSON output mode for ``model`` and validate the resulting plan."""
+    clean_model = str(model or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    if clean_model.startswith("models/"):
+        clean_model = clean_model[len("models/") :]
+    endpoint_url = build_gemini_endpoint(clean_model)
+
     today_iso = date.today().isoformat()
     payload = {
         "systemInstruction": {"parts": [{"text": _GEMINI_SYSTEM_PROMPT}]},
@@ -393,7 +433,7 @@ def parse_eo_request_gemini(
         },
     }
     resp = requests.post(
-        GEMINI_ENDPOINT,
+        endpoint_url,
         params={"key": api_key},
         json=payload,
         timeout=timeout,
@@ -405,7 +445,9 @@ def parse_eo_request_gemini(
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.DOTALL).strip()
     parsed = json.loads(cleaned)
-    return validate_and_normalize_plan(parsed, engine="gemini")
+    plan = validate_and_normalize_plan(parsed, engine="gemini")
+    plan["gemini_model"] = clean_model
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -679,15 +721,55 @@ def parse_eo_request(
     query: str,
     *,
     api_key: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
 ) -> dict[str, Any]:
-    """Parse a natural-language EO query using Gemini 2.5 Flash (if configured) or smart local fallback."""
+    """Parse a natural-language EO query using the selected Gemini model or smart local fallback.
+
+    If a preview/custom Gemini model returns HTTP 404/400 or fails, gracefully falls back
+    to ``gemini-2.5-flash`` and finally to the built-in offline local parser.
+    """
     resolved_key, _source = get_active_gemini_api_key(api_key)
+    req_model = str(model or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    if req_model == "custom":
+        req_model = DEFAULT_GEMINI_MODEL
+
     if resolved_key:
         try:
-            return parse_eo_request_gemini(query, api_key=resolved_key)
-        except Exception:
-            pass
-    return parse_eo_request_local(query)
+            plan = parse_eo_request_gemini(query, api_key=resolved_key, model=req_model)
+            plan["fallback_note_sl"] = ""
+            plan["fallback_note_en"] = ""
+            return plan
+        except Exception as first_exc:
+            status_code = getattr(getattr(first_exc, "response", None), "status_code", None)
+            if req_model != DEFAULT_GEMINI_MODEL:
+                try:
+                    plan = parse_eo_request_gemini(
+                        query, api_key=resolved_key, model=DEFAULT_GEMINI_MODEL
+                    )
+                    code_txt = f" (HTTP {status_code})" if status_code else ""
+                    plan["fallback_note_sl"] = (
+                        f"Model `{req_model}` ni bil dosegljiv{code_txt}; samodejni preklop na `{DEFAULT_GEMINI_MODEL}`."
+                    )
+                    plan["fallback_note_en"] = (
+                        f"Model `{req_model}` unavailable{code_txt}; automatically fell back to `{DEFAULT_GEMINI_MODEL}`."
+                    )
+                    return plan
+                except Exception:
+                    pass
+            plan_loc = parse_eo_request_local(query)
+            code_txt = f" (HTTP {status_code})" if status_code else ""
+            plan_loc["fallback_note_sl"] = (
+                f"Gemini API (`{req_model}`) trenutno ni dosegljiv{code_txt}; uporabljen je bil lokalni pametni parser."
+            )
+            plan_loc["fallback_note_en"] = (
+                f"Gemini API (`{req_model}`) unavailable{code_txt}; used built-in smart local parser."
+            )
+            return plan_loc
+
+    plan_loc = parse_eo_request_local(query)
+    plan_loc["fallback_note_sl"] = ""
+    plan_loc["fallback_note_en"] = ""
+    return plan_loc
 
 
 # ---------------------------------------------------------------------------

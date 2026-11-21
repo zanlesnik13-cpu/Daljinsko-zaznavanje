@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
@@ -50,6 +51,7 @@ _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "casovne_vrste",
     "nesrece",
     "ai_pomocnik",
+    "gnss_plan",
     "i18n",
 )
 
@@ -76,6 +78,8 @@ _reload_stale_local_modules()
 
 from ai_pomocnik import (
     AI_EXAMPLE_PROMPTS,
+    DEFAULT_GEMINI_MODEL,
+    GEMINI_MODEL_OPTIONS,
     execute_ai_plan,
     get_active_gemini_api_key,
     parse_eo_request,
@@ -114,6 +118,11 @@ from geodezija_crs import (
     transform_coords,
     validate_aoi_geometry,
     validate_aoi_size,
+)
+from gnss_plan import (
+    CONSTELLATIONS as GNSS_CONSTELLATIONS,
+    CONSTELLATION_COLORS as GNSS_CONST_COLORS,
+    run_gnss_mission_plan,
 )
 from i18n import t
 from kartografija import format_metric_number, render_geodetic_map
@@ -788,6 +797,10 @@ def _init_session_state() -> None:
         "tab6_sent_to_carto": False,
         "tab6_gemini_key": "",
         "tab6_query_input": "",
+        "gemini_model": DEFAULT_GEMINI_MODEL,
+        "gemini_custom_model": "",
+        # Tab 7 GNSS Mission Planning state
+        "tab7_gnss_result": None,
         # Resolution guard
         "last_rec_res_key": None,
         "selected_resolution": 10,
@@ -3842,8 +3855,8 @@ def main() -> None:
     )
     st.markdown(header_html, unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        [t("tab1"), t("tab2"), t("tab3"), t("tab4"), t("tab5"), t("tab6")]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        [t("tab1"), t("tab2"), t("tab3"), t("tab4"), t("tab5"), t("tab6"), t("tab7")]
     )
 
     items: list[Any] = st.session_state["stac_items"]
@@ -6879,18 +6892,41 @@ def main() -> None:
                     key="tab6_btn_run",
                 )
 
-            # 3. Opcijske nastavitve Gemini API (z jasnim statusom)
+            # 3. Opcijske nastavitve Gemini API (z izbiro modela in jasnim statusom)
             cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
             with st.expander(t("ai_api_expander"), expanded=False):
                 if cur_api_key:
                     st.success(t("ai_status_gemini", source=key_src))
                 else:
                     st.info(t("ai_status_local"))
-                st.text_input(
-                    t("ai_key_input_label"),
-                    type="password",
-                    key="tab6_gemini_key",
-                )
+
+                col_key, col_mod = st.columns([1.1, 1.0])
+                with col_key:
+                    st.text_input(
+                        t("ai_key_input_label"),
+                        type="password",
+                        key="tab6_gemini_key",
+                    )
+                with col_mod:
+                    mod_ids = [m["id"] for m in GEMINI_MODEL_OPTIONS]
+                    mod_lbl_key = "label_en" if lang == "en" else "label_sl"
+                    mod_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
+                    selected_mod_choice = st.selectbox(
+                        t("ai_model_select_label"),
+                        options=mod_ids,
+                        format_func=lambda mid: mod_lbl_map.get(mid, mid),
+                        key="gemini_model",
+                    )
+
+                if selected_mod_choice == "custom":
+                    custom_mod_id = st.text_input(
+                        t("ai_model_custom_label"),
+                        placeholder=t("ai_model_custom_placeholder"),
+                        key="gemini_custom_model",
+                    )
+                    effective_gemini_model = (custom_mod_id or "").strip() or DEFAULT_GEMINI_MODEL
+                else:
+                    effective_gemini_model = str(selected_mod_choice or DEFAULT_GEMINI_MODEL)
 
         if btn_ai_run or auto_run_ai:
             q_clean = str(ai_query_text or "").strip()
@@ -6907,7 +6943,11 @@ def main() -> None:
                 try:
                     _on_ai_prog(0.04, "Razčlenjujem ukaz..." if lang == "sl" else "Parsing request...")
                     active_key_now, _ = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
-                    parsed_plan = parse_eo_request(q_clean, api_key=active_key_now)
+                    parsed_plan = parse_eo_request(
+                        q_clean,
+                        api_key=active_key_now,
+                        model=effective_gemini_model,
+                    )
                     ai_out = execute_ai_plan(
                         parsed_plan,
                         target_epsg=target_crs,
@@ -6936,11 +6976,12 @@ def main() -> None:
             ai_crs_show = str(ai_res_show.get("crs", target_crs))
             ai_kind_show = str(ai_res_show.get("kind", ""))
             eng_lbl = (
-                t("ai_plan_engine_gemini")
+                f"Gemini ({pl.get('gemini_model', DEFAULT_GEMINI_MODEL)})"
                 if pl.get("parser_engine") == "gemini"
                 else t("ai_plan_engine_local")
             )
             expl_txt = pl["explanation_en"] if lang == "en" else pl["explanation_sl"]
+            fb_note = pl.get("fallback_note_en" if lang == "en" else "fallback_note_sl") or ""
             period_txt = (
                 pl["event_date"]
                 if pl["task_type"].startswith("disaster_")
@@ -6961,6 +7002,8 @@ def main() -> None:
                 f'</div>'
             )
             st.markdown(plan_pills_html, unsafe_allow_html=True)
+            if fb_note:
+                st.caption(f"ℹ️ {fb_note}")
             st.info(expl_txt)
 
             # Display Output based on task kind
@@ -7139,6 +7182,525 @@ def main() -> None:
             # Copy-ready Technical Report Summary
             st.markdown(f"#### {t('ai_copy_header')}")
             st.code(ai_res_show.get("technical_summary", ""), language="text")
+
+    # =======================================================================
+    # ZAVIHEK 7: NAČRTOVANJE GNSS IZMERE (SKYPLOT, DOP & 360° MASKA OVIR)
+    # =======================================================================
+    with tab7:
+        st.subheader(t("gnss_header"))
+        st.caption(t("gnss_intro"))
+
+        # Sinhroniziraj privzeto stojišče z aktivnim središčem AOI
+        aoi_c_lat = float(center_lat)
+        aoi_c_lon = float(center_lon)
+        aoi_sync_sig = (round(aoi_c_lat, 5), round(aoi_c_lon, 5))
+        if st.session_state.get("tab7_last_aoi_sig") != aoi_sync_sig:
+            st.session_state["tab7_lat_input"] = round(aoi_c_lat, 6)
+            st.session_state["tab7_lon_input"] = round(aoi_c_lon, 6)
+            st.session_state["tab7_last_aoi_sig"] = aoi_sync_sig
+
+        with st.container(border=True):
+            g_lat_cur = float(st.session_state.get("tab7_lat_input", aoi_c_lat))
+            g_lon_cur = float(st.session_state.get("tab7_lon_input", aoi_c_lon))
+            g_e_cur, g_n_cur = transform_coords(g_lon_cur, g_lat_cur, EPSG_WGS84, EPSG_D96TM)
+            st.markdown(
+                t("gnss_station_banner", e=g_e_cur, n=g_n_cur, lat=g_lat_cur, lon=g_lon_cur)
+            )
+
+            gc1, gc2, gc3, gc4 = st.columns([1.0, 1.0, 1.0, 1.0])
+            with gc1:
+                gnss_lat = st.number_input(
+                    t("gnss_lat_label"),
+                    min_value=-85.0,
+                    max_value=85.0,
+                    step=0.0005,
+                    format="%.5f",
+                    key="tab7_lat_input",
+                )
+            with gc2:
+                gnss_lon = st.number_input(
+                    t("gnss_lon_label"),
+                    min_value=-180.0,
+                    max_value=180.0,
+                    step=0.0005,
+                    format="%.5f",
+                    key="tab7_lon_input",
+                )
+            with gc3:
+                gnss_date = st.date_input(
+                    t("gnss_date_label"),
+                    value=date.today(),
+                    min_value=date(2015, 1, 1),
+                    max_value=date.today() + timedelta(days=365),
+                    key="tab7_plan_date",
+                )
+            with gc4:
+                gnss_tz = st.selectbox(
+                    t("gnss_tz_label"),
+                    options=["Europe/Ljubljana", "UTC"],
+                    index=0,
+                    format_func=lambda z: "CET/CEST (Ljubljana)" if z == "Europe/Ljubljana" else "UTC",
+                    key="tab7_tz_select",
+                )
+
+            gp1, gp2, gp3 = st.columns([1.4, 1.0, 0.9])
+            with gp1:
+                gnss_consts = st.multiselect(
+                    t("gnss_const_label"),
+                    options=list(GNSS_CONSTELLATIONS),
+                    default=list(GNSS_CONSTELLATIONS),
+                    key="tab7_constellations",
+                )
+            with gp2:
+                gnss_cutoff = st.slider(
+                    t("gnss_cutoff_label"),
+                    min_value=5,
+                    max_value=25,
+                    value=10,
+                    step=1,
+                    key="tab7_cutoff_deg",
+                )
+            with gp3:
+                gnss_ant_h = st.number_input(
+                    t("gnss_ant_label"),
+                    min_value=0.0,
+                    max_value=20.0,
+                    value=2.0,
+                    step=0.2,
+                    format="%.1f",
+                    key="tab7_ant_height",
+                )
+
+            with st.expander(t("gnss_obs_expander"), expanded=False):
+                oe1, oe2 = st.columns(2)
+                with oe1:
+                    gnss_use_dem = st.checkbox(t("gnss_use_dem_label"), value=True, key="tab7_use_dem")
+                    gnss_canopy_h = st.slider(
+                        t("gnss_canopy_label"),
+                        min_value=5,
+                        max_value=35,
+                        value=18,
+                        step=1,
+                        key="tab7_canopy_h",
+                    )
+                with oe2:
+                    gnss_use_s2 = st.checkbox(t("gnss_use_s2_label"), value=True, key="tab7_use_s2")
+                    gnss_bldg_h = st.slider(
+                        t("gnss_building_label"),
+                        min_value=4,
+                        max_value=40,
+                        value=12,
+                        step=1,
+                        key="tab7_bldg_h",
+                    )
+
+            btn_run_gnss = st.button(
+                t("gnss_btn_run"),
+                type="primary",
+                width="stretch",
+                key="tab7_btn_run",
+            )
+
+        if btn_run_gnss:
+            gnss_prog = st.progress(0.0)
+            gnss_status = st.empty()
+
+            def _on_gnss_prog(frac: float, msg: str) -> None:
+                gnss_prog.progress(min(max(float(frac), 0.0), 1.0))
+                gnss_status.caption(msg)
+
+            try:
+                gnss_out = run_gnss_mission_plan(
+                    lat_deg=float(gnss_lat),
+                    lon_deg=float(gnss_lon),
+                    plan_date=gnss_date,
+                    constellations=gnss_consts or list(GNSS_CONSTELLATIONS),
+                    cutoff_deg=float(gnss_cutoff),
+                    ant_height_m=float(gnss_ant_h),
+                    canopy_h_m=float(gnss_canopy_h),
+                    building_h_m=float(gnss_bldg_h),
+                    use_dem=bool(gnss_use_dem),
+                    use_s2_obstacles=bool(gnss_use_s2),
+                    tz_name=str(gnss_tz),
+                    step_minutes=15,
+                    target_epsg=target_crs,
+                    progress_cb=_on_gnss_prog,
+                )
+                st.session_state["tab7_gnss_result"] = gnss_out
+                gnss_prog.empty()
+                gnss_status.empty()
+                gc.collect()
+            except Exception as exc:
+                gnss_prog.empty()
+                gnss_status.empty()
+                st.error(t("gnss_error", err=exc))
+
+        gnss_res: dict[str, Any] | None = st.session_state.get("tab7_gnss_result")
+        if isinstance(gnss_res, dict) and gnss_res.get("timeline_df") is not None:
+            st.divider()
+            g_sum = gnss_res["summary"]
+            tl_df: pd.DataFrame = gnss_res["timeline_df"]
+
+            # Ephemeris source badge
+            if gnss_res["orbit_source"] == "celestrak_tle":
+                st.success(t("gnss_badge_tle"))
+            else:
+                st.info(t("gnss_badge_walker"))
+
+            # 1. KPI Summary Row
+            gk1, gk2, gk3, gk4, gk5 = st.columns(5)
+            gk1.metric(
+                t("gnss_kpi_vis"),
+                f"{g_sum['avg_vis_real']:.1f} / {g_sum['avg_vis_open']:.1f}",
+            )
+            gk2.metric(
+                t("gnss_kpi_min_pdop"),
+                f"{g_sum['min_pdop_real']:.2f}" if not np.isnan(g_sum["min_pdop_real"]) else "—",
+            )
+            gk3.metric(
+                t("gnss_kpi_mean_pdop"),
+                f"{g_sum['mean_pdop_real']:.2f}" if not np.isnan(g_sum["mean_pdop_real"]) else "—",
+            )
+            gk4.metric(
+                t("gnss_kpi_blocked"),
+                f"{g_sum['sky_blocked_pct']:.1f} %",
+            )
+            opt_wins = g_sum.get("optimal_windows") or []
+            best_win_txt = opt_wins[0] if opt_wins else t("gnss_no_window")
+            gk5.metric(
+                t("gnss_kpi_window"),
+                best_win_txt,
+                delta=(f"+{len(opt_wins) - 1} more" if len(opt_wins) > 1 else None),
+                delta_color="off",
+            )
+
+            # 2. Chart 1 — Interactive Polar Skyplot
+            st.markdown(f"#### {t('gnss_skyplot_header')}")
+            t_labels = tl_df["time_str"].tolist()
+            default_ep = min(48, len(t_labels) - 1)  # 12:00 noon default
+            chosen_ep_idx = st.select_slider(
+                t("gnss_epoch_slider"),
+                options=list(range(len(t_labels))),
+                value=default_ep,
+                format_func=lambda idx: f"{t_labels[idx]} ({gnss_res['tz_name']})",
+                key="tab7_skyplot_epoch_slider",
+            )
+
+            az_c = np.asarray(gnss_res["az_centers_deg"], dtype=np.float64)
+            az_closed = np.append(az_c, az_c[0])
+            terr_closed = np.append(gnss_res["terrain_mask_deg"], gnss_res["terrain_mask_deg"][0])
+            obs_closed = np.append(gnss_res["obstacle_mask_deg"], gnss_res["obstacle_mask_deg"][0])
+            cut_closed = np.full_like(az_closed, float(gnss_res["cutoff_deg"]))
+
+            fig_sky = go.Figure()
+            # Outer horizon baseline (0 deg) so "toself" fills from horizon inward to mask angle
+            # We draw closed polygon: outer ring at 0 deg -> inner ring at mask_deg
+            ring_az = np.concatenate([az_closed, az_closed[::-1]])
+            if float(np.max(terr_closed)) > 0.5:
+                terr_r = np.concatenate([np.zeros_like(az_closed), terr_closed[::-1]])
+                fig_sky.add_trace(
+                    go.Scatterpolar(
+                        r=terr_r,
+                        theta=ring_az,
+                        fill="toself",
+                        fillcolor="rgba(100, 116, 139, 0.34)",
+                        line=dict(color="#475569", width=1.4),
+                        name=t("gnss_sky_terrain"),
+                    )
+                )
+            if float(np.max(obs_closed)) > 0.5:
+                obs_r = np.concatenate([np.zeros_like(az_closed), obs_closed[::-1]])
+                fig_sky.add_trace(
+                    go.Scatterpolar(
+                        r=obs_r,
+                        theta=ring_az,
+                        fill="toself",
+                        fillcolor="rgba(15, 118, 110, 0.28)",
+                        line=dict(color="#0F766E", width=1.5),
+                        name=t("gnss_sky_obs"),
+                    )
+                )
+            # Cutoff ring
+            fig_sky.add_trace(
+                go.Scatterpolar(
+                    r=cut_closed,
+                    theta=az_closed,
+                    mode="lines",
+                    line=dict(color="#DC2626", width=1.4, dash="dash"),
+                    name=t("gnss_sky_cutoff", deg=gnss_res["cutoff_deg"]),
+                )
+            )
+
+            # Satellite positions at selected epoch
+            ep_sats = gnss_res["epoch_sat_states"][int(chosen_ep_idx)]
+            for const in gnss_res["constellations"]:
+                vis_c = [s for s in ep_sats if s["constellation"] == const and s["visible_real"]]
+                if vis_c:
+                    fig_sky.add_trace(
+                        go.Scatterpolar(
+                            r=[s["el_deg"] for s in vis_c],
+                            theta=[s["az_deg"] for s in vis_c],
+                            mode="markers+text",
+                            text=[s["prn"] for s in vis_c],
+                            textposition="top center",
+                            textfont=dict(size=10, color="#0F172A"),
+                            marker=dict(
+                                size=10,
+                                color=GNSS_CONST_COLORS.get(const, "#0F766E"),
+                                line=dict(color="#FFFFFF", width=1.2),
+                            ),
+                            name=f"{const} ({len(vis_c)})",
+                        )
+                    )
+            blocked_sats = [s for s in ep_sats if not s["visible_real"]]
+            if blocked_sats:
+                fig_sky.add_trace(
+                    go.Scatterpolar(
+                        r=[s["el_deg"] for s in blocked_sats],
+                        theta=[s["az_deg"] for s in blocked_sats],
+                        mode="markers+text",
+                        text=[s["prn"] for s in blocked_sats],
+                        textposition="top center",
+                        textfont=dict(size=9, color="#64748B"),
+                        marker=dict(
+                            size=9,
+                            symbol="x",
+                            color="#94A3B8",
+                            line=dict(width=1.5),
+                        ),
+                        name=f"{t('gnss_sky_blocked')} ({len(blocked_sats)})",
+                    )
+                )
+
+            ep_row = tl_df.iloc[int(chosen_ep_idx)]
+            pdop_ep_str = f"{ep_row['pdop_real']:.2f}" if pd.notna(ep_row["pdop_real"]) else "N/A"
+            fig_sky.update_layout(
+                title=dict(
+                    text=(
+                        f"Skyplot · {gnss_res['plan_date']} {t_labels[int(chosen_ep_idx)]} · "
+                        f"Visible: {int(ep_row['visible_real'])} / Open: {int(ep_row['visible_open'])} · PDOP: {pdop_ep_str}"
+                    ),
+                    font=dict(size=13, color="#0F172A"),
+                ),
+                polar=dict(
+                    bgcolor="#FFFFFF",
+                    angularaxis=dict(
+                        direction="clockwise",
+                        rotation=90,
+                        tickmode="array",
+                        tickvals=[0, 45, 90, 135, 180, 225, 270, 315],
+                        ticktext=["N (0°)", "NE", "E (90°)", "SE", "S (180°)", "SW", "W (270°)", "NW"],
+                        gridcolor="#E2E8F0",
+                    ),
+                    radialaxis=dict(
+                        range=[90, 0],
+                        tickvals=[90, 60, 30, 0],
+                        ticktext=["90°", "60°", "30°", "0°"],
+                        gridcolor="#E2E8F0",
+                    ),
+                ),
+                height=540,
+                paper_bgcolor="#FFFFFF",
+                font=dict(color="#0F172A"),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.18, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_sky, width="stretch", key="tab7_skyplot_plotly")
+
+            # 3. Chart 2 — 24-Hour Visibility & PDOP / HDOP / VDOP Dual-Panel Chart
+            st.markdown(f"#### {t('gnss_dop_header')}")
+            fig_dop = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.09,
+                subplot_titles=(
+                    "Število vidnih satelitov (Odprto nebo vs. Realno z ovirami)"
+                    if lang == "sl"
+                    else "Visible Satellites (Open Sky vs. Real Obstructed Sky)",
+                    "Geometrija DOP (PDOP / HDOP / VDOP — zeleno = optimalno okno PDOP ≤ 2,5)"
+                    if lang == "sl"
+                    else "DOP Geometry (PDOP / HDOP / VDOP — green = optimal window PDOP ≤ 2.5)",
+                ),
+            )
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["visible_open"],
+                    mode="lines",
+                    name="Odprto nebo" if lang == "sl" else "Open Sky",
+                    line=dict(color="#94A3B8", width=1.8, dash="dot"),
+                ),
+                row=1,
+                col=1,
+            )
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["visible_real"],
+                    mode="lines",
+                    fill="tozeroy",
+                    fillcolor="rgba(15, 118, 110, 0.14)",
+                    name="Realno (z ovirami)" if lang == "sl" else "Real (Obstructed)",
+                    line=dict(color="#0F766E", width=2.4),
+                ),
+                row=1,
+                col=1,
+            )
+
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["pdop_real"],
+                    mode="lines",
+                    name="PDOP (Real)",
+                    line=dict(color="#DC2626", width=2.4),
+                ),
+                row=2,
+                col=1,
+            )
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["hdop_real"],
+                    mode="lines",
+                    name="HDOP (Real)",
+                    line=dict(color="#0284C7", width=1.8),
+                ),
+                row=2,
+                col=1,
+            )
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["vdop_real"],
+                    mode="lines",
+                    name="VDOP (Real)",
+                    line=dict(color="#D97706", width=1.8),
+                ),
+                row=2,
+                col=1,
+            )
+            fig_dop.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["pdop_open"],
+                    mode="lines",
+                    name="PDOP (Open Sky)",
+                    line=dict(color="#94A3B8", width=1.4, dash="dot"),
+                ),
+                row=2,
+                col=1,
+            )
+
+            # Highlight optimal measurement windows (PDOP <= 2.5 & visible >= 6)
+            opt_flags = (
+                tl_df["pdop_real"].notna() & (tl_df["pdop_real"] <= 2.5) & (tl_df["visible_real"] >= 6)
+            ).to_numpy()
+            seg_s: int | None = None
+            for i_op, flg in enumerate(opt_flags):
+                if flg and seg_s is None:
+                    seg_s = i_op
+                elif not flg and seg_s is not None:
+                    fig_dop.add_vrect(
+                        x0=t_labels[seg_s],
+                        x1=t_labels[i_op - 1],
+                        fillcolor="rgba(22, 163, 74, 0.14)",
+                        line_width=0,
+                        row=2,
+                        col=1,
+                    )
+                    seg_s = None
+            if seg_s is not None:
+                fig_dop.add_vrect(
+                    x0=t_labels[seg_s],
+                    x1=t_labels[-1],
+                    fillcolor="rgba(22, 163, 74, 0.14)",
+                    line_width=0,
+                    row=2,
+                    col=1,
+                )
+
+            fig_dop.add_hline(y=2.5, line_dash="dash", line_color="#16A34A", line_width=1.2, row=2, col=1)
+            fig_dop.update_yaxes(title_text="Sat.", row=1, col=1, gridcolor="#E2E8F0")
+            fig_dop.update_yaxes(title_text="DOP", range=[0, 8], row=2, col=1, gridcolor="#E2E8F0")
+            fig_dop.update_xaxes(nticks=12, gridcolor="#E2E8F0")
+            fig_dop.update_layout(
+                height=520,
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                font=dict(color="#0F172A"),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.16, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_dop, width="stretch", key="tab7_dop_plotly")
+
+            # 4. Chart 3 — Local Obstruction Overview (Sentinel-2 10 m + 50 m / 100 m rings)
+            st.markdown(f"#### {t('gnss_local_header')}")
+            s2_inf = gnss_res.get("s2_info") or {}
+            if s2_inf.get("ok") and s2_inf.get("rgb_u8") is not None:
+                rgb_loc = s2_inf["rgb_u8"]
+                obs_loc = s2_inf["obs_cls"]
+                xv_loc = np.asarray(s2_inf["x_coords"], dtype=np.float64)
+                yv_loc = np.asarray(s2_inf["y_coords"], dtype=np.float64)
+                e0_loc = float(s2_inf["station_e"])
+                n0_loc = float(s2_inf["station_n"])
+
+                # Overlay detected forest (teal) & buildings (amber) subtly onto 10 m RGB
+                rgb_vis = rgb_loc.astype(np.float32).copy()
+                f_mask = obs_loc == 1
+                b_mask = obs_loc == 2
+                rgb_vis[f_mask] = 0.55 * rgb_vis[f_mask] + 0.45 * np.array([15.0, 118.0, 110.0])
+                rgb_vis[b_mask] = 0.55 * rgb_vis[b_mask] + 0.45 * np.array([217.0, 119.0, 6.0])
+                rgb_vis_u8 = np.clip(np.round(rgb_vis), 0, 255).astype(np.uint8)
+
+                fig_loc = px.imshow(
+                    rgb_vis_u8,
+                    x=xv_loc,
+                    y=yv_loc,
+                    origin="upper" if (yv_loc.size > 1 and yv_loc[0] > yv_loc[-1]) else "lower",
+                )
+                theta_ring = np.linspace(0.0, 2.0 * np.pi, 121)
+                for r_ring, r_dash in ((50.0, "dash"), (100.0, "dot")):
+                    fig_loc.add_trace(
+                        go.Scatter(
+                            x=e0_loc + r_ring * np.cos(theta_ring),
+                            y=n0_loc + r_ring * np.sin(theta_ring),
+                            mode="lines",
+                            line=dict(color="#FFFFFF", width=2.0, dash=r_dash),
+                            name=f"{int(r_ring)} m",
+                        )
+                    )
+                fig_loc.add_trace(
+                    go.Scatter(
+                        x=[e0_loc],
+                        y=[n0_loc],
+                        mode="markers",
+                        marker=dict(size=12, color="#DC2626", symbol="cross-thin", line=dict(width=3, color="#DC2626")),
+                        name="GNSS",
+                    )
+                )
+                fig_loc.update_layout(
+                    title=f"Sentinel-2 10 m ({s2_inf.get('scene_date', '')}) · Teal = Forest · Amber = Buildings",
+                    xaxis_title="e [m] (D96/TM)",
+                    yaxis_title="n [m] (D96/TM)",
+                    yaxis=dict(scaleanchor="x", scaleratio=1.0),
+                    height=460,
+                    paper_bgcolor="#FFFFFF",
+                    font=dict(color="#0F172A"),
+                )
+                st.plotly_chart(fig_loc, width="stretch", key="tab7_local_obs_plotly")
+            else:
+                st.info(t("gnss_local_unavail"))
+
+            # 5. Export GNSS Mission Plan CSV
+            st.download_button(
+                label=t("gnss_btn_dl_csv"),
+                data=gnss_res["csv_bytes"],
+                file_name=gnss_res["csv_filename"],
+                mime="text/csv",
+                width="stretch",
+                key="tab7_dl_csv",
+            )
 
     # Prepreči odpiranje virtualne tipkovnice na preostalih dinamičnih selectboxih (tablice/telefoni)
     _inject_tablet_no_keyboard_js()
