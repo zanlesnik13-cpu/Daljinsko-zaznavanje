@@ -20,7 +20,7 @@ import gc
 import os
 import re
 from datetime import date, datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Sequence, Union
 
 # Ensure GDAL/rasterio honors custom system/proxy CA bundles before library init
 _ca_bundle = os.environ.get("CURL_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
@@ -213,7 +213,7 @@ def _is_landsat7_slc_off(item: pystac.Item) -> bool:
     return False
 
 
-StacItemOrGroup = pystac.Item | Sequence[pystac.Item]
+StacItemOrGroup = Union[pystac.Item, Sequence[pystac.Item]]
 
 
 def _normalize_item_group(items_or_item: StacItemOrGroup) -> list[pystac.Item]:

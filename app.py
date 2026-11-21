@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import base64
 import gc
+import importlib
 import json
+import os
 import re
+import sys
 import unicodedata
 from datetime import date, timedelta
 from typing import Any, Callable
@@ -32,6 +35,39 @@ import xarray as xr
 from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
+
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
+_LOCAL_MODULES_ORDER: tuple[str, ...] = (
+    "geodezija_crs",
+    "stac_loader",
+    "analize",
+    "casovne_vrste",
+    "i18n",
+)
+
+
+def _reload_stale_local_modules() -> None:
+    """Reload cached local modules when their .py files changed on disk (Streamlit Cloud hot-reload)."""
+    any_reloaded = False
+    for mod_name in _LOCAL_MODULES_ORDER:
+        mod = sys.modules.get(mod_name)
+        mod_path = os.path.join(_APP_DIR, f"{mod_name}.py")
+        if mod is not None and os.path.exists(mod_path):
+            try:
+                disk_mtime = os.path.getmtime(mod_path)
+                loaded_mtime = getattr(mod, "__dz_loaded_mtime__", None)
+                if any_reloaded or loaded_mtime != disk_mtime:
+                    reloaded = importlib.reload(mod)
+                    setattr(reloaded, "__dz_loaded_mtime__", disk_mtime)
+                    any_reloaded = True
+            except Exception:
+                pass
+
+
+_reload_stale_local_modules()
 
 from analize import (
     OPTICAL_SIGNATURE_BANDS,
@@ -75,6 +111,15 @@ from stac_loader import (
     load_scene,
     search_scenes,
 )
+
+for _m_name in _LOCAL_MODULES_ORDER:
+    _m_obj = sys.modules.get(_m_name)
+    _m_path = os.path.join(_APP_DIR, f"{_m_name}.py")
+    if _m_obj is not None and os.path.exists(_m_path):
+        try:
+            setattr(_m_obj, "__dz_loaded_mtime__", os.path.getmtime(_m_path))
+        except Exception:
+            pass
 
 matplotlib.use("Agg")
 
@@ -582,6 +627,8 @@ def _init_session_state() -> None:
         "loc_search_mode": "place",
         "sidebar_aoi_mode": "map",
         "pending_aoi_mode": None,
+        "pending_reset_scene_widgets": False,
+        "map_jump_version": 0,
         "map_lat": SLOVENIA_CENTER_LAT,
         "map_lon": SLOVENIA_CENTER_LON,
         "map_zoom": 10,
@@ -816,6 +863,7 @@ def _execute_stac_search(
     st.session_state["search_bbox_3794"] = list(bbox_3794) if bbox_3794 else None
     st.session_state["search_polygon_4326"] = aoi_polygon_4326
     st.session_state["search_area_km2"] = area_km2
+    st.session_state["pending_reset_scene_widgets"] = True
     _clear_loaded_products()
 
 
@@ -903,9 +951,17 @@ def _touch_selector(
     return resolved
 
 
+def _render_html_iframe(html_str: str, height: int = 1) -> None:
+    """Izriše HTML v iframe z uporabo novejšega ``st.iframe`` (brez opozoril o zastarelosti) ali ``components.html``."""
+    if hasattr(st, "iframe"):
+        st.iframe(html_str, height=max(1, int(height)))
+    else:
+        components.html(html_str, height=int(height), scrolling=False)
+
+
 def _inject_tablet_no_keyboard_js() -> None:
     """Nastavi readonly + inputmode='none' na vse BaseWeb selectbox vnose (prepreči tipkovnico na tablicah)."""
-    components.html(
+    _render_html_iframe(
         """
 <script>
 (function() {
@@ -930,8 +986,7 @@ def _inject_tablet_no_keyboard_js() -> None:
 })();
 </script>
 """,
-        height=0,
-        width=0,
+        height=1,
     )
 
 
@@ -1123,6 +1178,7 @@ def _jump_to_location(lat: float, lon: float, label: str, zoom: int = 12) -> Non
     st.session_state["map_lon"] = round(float(lon), 6)
     st.session_state["map_zoom"] = int(zoom)
     st.session_state["live_map_zoom"] = int(zoom)
+    st.session_state["map_jump_version"] = int(st.session_state.get("map_jump_version", 0)) + 1
     st.session_state["last_processed_click"] = None
     st.session_state["pending_aoi_mode"] = "map"
     st.session_state["geocoded_place_msg"] = t(
@@ -1929,6 +1985,12 @@ def _build_spectral_signature_chart(
             name=sensor_name,
         )
     )
+    fin_refl = sig_df["reflectance"].dropna() if not sig_df.empty else pd.Series(dtype=float)
+    y_max = (
+        min(1.05, max(0.55, float(fin_refl.max()) * 1.22))
+        if not fin_refl.empty and np.isfinite(float(fin_refl.max()))
+        else 0.55
+    )
     fig.update_layout(
         title=dict(
             text=t("sig_chart_title", sensor=sensor_name, date=date_str),
@@ -1945,7 +2007,7 @@ def _build_spectral_signature_chart(
             title=t("sig_yaxis"),
             gridcolor="#E2E8F0",
             zerolinecolor="#94A3B8",
-            range=[0.0, min(1.05, max(0.55, float(np.nanmax(sig_df["reflectance"]) * 1.22)))],
+            range=[0.0, y_max],
         ),
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
@@ -2144,7 +2206,7 @@ def _render_before_after_swipe_html(
   </script>
 </body>
 </html>"""
-    components.html(html_doc, height=height, scrolling=False)
+    _render_html_iframe(html_doc, height=height)
 
 
 def _build_index_histogram(
@@ -2500,6 +2562,8 @@ def _render_interactive_aoi_section(
     if st.session_state.get("geocoded_place_msg"):
         st.success(f"📍 {st.session_state['geocoded_place_msg']}")
 
+    jump_ver = int(st.session_state.get("map_jump_version", 0))
+
     # Način 1: Interaktivno risanje poligona / pravokotnika na 600 px zemljevidu
     if aoi_mode_key == "draw":
         st.caption(t("draw_main_hint"))
@@ -2514,10 +2578,12 @@ def _render_interactive_aoi_section(
         draw_ver = int(st.session_state.get("draw_map_version", 0))
         draw_out = st_folium(
             draw_map,
+            center=(center_lat, center_lon),
+            zoom=draw_zoom,
             height=600,
             use_container_width=True,
             returned_objects=["last_active_drawing", "all_drawings", "zoom"],
-            key=f"aoi_draw_map_{draw_ver}_{selected_basemap}",
+            key=f"aoi_draw_map_{draw_ver}_{jump_ver}_{selected_basemap}",
         )
         if isinstance(draw_out, dict) and draw_out.get("zoom") is not None:
             try:
@@ -2556,10 +2622,12 @@ def _render_interactive_aoi_section(
         returned_objs = ["last_clicked", "zoom"] if is_click_mode else ["zoom"]
         map_out = st_folium(
             main_map,
+            center=(center_lat, center_lon),
+            zoom=zoom_val,
             height=600,
             use_container_width=True,
             returned_objects=returned_objs,
-            key=f"main_interactive_aoi_map_{selected_basemap}",
+            key=f"main_interactive_aoi_map_{jump_ver}_{selected_basemap}",
         )
         if isinstance(map_out, dict):
             raw_zoom = map_out.get("zoom")
@@ -2599,6 +2667,19 @@ def main() -> None:
     pending_mode = st.session_state.pop("pending_aoi_mode", None)
     if pending_mode in AOI_MODE_KEYS:
         st.session_state["sidebar_aoi_mode"] = pending_mode
+    if st.session_state.pop("pending_reset_scene_widgets", False):
+        reset_prefixes = (
+            "tab1_scene_select_",
+            "tab2_scene_select_",
+            "tab2_comp_n_",
+            "tab3_max_epochs_",
+            "tab3_t1_select_",
+            "tab3_t2_select_",
+            "tab3_tl_frames_",
+        )
+        for k in list(st.session_state.keys()):
+            if k == "tab2_sar_scene_select" or k.startswith(reset_prefixes):
+                st.session_state.pop(k, None)
     _clamp_dates_for_sensor(str(st.session_state["selected_sensor"]))
 
     # =======================================================================
@@ -2986,6 +3067,7 @@ def main() -> None:
                         exclude_l7_slc_off=exclude_l7_slc_off,
                         limit=50,
                     )
+                    st.rerun()
                 except Exception as exc:
                     st.error(t("search_error", err=exc))
 
@@ -3047,7 +3129,9 @@ def main() -> None:
                     )
                 )
         if active_sensor != SENSOR_S1 and summary_df["cloud_cover"].notna().any():
-            default_scene_idx = int(summary_df["cloud_cover"].idxmin())
+            cand_idx = int(summary_df["cloud_cover"].reset_index(drop=True).idxmin())
+            if 0 <= cand_idx < len(items):
+                default_scene_idx = cand_idx
 
     # =======================================================================
     # ZAVIHEK 1: ISKANJE POSNETKOV, PREGLED (OPTIKA / SAR) IN GEOTIFF IZVOZ
@@ -3800,7 +3884,7 @@ def main() -> None:
                             fig_comp,
                             width="stretch",
                             config=PLOTLY_VIEWER_CONFIG,
-                            key="tab2_comp_plotly_viewer",
+                            key="tab2_comp_rgb_plotly_viewer",
                         )
                     elif isinstance(comp_obj, xr.DataArray):
                         c_idx_key = str(comp_meta_show["mode"])
@@ -3830,7 +3914,7 @@ def main() -> None:
                             fig_comp,
                             width="stretch",
                             config=PLOTLY_VIEWER_CONFIG,
-                            key="tab2_comp_plotly_viewer",
+                            key="tab2_comp_idx_plotly_viewer",
                         )
 
                     st.caption(
