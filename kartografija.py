@@ -126,6 +126,14 @@ def format_metric_number(value: float | int) -> str:
     return f"{int(round(value)):,}".replace(",", " ")
 
 
+def _clean_print_text(text: str | None) -> str:
+    """Remove non-BMP emoji glyphs unsupported by DejaVu Sans while keeping diacritics and math symbols."""
+    if not text:
+        return ""
+    cleaned = "".join(ch for ch in str(text) if ord(ch) <= 0xFFFF and ch != "\ufe0f")
+    return " ".join(cleaned.split())
+
+
 def compute_nice_grid_spacing(span_m: float, target_lines: int = 5) -> int:
     """Select a clean round metric grid interval in meters for a given map span."""
     span = max(float(span_m), 100.0)
@@ -589,6 +597,14 @@ def render_geodetic_map(
         Contains ``png_preview_bytes``, ``png_hires_bytes``, ``pdf_bytes``,
         ``scale_denom``, ``grid_spacing_m``, ``scalebar_length_m``, and ``extent_m``.
     """
+    title = _clean_print_text(title)
+    subtitle = _clean_print_text(subtitle)
+    author = _clean_print_text(author)
+    legend_title = _clean_print_text(legend_title)
+    sensor_label = _clean_print_text(sensor_label)
+    if discrete_items:
+        discrete_items = [(int(v), _clean_print_text(lbl), str(col)) for v, lbl, col in discrete_items]
+
     fmt_spec = PAGE_FORMATS.get(page_format, PAGE_FORMATS["a4_landscape"])
     fig_w_in, fig_h_in = fmt_spec["figsize"]
     orientation = fmt_spec["orientation"]

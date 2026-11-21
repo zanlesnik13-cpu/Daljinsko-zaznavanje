@@ -48,6 +48,7 @@ _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "stac_loader",
     "analize",
     "casovne_vrste",
+    "nesrece",
     "i18n",
 )
 
@@ -114,6 +115,17 @@ from map_overlay import (
     build_satellite_slippy_map,
     expand_bbox_for_panning,
     raster_to_map_overlay_png,
+)
+from nesrece import (
+    DISASTER_FLOOD,
+    DISASTER_FOREST,
+    DISASTER_TYPES,
+    DISASTER_WILDFIRE,
+    SLOVENIA_CASE_STUDIES,
+    build_carto_discrete_items,
+    build_slippy_rgba_map,
+    get_class_specs,
+    run_disaster_assessment,
 )
 from stac_loader import (
     DEFAULT_MIN_AOI_COVERAGE_PCT,
@@ -652,6 +664,14 @@ CARTO_GRID_STYLE_I18N: dict[str, str] = {
     "dark": "carto_grid_dark",
 }
 
+DISASTER_TYPE_KEYS: list[str] = list(DISASTER_TYPES)
+DISASTER_TYPE_I18N: dict[str, str] = {
+    DISASTER_FLOOD: "dis_type_flood",
+    DISASTER_WILDFIRE: "dis_type_wildfire",
+    DISASTER_FOREST: "dis_type_forest",
+}
+DISASTER_PRESET_KEYS: list[str] = list(SLOVENIA_CASE_STUDIES.keys())
+
 
 # ---------------------------------------------------------------------------
 # Pomožne funkcije: stanje seje, sinhronizacija senzorja/datumov, iskanje STAC
@@ -752,6 +772,10 @@ def _init_session_state() -> None:
         # Tab 4 Cartography / Print Layout state
         "tab4_carto_result": None,
         "tab4_carto_meta": None,
+        # Tab 5 Natural Disaster Assessment state
+        "tab5_disaster_result": None,
+        "tab5_last_preset": "custom",
+        "tab5_sent_to_carto": False,
         # Resolution guard
         "last_rec_res_key": None,
         "selected_resolution": 10,
@@ -803,6 +827,7 @@ def _clear_loaded_products() -> None:
         "tab3_timelapse_data",
         "tab4_carto_result",
         "tab4_carto_meta",
+        "tab5_disaster_result",
     ):
         st.session_state[key] = None
     gc.collect()
@@ -1084,6 +1109,62 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                 "tif_bytes": st.session_state.get("tab3_change_tif_bytes"),
                 "tif_filename": st.session_state.get("tab3_change_tif_filename") or f"delta_{ch_idx}.tif",
                 "file_stem": f"Delta_{ch_idx}_{d_t1}_to_{d_t2}",
+            }
+        )
+
+    # 6. Tab 5: Natural Disaster Impact Map (Flood SAR / Wildfire dNBR / Forest dNDVI)
+    dis_res = st.session_state.get("tab5_disaster_result")
+    if isinstance(dis_res, dict) and dis_res.get("class_da") is not None:
+        d_type = str(dis_res.get("disaster_type", DISASTER_FLOOD))
+        d_type_lbl = t(DISASTER_TYPE_I18N.get(d_type, "dis_type_flood"), lang=lang)
+        d_pre = str(dis_res.get("date_pre", ""))
+        d_ev = str(dis_res.get("date_event", ""))
+        d_sum = dis_res.get("summary", {})
+        s_cfg_d = SENSOR_META.get(dis_res.get("sensor", SENSOR_S1), SENSOR_META[SENSOR_S1])
+        dis_stats_rows: list[tuple[str, str]] = [
+            (
+                t("dis_kpi_affected_ha", lang=lang),
+                f"{d_sum.get('affected_area_ha', 0.0):,.2f} ha",
+            ),
+            (
+                t("dis_kpi_affected_pct", lang=lang),
+                f"{d_sum.get('affected_pct', 0.0):.2f} %",
+            ),
+        ]
+        if d_type == DISASTER_FLOOD:
+            dis_stats_rows.append(
+                (
+                    "Stalna voda" if lang == "sl" else "Permanent water",
+                    f"{d_sum.get('permanent_water_ha', 0.0):,.2f} ha",
+                )
+            )
+        sources.append(
+            {
+                "id": "tab5_disaster",
+                "label": t("carto_layer_tab5_disaster", lang=lang, dtype=d_type_lbl, d1=d_pre, d2=d_ev),
+                "raster": dis_res["class_da"],
+                "crs": dis_res.get("crs", CRS_D96TM),
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": "Greys",
+                "vmin": 0.0,
+                "vmax": 4.0,
+                "discrete_items": build_carto_discrete_items(d_type, lang=lang),
+                "legend_title": d_type_lbl,
+                "legend_units": "",
+                "stats_summary": dis_stats_rows,
+                "default_title": f"{d_type_lbl} — {d_ev}",
+                "default_subtitle": f"{s_cfg_d['short_name']} | {d_pre} → {d_ev}",
+                "sensor_label": s_cfg_d["short_name"],
+                "date_label": f"{d_pre} → {d_ev}",
+                "resolution_m": float(dis_res.get("resolution_m", 20.0)),
+                "tif_bytes": dis_res.get("tif_bytes"),
+                "tif_filename": dis_res.get("tif_filename") or f"disaster_{d_type}.tif",
+                "file_stem": f"Disaster_{d_type}_{d_pre}_to_{d_ev}",
+                "aoi_bbox_4326": dis_res.get("bbox_4326"),
+                "aoi_polygon_4326": dis_res.get("polygon_4326"),
             }
         )
 
@@ -3634,7 +3715,7 @@ def main() -> None:
     )
     st.markdown(header_html, unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4 = st.tabs([t("tab1"), t("tab2"), t("tab3"), t("tab4")])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([t("tab1"), t("tab2"), t("tab3"), t("tab4"), t("tab5")])
 
     items: list[Any] = st.session_state["stac_items"]
     summary_df: pd.DataFrame = st.session_state["stac_summary_df"]
@@ -6051,13 +6132,13 @@ def main() -> None:
                     with st.spinner(t("carto_quick_load_spinner", crs=target_crs)):
                         try:
                             ds_ql = load_scene(
-                                ql_item,
+                                sensor=active_sensor,
+                                item=ql_item,
                                 bbox_4326=active_bbox,
                                 bands=ql_bands,
-                                crs=target_crs,
+                                target_epsg=target_crs,
                                 resolution=int(selected_resolution),
-                                sensor=active_sensor,
-                                aoi_polygon=active_polygon,
+                                aoi_polygon_4326=active_polygon,
                             )
                             ql_tif = export_to_geotiff_bytes(
                                 ds_ql[ql_vars], target_epsg=target_crs
@@ -6106,6 +6187,10 @@ def main() -> None:
 
                     src_ids = [s["id"] for s in carto_sources]
                     src_map = {s["id"]: s for s in carto_sources}
+                    pending_src = st.session_state.pop("tab4_pending_source_select", None)
+                    if pending_src in src_ids:
+                        st.session_state["tab4_source_select"] = pending_src
+                        st.session_state["tab4_last_src_sig"] = None
                     selected_src_id = st.selectbox(
                         t("carto_layer_label"),
                         options=src_ids,
@@ -6214,8 +6299,12 @@ def main() -> None:
                                 show_north_arrow=bool(chk_north),
                                 show_legend=bool(chk_legend),
                                 show_aoi_outline=bool(chk_aoi),
-                                aoi_polygon_geojson=active_polygon,
-                                aoi_bbox_4326=active_bbox,
+                                aoi_polygon_geojson=(
+                                    src["aoi_polygon_4326"]
+                                    if "aoi_polygon_4326" in src
+                                    else active_polygon
+                                ),
+                                aoi_bbox_4326=src.get("aoi_bbox_4326") or active_bbox,
                                 aoi_legend_label=t("slippy_aoi_outline"),
                                 lang=lang,
                             )
@@ -6289,6 +6378,329 @@ def main() -> None:
                             width="stretch",
                             key="tab4_dl_tif",
                         )
+
+    # =======================================================================
+    # ZAVIHEK 5: HITRA OCENA NARAVNIH NESREČ (PRED / MED / PO)
+    # =======================================================================
+    with tab5:
+        st.subheader(t("dis_header"))
+        st.caption(t("dis_intro"))
+
+        with st.container(border=True):
+            # 1. Hitri primeri resničnih dogodkov v Sloveniji
+            preset_name_key = "name_en" if lang == "en" else "name_sl"
+            dis_preset_id = _touch_selector(
+                t("dis_preset_label"),
+                options=DISASTER_PRESET_KEYS,
+                default="custom",
+                format_func=lambda pid, _nk=preset_name_key: SLOVENIA_CASE_STUDIES[pid][_nk],
+                key="tab5_preset_selector",
+            )
+            preset_cfg = SLOVENIA_CASE_STUDIES[dis_preset_id]
+
+            # Ob izbiri slovenskega primera samodejno nastavi vrsto nesreče in datum dogodka
+            if st.session_state.get("tab5_last_preset") != dis_preset_id:
+                st.session_state["tab5_last_preset"] = dis_preset_id
+                if dis_preset_id != "custom":
+                    st.session_state["tab5_disaster_type_selector"] = preset_cfg["disaster_type"]
+                    st.session_state["tab5_event_date_input"] = preset_cfg["event_date"]
+
+            if "tab5_event_date_input" not in st.session_state:
+                st.session_state["tab5_event_date_input"] = date(2023, 8, 4)
+
+            if dis_preset_id != "custom":
+                full_t_key = "full_title_en" if lang == "en" else "full_title_sl"
+                desc_key = "desc_en" if lang == "en" else "desc_sl"
+                st.info(
+                    t(
+                        "dis_active_preset_note",
+                        title=preset_cfg[full_t_key],
+                        desc=preset_cfg[desc_key],
+                        lat=float(preset_cfg["lat"]),
+                        lon=float(preset_cfg["lon"]),
+                        rad=int(preset_cfg["radius_m"]),
+                    )
+                )
+
+            # 2. Vrsta nesreče (touch pills)
+            dis_type = _touch_selector(
+                t("dis_type_label"),
+                options=DISASTER_TYPE_KEYS,
+                default=DISASTER_FLOOD,
+                format_func=lambda k, _lang=lang: t(DISASTER_TYPE_I18N[k], lang=_lang),
+                key="tab5_disaster_type_selector",
+            )
+
+            # 3. Datum dogodka, iskalno okno in prag za poplave
+            if dis_type == DISASTER_FLOOD:
+                dc1, dc2, dc3 = st.columns([1.0, 1.0, 1.0])
+            else:
+                dc1, dc2 = st.columns([1.0, 1.0])
+                dc3 = None
+
+            with dc1:
+                dis_event_date = st.date_input(
+                    t("dis_event_date_label"),
+                    min_value=HISTORICAL_MIN_DATE,
+                    max_value=date.today(),
+                    key="tab5_event_date_input",
+                )
+            with dc2:
+                dis_window_days = st.slider(
+                    t("dis_window_label"),
+                    min_value=30,
+                    max_value=120,
+                    value=60,
+                    step=5,
+                    key="tab5_window_days",
+                )
+            dis_flood_thr = -16.0
+            if dc3 is not None:
+                with dc3:
+                    dis_flood_thr = st.slider(
+                        t("dis_flood_thr_label"),
+                        min_value=-22.0,
+                        max_value=-10.0,
+                        value=-16.0,
+                        step=0.5,
+                        key="tab5_flood_thr_db",
+                    )
+
+            btn_run_disaster = st.button(
+                t("dis_btn_run"),
+                type="primary",
+                width="stretch",
+                key="tab5_btn_run",
+            )
+
+        if btn_run_disaster:
+            if dis_preset_id != "custom" and preset_cfg["lat"] is not None:
+                dis_bbox_4326, _dis_bbox_3794 = bbox_from_point_wgs84(
+                    float(preset_cfg["lat"]),
+                    float(preset_cfg["lon"]),
+                    float(preset_cfg["radius_m"]),
+                )
+                dis_poly = None
+                # Za 6 km radij (144 km²) je 20 m varno in hitro za Streamlit Cloud RAM
+                dis_res_m = max(int(selected_resolution), 20)
+            else:
+                dis_bbox_4326 = active_bbox
+                dis_poly = active_polygon
+                dis_res_m = max(int(selected_resolution), 10)
+
+            dis_prog = st.progress(0.0)
+            dis_status = st.empty()
+
+            def _on_dis_prog(frac: float, msg: str) -> None:
+                dis_prog.progress(min(max(float(frac), 0.0), 1.0))
+                dis_status.caption(msg)
+
+            try:
+                dis_out = run_disaster_assessment(
+                    disaster_type=str(dis_type),
+                    bbox_4326=dis_bbox_4326,
+                    event_date=dis_event_date,
+                    target_crs=target_crs,
+                    resolution=int(dis_res_m),
+                    search_window_days=int(dis_window_days),
+                    flood_threshold_db=float(dis_flood_thr),
+                    aoi_polygon_4326=dis_poly,
+                    lang=lang,
+                    progress_cb=_on_dis_prog,
+                )
+                st.session_state["tab5_disaster_result"] = dis_out
+                st.session_state["tab5_sent_to_carto"] = False
+                dis_prog.empty()
+                dis_status.empty()
+                gc.collect()
+            except Exception as exc:
+                dis_prog.empty()
+                dis_status.empty()
+                st.error(t("dis_error", err=exc))
+
+        dis_res_show: dict[str, Any] | None = st.session_state.get("tab5_disaster_result")
+        if isinstance(dis_res_show, dict) and dis_res_show.get("class_da") is not None:
+            st.divider()
+            d_sum = dis_res_show["summary"]
+            d_type_show = str(dis_res_show["disaster_type"])
+            d_crs_show = str(dis_res_show["crs"])
+            d_sensor_cfg = SENSOR_META.get(dis_res_show["sensor"], SENSOR_META[SENSOR_S1])
+
+            # 1. KPI Metric Row
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric(
+                t("dis_kpi_dates"),
+                f"{dis_res_show['date_pre']} → {dis_res_show['date_event']}",
+            )
+            k2.metric(
+                t("dis_kpi_affected_ha"),
+                f"{d_sum['affected_area_ha']:,.2f} ha",
+                delta=f"{d_sum['affected_area_km2']:.3f} km²",
+                delta_color="off",
+            )
+            k3.metric(
+                t("dis_kpi_affected_pct"),
+                f"{d_sum['affected_pct']:.2f} %",
+            )
+            k4.metric(
+                t("dis_kpi_crs"),
+                f"{d_crs_show} · {d_sensor_cfg['short_name']}",
+            )
+
+            if d_type_show == DISASTER_FLOOD:
+                st.caption(
+                    t(
+                        "dis_perm_water_note",
+                        perm=d_sum.get("permanent_water_ha", 0.0),
+                        flood=d_sum.get("newly_flooded_ha", d_sum["affected_area_ha"]),
+                        km2=d_sum["affected_area_km2"],
+                        thr=d_sum.get("threshold_db", -16.0),
+                    )
+                )
+
+            # 2. Interactive Slippy Map Overlay (Phase 1 engine)
+            st.markdown(f"#### {t('dis_map_header')}")
+            dis_opacity_pct = st.slider(
+                t("dis_opacity_label"),
+                min_value=0,
+                max_value=100,
+                value=85,
+                step=5,
+                key="tab5_dis_opacity",
+            )
+            specs_show = get_class_specs(d_type_show)
+            lbl_k = "en" if lang == "en" else "sl"
+            swatch_items = [
+                (str(sp[lbl_k]), str(sp["hex"]))
+                for sp in specs_show
+                if sp["affected"] or (d_type_show == DISASTER_FLOOD and sp["code"] == 1)
+            ]
+            st.markdown(
+                build_horizontal_colorbar_html(
+                    cmap_name="Greys",
+                    vmin=0.0,
+                    vmax=1.0,
+                    label=t(DISASTER_TYPE_I18N[d_type_show]),
+                    discrete_items=swatch_items,
+                ),
+                unsafe_allow_html=True,
+            )
+            dis_uri, dis_bounds = raster_to_map_overlay_png(
+                dis_res_show["class_da"],
+                src_epsg=d_crs_show,
+                is_rgb=False,
+                discrete_rgba_map=build_slippy_rgba_map(d_type_show),
+            )
+            d_bbox = dis_res_show.get("bbox_4326") or active_bbox
+            c_lat_d = 0.5 * (d_bbox[1] + d_bbox[3]) if d_bbox is not None else center_lat
+            c_lon_d = 0.5 * (d_bbox[0] + d_bbox[2]) if d_bbox is not None else center_lon
+            slippy_dis = build_satellite_slippy_map(
+                center_lat=c_lat_d,
+                center_lon=c_lon_d,
+                zoom=None,
+                basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                overlay_layers=[
+                    {
+                        "name": f"🚨 {t(DISASTER_TYPE_I18N[d_type_show])} ({dis_res_show['date_event']})",
+                        "image": dis_uri,
+                        "bounds": dis_bounds,
+                        "opacity": float(dis_opacity_pct) / 100.0,
+                        "show": True,
+                        "zindex": 18,
+                    }
+                ],
+                aoi_bbox_4326=d_bbox,
+                aoi_polygon_geojson=dis_res_show.get("polygon_4326"),
+                aoi_outline_label=t("slippy_aoi_outline"),
+                lang=lang,
+            )
+            st_folium(
+                slippy_dis,
+                height=580,
+                use_container_width=True,
+                returned_objects=[],
+                key=(
+                    f"tab5_dis_slippy_{d_type_show}_{dis_res_show['date_pre']}_"
+                    f"{dis_res_show['date_event']}_{dis_opacity_pct}_"
+                    f"{st.session_state.get('map_basemap', 'satellite')}"
+                ),
+            )
+            st.caption(t("geodetic_separation_caption", crs=d_crs_show))
+
+            # 3. Before / After Curtain Swipe Comparison
+            if dis_res_show.get("swipe_png_pre") and dis_res_show.get("swipe_png_post"):
+                st.markdown(f"#### {t('dis_swipe_header')}")
+                _render_before_after_swipe_html(
+                    png_t1_bytes=dis_res_show["swipe_png_pre"],
+                    png_t2_bytes=dis_res_show["swipe_png_post"],
+                    label_t1=t("dis_swipe_pre_lbl", date=dis_res_show["date_pre"]),
+                    label_t2=t("dis_swipe_post_lbl", date=dis_res_show["date_event"]),
+                    height=500,
+                )
+
+            # 4. Severity / Area Breakdown Table + Plotly Bar Chart
+            st.markdown(f"#### {t('dis_breakdown_header')}")
+            bdf: pd.DataFrame = dis_res_show["breakdown_df"]
+            col_tbl, col_bar = st.columns([1.05, 1.15], gap="medium")
+            with col_tbl:
+                show_tbl = pd.DataFrame(
+                    {
+                        t("dis_col_class"): bdf["class_label"],
+                        t("dis_col_ha"): bdf["area_ha"],
+                        t("dis_col_km2"): bdf["area_km2"],
+                        t("dis_col_pct"): bdf["pct"],
+                    }
+                )
+                st.dataframe(show_tbl, width="stretch", hide_index=True)
+            with col_bar:
+                fig_bar = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=bdf["area_ha"],
+                            y=bdf["class_label"],
+                            orientation="h",
+                            marker=dict(color=bdf["hex"].tolist(), line=dict(color="#334155", width=0.8)),
+                            text=[f"{v:,.1f} ha ({p:.1f}%)" for v, p in zip(bdf["area_ha"], bdf["pct"])],
+                            textposition="auto",
+                        )
+                    ]
+                )
+                fig_bar.update_layout(
+                    title=dict(text=t("dis_chart_title", crs=d_crs_show), font=dict(size=13, color="#0F172A")),
+                    xaxis_title=t("dis_col_ha"),
+                    yaxis=dict(autorange="reversed"),
+                    height=max(240, 56 * len(bdf) + 90),
+                    margin=dict(l=12, r=24, t=42, b=36),
+                    plot_bgcolor="#FFFFFF",
+                    paper_bgcolor="#FFFFFF",
+                    font=dict(color="#0F172A", size=11),
+                )
+                st.plotly_chart(fig_bar, width="stretch", key="tab5_dis_breakdown_bar")
+
+            # 5. Export GeoTIFF + 1-Click Send to Cartography (Phase 2)
+            act_c1, act_c2 = st.columns(2)
+            with act_c1:
+                st.download_button(
+                    label=t("dis_btn_dl_tif"),
+                    data=dis_res_show["tif_bytes"],
+                    file_name=dis_res_show["tif_filename"],
+                    mime="image/tiff",
+                    width="stretch",
+                    key="tab5_dl_tif",
+                )
+            with act_c2:
+                if st.button(
+                    t("dis_btn_send_carto"),
+                    type="primary",
+                    width="stretch",
+                    key="tab5_btn_send_carto",
+                ):
+                    st.session_state["tab4_pending_source_select"] = "tab5_disaster"
+                    st.session_state["tab5_sent_to_carto"] = True
+                    st.rerun()
+
+            if st.session_state.get("tab5_sent_to_carto"):
+                st.success(t("dis_sent_carto_ok"))
 
     # Prepreči odpiranje virtualne tipkovnice na preostalih dinamičnih selectboxih (tablice/telefoni)
     _inject_tablet_no_keyboard_js()
