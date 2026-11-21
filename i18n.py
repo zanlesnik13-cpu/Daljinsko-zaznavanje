@@ -513,6 +513,39 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "dis_btn_dl_tif": "💾 Prenesi karto prizadetosti kot GeoTIFF (.tif)",
         "dis_btn_send_carto": "🗺️ Pošlji rezultat v Izdelavo karte (D96/TM)",
         "dis_sent_carto_ok": "✅ Rezultat je pripravljen v zavihku **🗺️ Izdelava karte (D96/TM)** — preklopite nanj za 300 DPI PDF/PNG izvoz!",
+        "carto_layer_tab6_ai": "Zavihek 6 (AI) · {title}",
+        # Phase 4: Built-in AI EO Assistant (Tab 6)
+        "tab6": "🤖 AI Pomočnik",
+        "ai_header": "🤖 AI Pomočnik za daljinsko zaznavanje",
+        "ai_intro": (
+            "Opišite želeno satelitsko analizo v naravnem jeziku (slovensko ali angleško). "
+            "AI Pomočnik samodejno izbere ustrezen senzor (**Sentinel-2**, **Landsat 1984+**, **Sentinel-1 SAR**), "
+            "geokodira lokacijo v **EPSG:3794 / EPSG:32633** in izvede geodetsko analizo."
+        ),
+        "ai_examples_label": "Hitri primeri ukazov (1 klik):",
+        "ai_input_label": "Vpišite vprašanje ali ukaz za analizo:",
+        "ai_input_placeholder": "npr. Pokaži poplave v Celju avgusta 2023 ali Izračunaj NDVI za Bled poleti 2025...",
+        "ai_btn_run": "🚀 Izvedi AI analizo",
+        "ai_api_expander": "⚙️ Nastavitve Gemini API (opcijsko)",
+        "ai_status_gemini": "🟢 Gemini API aktiven ({source}) — uporablja model `gemini-2.5-flash`.",
+        "ai_status_local": "🟡 Lokalni pametni način — brez ključa (deluje 100 % brezplačno in brez povezave z API).",
+        "ai_key_input_label": "Opcijski Gemini API ključ (shranjen samo v trenutni seji):",
+        "ai_plan_header": "📋 Razpoznani geodetski načrt analize",
+        "ai_plan_place": "Kraj",
+        "ai_plan_sensor": "Senzor",
+        "ai_plan_period": "Obdobje",
+        "ai_plan_task": "Analiza",
+        "ai_plan_crs": "CRS",
+        "ai_plan_engine_gemini": "Gemini 2.5 Flash",
+        "ai_plan_engine_local": "Lokalni parser",
+        "ai_error": "Napaka pri izvedbi AI analize: {err}",
+        "ai_empty_query": "Prosimo, vpišite ukaz ali kliknite enega od zgornjih hitrih primerov.",
+        "ai_btn_dl_tif": "💾 Prenesi produkt kot GeoTIFF (.tif)",
+        "ai_btn_dl_csv": "💾 Prenesi časovno vrsto kot CSV (.csv)",
+        "ai_copy_header": "📋 Kopiraj tehnični povzetek (za poročilo)",
+        "ai_btn_send_carto": "🗺️ Pošlji v Izdelavo karte (D96/TM)",
+        "ai_sent_carto_ok": "✅ AI sloj je pripravljen v zavihku **🗺️ Izdelava karte (D96/TM)** za 300 DPI PDF/PNG izvoz!",
+        "ai_ts_chart_title": "AI Časovna vrsta {idx} — {place} ({sensor}, {crs})",
     },
     "en": {
         # App chrome & header
@@ -1022,6 +1055,39 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "dis_btn_dl_tif": "💾 Download Impact Map as GeoTIFF (.tif)",
         "dis_btn_send_carto": "🗺️ Send Result to Map Layout (D96/TM)",
         "dis_sent_carto_ok": "✅ Disaster map is ready in **🗺️ Map Layout (D96/TM)** — switch tabs to export a 300 DPI PDF/PNG report map!",
+        "carto_layer_tab6_ai": "Tab 6 (AI) · {title}",
+        # Phase 4: Built-in AI EO Assistant (Tab 6)
+        "tab6": "🤖 AI Assistant",
+        "ai_header": "🤖 AI Remote Sensing Assistant",
+        "ai_intro": (
+            "Describe your satellite analysis in natural language (Slovenian or English). "
+            "The AI Assistant automatically selects the right sensor (**Sentinel-2**, **Landsat 1984+**, **Sentinel-1 SAR**), "
+            "geocodes your location into **EPSG:3794 / EPSG:32633**, and executes the geodetic workflow."
+        ),
+        "ai_examples_label": "Quick Example Prompts (1 click):",
+        "ai_input_label": "Enter your remote sensing request:",
+        "ai_input_placeholder": "e.g. Show floods in Celje in August 2023 or Compute NDVI for Bled in summer 2025...",
+        "ai_btn_run": "🚀 Run AI Analysis",
+        "ai_api_expander": "⚙️ Gemini API Settings (optional)",
+        "ai_status_gemini": "🟢 Gemini API active ({source}) — using `gemini-2.5-flash`.",
+        "ai_status_local": "🟡 Smart Local Mode — no API key required (100% free & offline parsing).",
+        "ai_key_input_label": "Optional Gemini API key (stored only for this session):",
+        "ai_plan_header": "📋 Parsed Geodetic Execution Plan",
+        "ai_plan_place": "Place",
+        "ai_plan_sensor": "Sensor",
+        "ai_plan_period": "Period",
+        "ai_plan_task": "Analysis",
+        "ai_plan_crs": "CRS",
+        "ai_plan_engine_gemini": "Gemini 2.5 Flash",
+        "ai_plan_engine_local": "Local Parser",
+        "ai_error": "AI analysis error: {err}",
+        "ai_empty_query": "Please enter a request or click one of the quick example prompts above.",
+        "ai_btn_dl_tif": "💾 Download Product as GeoTIFF (.tif)",
+        "ai_btn_dl_csv": "💾 Download Time Series as CSV (.csv)",
+        "ai_copy_header": "📋 Copy Technical Summary (for report)",
+        "ai_btn_send_carto": "🗺️ Send to Map Layout (D96/TM)",
+        "ai_sent_carto_ok": "✅ AI layer is ready in **🗺️ Map Layout (D96/TM)** for 300 DPI PDF/PNG export!",
+        "ai_ts_chart_title": "AI {idx} Time Series — {place} ({sensor}, {crs})",
     },
 }
 

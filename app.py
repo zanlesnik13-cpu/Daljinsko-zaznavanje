@@ -49,6 +49,7 @@ _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "analize",
     "casovne_vrste",
     "nesrece",
+    "ai_pomocnik",
     "i18n",
 )
 
@@ -73,6 +74,12 @@ def _reload_stale_local_modules() -> None:
 
 _reload_stale_local_modules()
 
+from ai_pomocnik import (
+    AI_EXAMPLE_PROMPTS,
+    execute_ai_plan,
+    get_active_gemini_api_key,
+    parse_eo_request,
+)
 from analize import (
     OPTICAL_SIGNATURE_BANDS,
     SAR_METRICS,
@@ -776,6 +783,11 @@ def _init_session_state() -> None:
         "tab5_disaster_result": None,
         "tab5_last_preset": "custom",
         "tab5_sent_to_carto": False,
+        # Tab 6 AI EO Assistant state
+        "tab6_ai_result": None,
+        "tab6_sent_to_carto": False,
+        "tab6_gemini_key": "",
+        "tab6_query_input": "",
         # Resolution guard
         "last_rec_res_key": None,
         "selected_resolution": 10,
@@ -1167,6 +1179,121 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                 "aoi_polygon_4326": dis_res.get("polygon_4326"),
             }
         )
+
+    # 7. Tab 6: AI EO Assistant Raster Output (Disaster / Spectral Index / RGB Scene)
+    ai_res = st.session_state.get("tab6_ai_result")
+    if isinstance(ai_res, dict) and ai_res.get("kind") in ("disaster", "spectral_index", "scene_rgb"):
+        ai_plan = ai_res["plan"]
+        ai_place = str(ai_plan.get("place_name", "AOI"))
+        ai_crs = str(ai_res.get("crs", CRS_D96TM))
+        ai_sensor_cfg = SENSOR_META.get(ai_plan.get("sensor", SENSOR_S2), SENSOR_META[SENSOR_S2])
+        ai_kind = ai_res["kind"]
+
+        if ai_kind == "disaster":
+            d_obj = ai_res["disaster_result"]
+            dt = str(d_obj["disaster_type"])
+            dt_lbl = t(DISASTER_TYPE_I18N.get(dt, "dis_type_flood"), lang=lang)
+            ds_sum = d_obj["summary"]
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"{dt_lbl} — {ai_place}"),
+                    "raster": d_obj["class_da"],
+                    "crs": ai_crs,
+                    "is_rgb": False,
+                    "bands": None,
+                    "use_percentile_stretch": False,
+                    "gamma": 1.0,
+                    "cmap_name": "Greys",
+                    "vmin": 0.0,
+                    "vmax": 4.0,
+                    "discrete_items": build_carto_discrete_items(dt, lang=lang),
+                    "legend_title": dt_lbl,
+                    "legend_units": "",
+                    "stats_summary": [
+                        (t("dis_kpi_affected_ha", lang=lang), f"{ds_sum['affected_area_ha']:,.2f} ha"),
+                        (t("dis_kpi_affected_pct", lang=lang), f"{ds_sum['affected_pct']:.2f} %"),
+                    ],
+                    "default_title": f"{dt_lbl} — {ai_place}",
+                    "default_subtitle": f"{ai_sensor_cfg['short_name']} | {d_obj['date_pre']} → {d_obj['date_event']}",
+                    "sensor_label": ai_sensor_cfg["short_name"],
+                    "date_label": f"{d_obj['date_pre']} → {d_obj['date_event']}",
+                    "resolution_m": float(d_obj.get("resolution_m", 20.0)),
+                    "tif_bytes": d_obj.get("tif_bytes"),
+                    "tif_filename": d_obj.get("tif_filename") or f"AI_{dt}.tif",
+                    "file_stem": f"AI_{dt}_{ai_place}_{d_obj['date_event']}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
+        elif ai_kind == "spectral_index":
+            idx_n = str(ai_plan.get("index_name", "NDVI"))
+            is_sar_ai = ai_plan.get("sensor") == SENSOR_S1
+            spec_ai = SAR_METRICS.get(idx_n, SAR_METRICS["VV"]) if is_sar_ai else SPECTRAL_INDICES.get(idx_n, SPECTRAL_INDICES["NDVI"])
+            st_ai = ai_res.get("stats", {})
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"{idx_n} — {ai_place} ({ai_res.get('date_str', '')})"),
+                    "raster": ai_res["index_da"],
+                    "crs": ai_crs,
+                    "is_rgb": False,
+                    "bands": None,
+                    "use_percentile_stretch": False,
+                    "gamma": 1.0,
+                    "cmap_name": spec_ai["cmap"],
+                    "vmin": float(spec_ai["vmin"]),
+                    "vmax": float(spec_ai["vmax"]),
+                    "discrete_items": None,
+                    "legend_title": idx_n,
+                    "legend_units": spec_ai.get("units", ""),
+                    "stats_summary": [
+                        ("Mean" if lang == "en" else "Povprečje", f"{st_ai.get('mean', 0.0):.3f}"),
+                        ("Median" if lang == "en" else "Mediana", f"{st_ai.get('median', 0.0):.3f}"),
+                        (t("m_valid_ha", lang=lang), f"{st_ai.get('valid_area_ha', 0.0):,.1f} ha"),
+                    ],
+                    "default_title": f"{idx_n} — {ai_place}",
+                    "default_subtitle": f"{ai_sensor_cfg['short_name']} | {ai_res.get('date_str', '')}",
+                    "sensor_label": ai_sensor_cfg["short_name"],
+                    "date_label": str(ai_res.get("date_str", "")),
+                    "resolution_m": float(ai_plan.get("resolution_m", 10.0)),
+                    "tif_bytes": ai_res.get("tif_bytes"),
+                    "tif_filename": ai_res.get("tif_filename") or f"AI_{idx_n}.tif",
+                    "file_stem": f"AI_{idx_n}_{ai_place}_{ai_res.get('date_str', '')}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
+        elif ai_kind == "scene_rgb":
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"RGB — {ai_place} ({ai_res.get('date_str', '')})"),
+                    "raster": ai_res["scene_ds"],
+                    "crs": ai_crs,
+                    "is_rgb": True,
+                    "bands": ai_res.get("bands", ["B04", "B03", "B02"]),
+                    "use_percentile_stretch": True,
+                    "gamma": 1.0,
+                    "cmap_name": "Greys_r",
+                    "vmin": 0.0,
+                    "vmax": 1.0,
+                    "discrete_items": None,
+                    "legend_title": "RGB" if ai_plan.get("sensor") != SENSOR_S1 else "SAR VV+VH",
+                    "legend_units": "",
+                    "stats_summary": [],
+                    "default_title": f"{ai_sensor_cfg['short_name']} — {ai_place}",
+                    "default_subtitle": f"{ai_res.get('date_str', '')} | {ai_res.get('tile', '')}",
+                    "sensor_label": ai_sensor_cfg["short_name"],
+                    "date_label": str(ai_res.get("date_str", "")),
+                    "resolution_m": float(ai_plan.get("resolution_m", 10.0)),
+                    "tif_bytes": ai_res.get("tif_bytes"),
+                    "tif_filename": ai_res.get("tif_filename") or f"AI_RGB_{ai_place}.tif",
+                    "file_stem": f"AI_RGB_{ai_place}_{ai_res.get('date_str', '')}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
 
     return sources
 
@@ -3715,7 +3842,9 @@ def main() -> None:
     )
     st.markdown(header_html, unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([t("tab1"), t("tab2"), t("tab3"), t("tab4"), t("tab5")])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        [t("tab1"), t("tab2"), t("tab3"), t("tab4"), t("tab5"), t("tab6")]
+    )
 
     items: list[Any] = st.session_state["stac_items"]
     summary_df: pd.DataFrame = st.session_state["stac_summary_df"]
@@ -6701,6 +6830,315 @@ def main() -> None:
 
             if st.session_state.get("tab5_sent_to_carto"):
                 st.success(t("dis_sent_carto_ok"))
+
+    # =======================================================================
+    # ZAVIHEK 6: AI POMOČNIK ZA DALJINSKO ZAZNAVANJE
+    # =======================================================================
+    with tab6:
+        st.subheader(t("ai_header"))
+        st.caption(t("ai_intro"))
+
+        # Predhodni prenos izbranega hitrega primera v tekstovno polje pred ustvarjanjem gradnika
+        pending_ai_q = st.session_state.pop("tab6_pending_query", None)
+        if pending_ai_q is not None:
+            st.session_state["tab6_query_input"] = str(pending_ai_q)
+        auto_run_ai = bool(st.session_state.pop("tab6_auto_run", False))
+
+        with st.container(border=True):
+            # 1. Hitri primeri ukazov (4 gumbi za 1 klik)
+            st.caption(t("ai_examples_label"))
+            ex_cols = st.columns(2)
+            ex_lang_k = "en" if lang == "en" else "sl"
+            for ex_idx, ex_item in enumerate(AI_EXAMPLE_PROMPTS):
+                ex_text = ex_item[ex_lang_k]
+                with ex_cols[ex_idx % 2]:
+                    if st.button(
+                        ex_text,
+                        width="stretch",
+                        key=f"tab6_ex_{ex_item['id']}",
+                    ):
+                        # Odstrani uvodni emoji iz ukaza ob vstavitvi
+                        clean_ex = ex_text.split(" ", 1)[1] if " " in ex_text else ex_text
+                        st.session_state["tab6_pending_query"] = clean_ex
+                        st.session_state["tab6_auto_run"] = True
+                        st.rerun()
+
+            # 2. Vnos ukaza + primarni gumb
+            col_q, col_go = st.columns([3.4, 1.1], vertical_alignment="bottom")
+            with col_q:
+                ai_query_text = st.text_input(
+                    t("ai_input_label"),
+                    placeholder=t("ai_input_placeholder"),
+                    key="tab6_query_input",
+                )
+            with col_go:
+                btn_ai_run = st.button(
+                    t("ai_btn_run"),
+                    type="primary",
+                    width="stretch",
+                    key="tab6_btn_run",
+                )
+
+            # 3. Opcijske nastavitve Gemini API (z jasnim statusom)
+            cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
+            with st.expander(t("ai_api_expander"), expanded=False):
+                if cur_api_key:
+                    st.success(t("ai_status_gemini", source=key_src))
+                else:
+                    st.info(t("ai_status_local"))
+                st.text_input(
+                    t("ai_key_input_label"),
+                    type="password",
+                    key="tab6_gemini_key",
+                )
+
+        if btn_ai_run or auto_run_ai:
+            q_clean = str(ai_query_text or "").strip()
+            if not q_clean:
+                st.warning(t("ai_empty_query"))
+            else:
+                ai_prog = st.progress(0.0)
+                ai_status = st.empty()
+
+                def _on_ai_prog(frac: float, msg: str) -> None:
+                    ai_prog.progress(min(max(float(frac), 0.0), 1.0))
+                    ai_status.caption(msg)
+
+                try:
+                    _on_ai_prog(0.04, "Razčlenjujem ukaz..." if lang == "sl" else "Parsing request...")
+                    active_key_now, _ = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
+                    parsed_plan = parse_eo_request(q_clean, api_key=active_key_now)
+                    ai_out = execute_ai_plan(
+                        parsed_plan,
+                        target_epsg=target_crs,
+                        geocode_fn=lambda name, _l=lang: geocode_place(name, lang=_l),
+                        lang=lang,
+                        progress_cb=_on_ai_prog,
+                    )
+                    st.session_state["tab6_ai_result"] = ai_out
+                    st.session_state["tab6_sent_to_carto"] = False
+                    # Sinhroniziraj geokodiran AOI v sejo (da ga vidijo tudi ostali zavihki)
+                    st.session_state["map_lat"] = round(float(ai_out["lat"]), 6)
+                    st.session_state["map_lon"] = round(float(ai_out["lon"]), 6)
+                    st.session_state["radius_m"] = int(parsed_plan["radius_m"])
+                    ai_prog.empty()
+                    ai_status.empty()
+                    gc.collect()
+                except Exception as exc:
+                    ai_prog.empty()
+                    ai_status.empty()
+                    st.error(t("ai_error", err=exc))
+
+        ai_res_show: dict[str, Any] | None = st.session_state.get("tab6_ai_result")
+        if isinstance(ai_res_show, dict) and ai_res_show.get("plan"):
+            st.divider()
+            pl = ai_res_show["plan"]
+            ai_crs_show = str(ai_res_show.get("crs", target_crs))
+            ai_kind_show = str(ai_res_show.get("kind", ""))
+            eng_lbl = (
+                t("ai_plan_engine_gemini")
+                if pl.get("parser_engine") == "gemini"
+                else t("ai_plan_engine_local")
+            )
+            expl_txt = pl["explanation_en"] if lang == "en" else pl["explanation_sl"]
+            period_txt = (
+                pl["event_date"]
+                if pl["task_type"].startswith("disaster_")
+                else f"{pl['start_date']} → {pl['end_date']}"
+            )
+            ai_sensor_short = SENSOR_META.get(pl["sensor"], SENSOR_META[SENSOR_S2])["short_name"]
+
+            # Transparent Geodetic Plan Card (crisp teal/slate cartographic pills, no purple)
+            st.markdown(f"#### {t('ai_plan_header')}")
+            plan_pills_html = (
+                f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">'
+                f'<span style="background:#F0FDFA;color:#0F766E;border:1px solid #99F6E4;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;">📍 {t("ai_plan_place")}: {ai_res_show.get("resolved_place", pl["place_name"])} ({pl["radius_m"]} m)</span>'
+                f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;">🛰️ {t("ai_plan_sensor")}: {ai_sensor_short}</span>'
+                f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;">📅 {t("ai_plan_period")}: {period_txt}</span>'
+                f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;">⚙️ {t("ai_plan_task")}: {pl["task_type"]} ({pl["index_name"]})</span>'
+                f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;">📐 {t("ai_plan_crs")}: {ai_crs_show} · {pl["resolution_m"]} m</span>'
+                f'<span style="background:#FFFFFF;color:#475569;border:1px solid #CBD5E1;border-radius:999px;padding:4px 12px;font-size:12px;">{eng_lbl}</span>'
+                f'</div>'
+            )
+            st.markdown(plan_pills_html, unsafe_allow_html=True)
+            st.info(expl_txt)
+
+            # Display Output based on task kind
+            if ai_kind_show == "disaster":
+                d_obj = ai_res_show["disaster_result"]
+                d_sum = d_obj["summary"]
+                dt_k = str(d_obj["disaster_type"])
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric(t("dis_kpi_dates"), f"{d_obj['date_pre']} → {d_obj['date_event']}")
+                m2.metric(t("dis_kpi_affected_ha"), f"{d_sum['affected_area_ha']:,.2f} ha", delta=f"{d_sum['affected_area_km2']:.3f} km²", delta_color="off")
+                m3.metric(t("dis_kpi_affected_pct"), f"{d_sum['affected_pct']:.2f} %")
+                m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+                ai_op_d = st.slider(t("opacity_layer_label"), 0, 100, 85, 5, key="tab6_ai_dis_opacity")
+                lbl_k_ai = "en" if lang == "en" else "sl"
+                sw_ai = [
+                    (str(sp[lbl_k_ai]), str(sp["hex"]))
+                    for sp in get_class_specs(dt_k)
+                    if sp["affected"] or (dt_k == DISASTER_FLOOD and sp["code"] == 1)
+                ]
+                st.markdown(
+                    build_horizontal_colorbar_html("Greys", 0.0, 1.0, label=t(DISASTER_TYPE_I18N[dt_k]), discrete_items=sw_ai),
+                    unsafe_allow_html=True,
+                )
+                ai_uri, ai_bnds = raster_to_map_overlay_png(
+                    d_obj["class_da"], src_epsg=ai_crs_show, is_rgb=False, discrete_rgba_map=build_slippy_rgba_map(dt_k)
+                )
+                slippy_ai = build_satellite_slippy_map(
+                    center_lat=float(ai_res_show["lat"]),
+                    center_lon=float(ai_res_show["lon"]),
+                    zoom=None,
+                    basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                    overlay_layers=[{"name": f"🤖 {t(DISASTER_TYPE_I18N[dt_k])}", "image": ai_uri, "bounds": ai_bnds, "opacity": ai_op_d / 100.0, "show": True, "zindex": 18}],
+                    aoi_bbox_4326=ai_res_show["bbox_4326"],
+                    aoi_outline_label=t("slippy_aoi_outline"),
+                    lang=lang,
+                )
+                st_folium(slippy_ai, height=560, use_container_width=True, returned_objects=[], key=f"tab6_dis_map_{ai_op_d}_{d_obj['date_event']}_{st.session_state.get('map_basemap', 'satellite')}")
+
+            elif ai_kind_show == "spectral_index":
+                st_ai = ai_res_show["stats"]
+                idx_n = str(pl["index_name"])
+                is_sar_ai = pl["sensor"] == SENSOR_S1
+                spec_ai = SAR_METRICS.get(idx_n, SAR_METRICS["VV"]) if is_sar_ai else SPECTRAL_INDICES.get(idx_n, SPECTRAL_INDICES["NDVI"])
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric(t("col_date"), str(ai_res_show["date_str"]))
+                m2.metric("Povprečje" if lang == "sl" else "Mean", f"{st_ai['mean']:.3f}")
+                m3.metric(t("m_valid_ha"), f"{st_ai['valid_area_ha']:,.2f} ha")
+                m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+                ai_op_i = st.slider(t("opacity_index_label"), 0, 100, 85, 5, key="tab6_ai_idx_opacity")
+                st.markdown(
+                    build_horizontal_colorbar_html(spec_ai["cmap"], float(spec_ai["vmin"]), float(spec_ai["vmax"]), label=idx_n, units=spec_ai.get("units", "")),
+                    unsafe_allow_html=True,
+                )
+                ai_uri, ai_bnds = raster_to_map_overlay_png(
+                    ai_res_show["index_da"], src_epsg=ai_crs_show, is_rgb=False, cmap_name=spec_ai["cmap"], vmin=float(spec_ai["vmin"]), vmax=float(spec_ai["vmax"])
+                )
+                slippy_ai = build_satellite_slippy_map(
+                    center_lat=float(ai_res_show["lat"]),
+                    center_lon=float(ai_res_show["lon"]),
+                    zoom=None,
+                    basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                    overlay_layers=[{"name": f"🤖 {idx_n} ({ai_res_show['date_str']})", "image": ai_uri, "bounds": ai_bnds, "opacity": ai_op_i / 100.0, "show": True, "zindex": 18}],
+                    aoi_bbox_4326=ai_res_show["bbox_4326"],
+                    aoi_outline_label=t("slippy_aoi_outline"),
+                    lang=lang,
+                )
+                st_folium(slippy_ai, height=560, use_container_width=True, returned_objects=[], key=f"tab6_idx_map_{ai_op_i}_{ai_res_show['date_str']}_{st.session_state.get('map_basemap', 'satellite')}")
+
+            elif ai_kind_show == "scene_rgb":
+                m1, m2, m3 = st.columns(3)
+                m1.metric(t("col_date"), str(ai_res_show["date_str"]))
+                m2.metric(t("col_tile"), str(ai_res_show.get("tile", "")))
+                m3.metric(t("ai_plan_crs"), ai_crs_show)
+
+                ai_op_r = st.slider(t("opacity_layer_label"), 0, 100, 100, 5, key="tab6_ai_rgb_opacity")
+                ai_uri, ai_bnds = raster_to_map_overlay_png(
+                    ai_res_show["scene_ds"], src_epsg=ai_crs_show, is_rgb=True, bands=ai_res_show.get("bands", ["B04", "B03", "B02"])
+                )
+                slippy_ai = build_satellite_slippy_map(
+                    center_lat=float(ai_res_show["lat"]),
+                    center_lon=float(ai_res_show["lon"]),
+                    zoom=None,
+                    basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                    overlay_layers=[{"name": f"🤖 RGB ({ai_res_show['date_str']})", "image": ai_uri, "bounds": ai_bnds, "opacity": ai_op_r / 100.0, "show": True, "zindex": 18}],
+                    aoi_bbox_4326=ai_res_show["bbox_4326"],
+                    aoi_outline_label=t("slippy_aoi_outline"),
+                    lang=lang,
+                )
+                st_folium(slippy_ai, height=560, use_container_width=True, returned_objects=[], key=f"tab6_rgb_map_{ai_op_r}_{ai_res_show['date_str']}_{st.session_state.get('map_basemap', 'satellite')}")
+
+            elif ai_kind_show == "time_series":
+                ts_ai: pd.DataFrame = ai_res_show["ts_df"]
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Št. datumov" if lang == "sl" else "Valid Dates", f"{len(ts_ai)}")
+                m2.metric("Povprečje" if lang == "sl" else "Mean", f"{ts_ai['mean'].mean():.3f}")
+                m3.metric(t("ai_plan_period"), f"{ts_ai['date_str'].iloc[0]} → {ts_ai['date_str'].iloc[-1]}")
+                m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+                fig_ai_ts = go.Figure()
+                fig_ai_ts.add_trace(
+                    go.Scatter(
+                        x=ts_ai["date_str"],
+                        y=ts_ai["mean"],
+                        mode="lines+markers",
+                        name=pl["index_name"],
+                        line=dict(color="#0F766E", width=2.5),
+                        marker=dict(size=7, color="#0F766E"),
+                    )
+                )
+                if len(ts_ai) >= 3:
+                    x_ord = np.arange(len(ts_ai), dtype=np.float64)
+                    slope, intercept = np.polyfit(x_ord, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
+                    fig_ai_ts.add_trace(
+                        go.Scatter(
+                            x=ts_ai["date_str"],
+                            y=slope * x_ord + intercept,
+                            mode="lines",
+                            name="Trend",
+                            line=dict(color="#DC2626", width=1.8, dash="dash"),
+                        )
+                    )
+                fig_ai_ts.update_layout(
+                    title=t(
+                        "ai_ts_chart_title",
+                        idx=pl["index_name"],
+                        place=pl["place_name"],
+                        sensor=ai_sensor_short,
+                        crs=ai_crs_show,
+                    ),
+                    xaxis_title=t("col_date"),
+                    yaxis_title=pl["index_name"],
+                    height=430,
+                    plot_bgcolor="#FFFFFF",
+                    paper_bgcolor="#FFFFFF",
+                    font=dict(color="#0F172A"),
+                )
+                st.plotly_chart(fig_ai_ts, width="stretch", key="tab6_ai_ts_plotly")
+
+            # Action & Export Bar
+            if ai_kind_show == "time_series":
+                st.download_button(
+                    label=t("ai_btn_dl_csv"),
+                    data=ai_res_show["csv_bytes"],
+                    file_name=ai_res_show["csv_filename"],
+                    mime="text/csv",
+                    width="stretch",
+                    key="tab6_dl_csv",
+                )
+            else:
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    st.download_button(
+                        label=t("ai_btn_dl_tif"),
+                        data=ai_res_show["tif_bytes"],
+                        file_name=ai_res_show["tif_filename"],
+                        mime="image/tiff",
+                        width="stretch",
+                        key="tab6_dl_tif",
+                    )
+                with ac2:
+                    if st.button(
+                        t("ai_btn_send_carto"),
+                        type="primary",
+                        width="stretch",
+                        key="tab6_btn_send_carto",
+                    ):
+                        st.session_state["tab4_pending_source_select"] = "tab6_ai"
+                        st.session_state["tab6_sent_to_carto"] = True
+                        st.rerun()
+
+                if st.session_state.get("tab6_sent_to_carto"):
+                    st.success(t("ai_sent_carto_ok"))
+
+            # Copy-ready Technical Report Summary
+            st.markdown(f"#### {t('ai_copy_header')}")
+            st.code(ai_res_show.get("technical_summary", ""), language="text")
 
     # Prepreči odpiranje virtualne tipkovnice na preostalih dinamičnih selectboxih (tablice/telefoni)
     _inject_tablet_no_keyboard_js()
