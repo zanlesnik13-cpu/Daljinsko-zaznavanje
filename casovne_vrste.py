@@ -33,6 +33,7 @@ from analize import (
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
+from geodezija_crs import clip_to_aoi_polygon
 from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,54 @@ def _compute_layer(ds: xr.Dataset, sensor: str, metric_name: str) -> xr.DataArra
     return compute_index(ds, metric_name)
 
 
+def _compute_raw_swath_coverage_pct(
+    ds: xr.Dataset,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+) -> float:
+    """Compute raw non-NoData satellite swath coverage [%] before cloud masking.
+
+    When ``aoi_polygon_4326`` is supplied, evaluates coverage relative to the pixels
+    inside the clipped polygon rather than the enclosing rectangular bounding box.
+    """
+    data_vars = [
+        str(v)
+        for v in ds.data_vars
+        if str(v) not in ("SCL", "QA_PIXEL", "qa_pixel")
+    ]
+    if not data_vars:
+        return 0.0
+
+    ref_da = ds[data_vars[0]]
+    finite_mask = np.ones(ref_da.shape, dtype=bool)
+    for var in data_vars:
+        finite_mask &= np.isfinite(ds[var].values)
+
+    finite_px = int(np.count_nonzero(finite_mask))
+    denom_px = int(finite_mask.size)
+
+    if aoi_polygon_4326 is not None and denom_px > 0:
+        try:
+            ones_da = xr.DataArray(
+                np.ones(ref_da.shape, dtype=np.float32),
+                dims=ref_da.dims,
+                coords=ref_da.coords,
+            )
+            crs = ds.rio.crs or ref_da.rio.crs
+            if crs is not None:
+                ones_da = ones_da.rio.write_crs(crs, inplace=False)
+            ones_da = ones_da.rio.write_nodata(np.nan, inplace=False)
+            clipped_ones = clip_to_aoi_polygon(ones_da, aoi_polygon_4326, drop=False)
+            poly_px = int(np.count_nonzero(np.isfinite(clipped_ones.values)))
+            if poly_px > 0:
+                denom_px = poly_px
+        except Exception:
+            pass
+
+    if denom_px <= 0:
+        return 0.0
+    return round(float(np.clip(100.0 * finite_px / denom_px, 0.0, 100.0)), 1)
+
+
 def extract_time_series(
     items: Sequence[StacItemOrGroup],
     bbox_4326: Sequence[float],
@@ -140,14 +189,17 @@ def extract_time_series(
     progress_callback: Callable[[int, int, str], None] | None = None,
     sensor: str = SENSOR_S2,
     aoi_polygon_4326: dict[str, Any] | None = None,
+    min_swath_coverage_pct: float = 85.0,
 ) -> pd.DataFrame:
     """Extract a multi-temporal index or SAR backscatter time series (1 mosaicked date in RAM).
 
     Streams only the minimal bands needed for ``sensor`` and ``index_name``,
     mosaics all same-day tiles seamlessly onto the target CRS grid, clips to
-    ``aoi_polygon_4326`` if provided, applies sensor-appropriate cloud masking
-    (Sentinel-2 SCL or Landsat QA_PIXEL; skipped for all-weather SAR), records
-    statistics, and immediately releases each raster via ``gc.collect()``.
+    ``aoi_polygon_4326`` if provided, skips partial-swath dates with less than
+    ``min_swath_coverage_pct`` non-NoData pixels before cloud masking, applies
+    sensor-appropriate cloud masking (Sentinel-2 SCL or Landsat QA_PIXEL;
+    skipped for all-weather SAR), records statistics, and immediately releases
+    each raster via ``gc.collect()``.
     """
     idx_key = index_name.strip().upper()
     use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
@@ -177,6 +229,25 @@ def extract_time_series(
                 resolution=float(resolution),
                 aoi_polygon_4326=aoi_polygon_4326,
             )
+            swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
+            if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
+                logger.info(
+                    "Skipped %s (%s): partial swath coverage %.1f%% < %.0f%%.",
+                    date_str,
+                    scene_id,
+                    swath_pct,
+                    min_swath_coverage_pct,
+                )
+                skipped_epochs.append(
+                    {
+                        "date_str": date_str,
+                        "scene_id": str(ds.attrs.get("scene_id", scene_id)),
+                        "valid_pct": swath_pct,
+                        "reason": f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)",
+                    }
+                )
+                continue
+
             masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=use_cloud_mask)
             layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=idx_key)
             stats = compute_index_stats(layer_da, resolution_m=float(resolution))
@@ -677,12 +748,15 @@ def generate_timelapse_frames(
     duration_ms: int = 800,
     max_width: int = 700,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    min_swath_coverage_pct: float = 85.0,
 ) -> dict[str, Any]:
     """Generate a memory-safe visual timelapse (compact PNG frames + animated GIF).
 
-    Loads strictly one mosaicked acquisition date at a time, aligns frames onto a
-    consistent pixel grid, stamps each frame with ``YYYY-MM-DD | Platform``, frees
-    raster memory via ``gc.collect()`` after every frame, and compiles a looping GIF.
+    Loads strictly one mosaicked acquisition date at a time, skips partial-swath
+    frames (< ``min_swath_coverage_pct`` non-NoData pixels before cloud masking),
+    aligns frames onto a consistent pixel grid, stamps each frame with
+    ``YYYY-MM-DD | Platform``, frees raster memory via ``gc.collect()`` after
+    every frame, and compiles a looping GIF.
     """
     mode = layer_mode.strip().upper()
     is_sar = sensor == SENSOR_S1
@@ -734,6 +808,25 @@ def generate_timelapse_frames(
             platform_lbl = _format_platform_stamp(str(ds.attrs.get("platform", platform_raw)), sensor)
             stamp = f"{date_str} | {platform_lbl} | {mode}"
             merged_scene_id = str(ds.attrs.get("scene_id", scene_id))
+
+            swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
+            if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
+                logger.info(
+                    "Timelapse skipped %s (%s): partial swath coverage %.1f%% < %.0f%%.",
+                    date_str,
+                    merged_scene_id,
+                    swath_pct,
+                    min_swath_coverage_pct,
+                )
+                skipped.append(
+                    {
+                        "date_str": date_str,
+                        "scene_id": merged_scene_id,
+                        "valid_pct": swath_pct,
+                        "reason": f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)",
+                    }
+                )
+                continue
 
             if is_rgb_composite:
                 # Check valid pixel coverage across the 3 composite bands

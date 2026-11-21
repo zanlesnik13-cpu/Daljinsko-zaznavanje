@@ -19,7 +19,7 @@ from __future__ import annotations
 import gc
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence, Union
 
 # Ensure GDAL/rasterio honors custom system/proxy CA bundles before library init
@@ -35,6 +35,9 @@ import pystac
 import rioxarray  # noqa: F401 - registers the .rio accessor on xarray objects
 import xarray as xr
 from pystac_client import Client
+from shapely.geometry import box as shapely_box
+from shapely.geometry import shape as shapely_shape
+from shapely.ops import unary_union as shapely_unary_union
 
 from geodezija_crs import clip_to_aoi_polygon
 
@@ -48,6 +51,31 @@ SENSOR_S1: str = "sentinel-1-rtc"
 SENTINEL2_COLLECTION: str = SENSOR_S2
 LANDSAT_COLLECTION: str = SENSOR_LANDSAT
 SENTINEL1_COLLECTION: str = SENSOR_S1
+
+# Historical archive bounds, operational Landsat missions & swath coverage defaults
+HISTORICAL_MIN_DATE: date = date(1984, 1, 1)
+DEFAULT_MIN_AOI_COVERAGE_PCT: float = 90.0
+LANDSAT_OPERATIONAL_PLATFORMS: list[str] = [
+    "landsat-4",
+    "landsat-5",
+    "landsat-7",
+    "landsat-8",
+    "landsat-9",
+]
+
+# Temporal sampling interval identifiers
+INTERVAL_ALL: str = "all"
+INTERVAL_14D: str = "14d"
+INTERVAL_MONTHLY: str = "monthly"
+INTERVAL_SEASONAL: str = "seasonal"
+INTERVAL_YEARLY: str = "yearly"
+TEMPORAL_INTERVAL_KEYS: tuple[str, ...] = (
+    INTERVAL_ALL,
+    INTERVAL_14D,
+    INTERVAL_MONTHLY,
+    INTERVAL_SEASONAL,
+    INTERVAL_YEARLY,
+)
 
 # ESA Sentinel-2 Processing Baseline 04.00 activation date (added +1000 BOA offset)
 PB04_START_UTC: datetime = datetime(2022, 1, 25, 0, 0, 0, tzinfo=timezone.utc)
@@ -114,6 +142,7 @@ SUMMARY_COLUMNS: list[str] = [
     "datetime",
     "date_str",
     "cloud_cover",
+    "coverage_pct",
     "mgrs_tile",
     "platform",
 ]
@@ -307,12 +336,186 @@ def _merge_group_metadata(items: Sequence[pystac.Item], sensor: str) -> dict[str
     }
 
 
+def _coerce_date(value: str | date | datetime) -> date:
+    """Convert a date, datetime, or ISO string into a calendar ``date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    return date.fromisoformat(raw[:10])
+
+
+def _build_stac_date_windows(
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    chunk_years: int = 5,
+) -> list[str]:
+    """Split spans > 3 years into multi-year STAC windows so old decades are never truncated."""
+    d_start = _coerce_date(start_date)
+    d_end = _coerce_date(end_date)
+    if d_end < d_start:
+        d_start, d_end = d_end, d_start
+
+    span_days = (d_end - d_start).days
+    if span_days <= 3 * 365:
+        return [f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"]
+
+    windows: list[str] = []
+    cur_start = d_start
+    while cur_start <= d_end:
+        try:
+            next_year_start = date(cur_start.year + chunk_years, cur_start.month, cur_start.day)
+        except ValueError:
+            next_year_start = date(cur_start.year + chunk_years, cur_start.month, 28)
+        cur_end = min(d_end, next_year_start - timedelta(days=1))
+        windows.append(f"{cur_start.isoformat()}/{cur_end.isoformat()}")
+        cur_start = cur_end + timedelta(days=1)
+
+    return windows
+
+
+def _fetch_stac_items_full(
+    *,
+    collection: str,
+    bbox_4326: Sequence[float],
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    query: dict[str, Any] | None = None,
+    max_items_per_window: int = 1000,
+    page_limit: int = 250,
+) -> list[pystac.Item]:
+    """Fetch STAC items across the entire requested historical span without cutting off older years.
+
+    Uses a single shared unsigned STAC API client iterating cleanly across 5-year windows
+    (avoiding SAS signing overhead and API burst rate-limits at search time; items are
+    freshly signed inside ``load_*_scene`` right before COG streaming).
+    """
+    from pystac_client.stac_api_io import StacApiIO
+
+    bbox_floats = [float(v) for v in bbox_4326]
+    windows = _build_stac_date_windows(start_date, end_date, chunk_years=5)
+    per_window_cap = max_items_per_window if len(windows) == 1 else min(max_items_per_window, 500)
+
+    catalog = Client.open(STAC_API_URL, stac_io=StacApiIO(timeout=25))
+    raw_items: list[pystac.Item] = []
+
+    for dt_range in windows:
+        kwargs: dict[str, Any] = {
+            "collections": [collection],
+            "bbox": bbox_floats,
+            "datetime": dt_range,
+            "limit": int(page_limit),
+            "max_items": int(per_window_cap),
+        }
+        if query:
+            kwargs["query"] = query
+        search = catalog.search(**kwargs)
+        raw_items.extend(search.items())
+
+    # Deduplicate by STAC item ID in case window boundaries overlap
+    seen_ids: set[str] = set()
+    unique_items: list[pystac.Item] = []
+    for it in raw_items:
+        if it.id not in seen_ids:
+            seen_ids.add(it.id)
+            unique_items.append(it)
+    return unique_items
+
+
+def _build_aoi_geom_4326(
+    bbox_4326: Sequence[float] | None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+):
+    """Build a valid Shapely polygon in EPSG:4326 for fast STAC footprint coverage checks."""
+    if aoi_polygon_4326 is not None:
+        try:
+            geom = shapely_shape(aoi_polygon_4326)
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            if not geom.is_empty and geom.area > 0:
+                return geom
+        except Exception:
+            pass
+    if bbox_4326 is not None and len(bbox_4326) == 4:
+        min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox_4326)
+        if min_lon < max_lon and min_lat < max_lat:
+            return shapely_box(min_lon, min_lat, max_lon, max_lat)
+    return None
+
+
+def _compute_group_aoi_coverage_pct(
+    day_items: Sequence[pystac.Item],
+    aoi_geom: Any,
+) -> float:
+    """Compute geometric AOI coverage [%] from the union of same-day STAC item footprints."""
+    if aoi_geom is None or aoi_geom.is_empty or aoi_geom.area <= 0:
+        return 100.0
+
+    geoms = []
+    for it in day_items:
+        g = None
+        if getattr(it, "geometry", None):
+            try:
+                g = shapely_shape(it.geometry)
+                if not g.is_valid:
+                    g = g.buffer(0)
+            except Exception:
+                g = None
+        if (g is None or g.is_empty) and getattr(it, "bbox", None) and len(it.bbox) >= 4:
+            try:
+                g = shapely_box(float(it.bbox[0]), float(it.bbox[1]), float(it.bbox[2]), float(it.bbox[3]))
+            except Exception:
+                g = None
+        if g is not None and not g.is_empty:
+            geoms.append(g)
+
+    if not geoms:
+        return 0.0
+
+    try:
+        union_geom = geoms[0] if len(geoms) == 1 else shapely_unary_union(geoms)
+        if not union_geom.is_valid:
+            union_geom = union_geom.buffer(0)
+        inter_area = float(union_geom.intersection(aoi_geom).area)
+        cov = (inter_area / float(aoi_geom.area)) * 100.0
+        return round(float(np.clip(cov, 0.0, 100.0)), 1)
+    except Exception:
+        return 100.0
+
+
+class _NoDeepCopyDict(dict):
+    """Dict subclass for ``DataFrame.attrs`` that prevents Pandas from deep-copying ``pystac.Item`` trees."""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_NoDeepCopyDict":
+        return self
+
+
+class _ShallowAttrBox:
+    """Lightweight holder for ``DataFrame.attrs`` entries that must not be deep-copied by Pandas."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_ShallowAttrBox":
+        return self
+
+
 def group_items_by_date(
     items: Sequence[pystac.Item],
     sensor: str,
     limit: int | None = None,
+    bbox_4326: Sequence[float] | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = 0.0,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Group STAC items by acquisition date (``YYYY-MM-DD``) for seamless tile mosaicking.
+
+    Computes geometric AOI footprint coverage ``coverage_pct`` for every date using the
+    union of all same-day tiles and optionally filters out partial-swath dates with
+    ``coverage_pct < min_coverage_pct``.
 
     Returns ``(grouped_items, summary_df)`` ordered newest-first, where each entry
     in ``grouped_items`` is the list of all STAC items from that acquisition date
@@ -321,7 +524,12 @@ def group_items_by_date(
     """
     if not items:
         empty_df = pd.DataFrame(columns=SUMMARY_COLUMNS)
-        empty_df.attrs["items_by_date"] = {}
+        empty_df.attrs["items_by_date"] = _NoDeepCopyDict()
+        empty_df.attrs["total_dates_before_coverage_filter"] = 0
+        empty_df.attrs["filtered_partial_dates"] = 0
+        empty_df.attrs["total_dates_found"] = 0
+        empty_df.attrs["selected_dates_count"] = 0
+        empty_df.attrs["interval_mode"] = INTERVAL_ALL
         return [], empty_df
 
     buckets: dict[str, list[pystac.Item]] = {}
@@ -330,16 +538,22 @@ def group_items_by_date(
         date_str = dt_utc.strftime("%Y-%m-%d")
         buckets.setdefault(date_str, []).append(it)
 
+    aoi_geom = _build_aoi_geom_4326(bbox_4326, aoi_polygon_4326)
     sorted_dates = sorted(buckets.keys(), reverse=True)
-    if limit is not None and int(limit) > 0:
-        sorted_dates = sorted_dates[: int(limit)]
+    total_before_cov = len(sorted_dates)
+    filtered_partial = 0
 
     grouped_items: list[list[pystac.Item]] = []
-    items_by_date: dict[str, list[pystac.Item]] = {}
+    items_by_date: _NoDeepCopyDict = _NoDeepCopyDict()
     rows: list[dict[str, object]] = []
 
     for date_str in sorted_dates:
         day_items = buckets[date_str]
+        cov_pct = _compute_group_aoi_coverage_pct(day_items, aoi_geom)
+        if min_coverage_pct > 0.0 and cov_pct < float(min_coverage_pct):
+            filtered_partial += 1
+            continue
+
         if sensor == SENSOR_S1:
             day_items.sort(
                 key=lambda it: (_extract_item_datetime_utc(it), it.id),
@@ -366,14 +580,133 @@ def group_items_by_date(
                 "datetime": pd.Timestamp(meta["datetime"]),
                 "date_str": meta["date_str"],
                 "cloud_cover": meta["cloud_cover"],
+                "coverage_pct": cov_pct,
                 "mgrs_tile": meta["mgrs_tile"],
                 "platform": meta["platform"],
             }
         )
 
+    if limit is not None and int(limit) > 0 and len(rows) > int(limit):
+        keep_n = int(limit)
+        rows = rows[:keep_n]
+        grouped_items = grouped_items[:keep_n]
+        keep_dates = {str(r["date_str"]) for r in rows}
+        items_by_date = _NoDeepCopyDict({d: v for d, v in items_by_date.items() if d in keep_dates})
+
     summary_df = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
     summary_df.attrs["items_by_date"] = items_by_date
+    summary_df.attrs["total_dates_before_coverage_filter"] = total_before_cov
+    summary_df.attrs["filtered_partial_dates"] = filtered_partial
+    summary_df.attrs["total_dates_found"] = len(summary_df)
+    summary_df.attrs["selected_dates_count"] = len(summary_df)
+    summary_df.attrs["interval_mode"] = INTERVAL_ALL
     return grouped_items, summary_df
+
+
+def filter_by_temporal_interval(
+    df_dates: pd.DataFrame,
+    items_by_date: dict[str, list[pystac.Item]],
+    interval_mode: str = INTERVAL_ALL,
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Select the single best/clearest date per temporal bucket (14d / monthly / seasonal / yearly).
+
+    For each bucket picks the date with the highest ``coverage_pct`` and lowest ``cloud_cover``.
+    For ``yearly`` mode applies a subtle preference for growing-season/summer months (May–Sep)
+    among full-coverage dates so multi-year vegetation/land-cover comparisons stay consistent.
+
+    Returns ``(grouped_items, filtered_df)`` ordered newest-first.
+    """
+    mode = str(interval_mode or INTERVAL_ALL).strip().lower()
+    if mode not in TEMPORAL_INTERVAL_KEYS:
+        mode = INTERVAL_ALL
+
+    base_total = int(len(df_dates))
+    base_before_cov = int(df_dates.attrs.get("total_dates_before_coverage_filter", base_total))
+    base_partial = int(df_dates.attrs.get("filtered_partial_dates", 0))
+
+    if df_dates.empty:
+        empty_df = pd.DataFrame(columns=SUMMARY_COLUMNS)
+        empty_df.attrs["items_by_date"] = _NoDeepCopyDict()
+        empty_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
+        empty_df.attrs["filtered_partial_dates"] = base_partial
+        empty_df.attrs["total_dates_found"] = 0
+        empty_df.attrs["selected_dates_count"] = 0
+        empty_df.attrs["interval_mode"] = mode
+        return [], empty_df
+
+    # Extract lightweight plain records without triggering DataFrame.attrs deep copies
+    records = df_dates.to_dict(orient="records")
+
+    if mode == INTERVAL_ALL:
+        valid_recs = [r for r in records if str(r["date_str"]) in items_by_date]
+        valid_recs.sort(key=lambda r: str(r["date_str"]), reverse=True)
+        ordered_df = pd.DataFrame(valid_recs, columns=SUMMARY_COLUMNS)
+        grouped = [items_by_date[str(r["date_str"])] for r in valid_recs]
+        ordered_df.attrs["items_by_date"] = _NoDeepCopyDict(
+            {str(r["date_str"]): items_by_date[str(r["date_str"])] for r in valid_recs}
+        )
+        ordered_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
+        ordered_df.attrs["filtered_partial_dates"] = base_partial
+        ordered_df.attrs["total_dates_found"] = base_total
+        ordered_df.attrs["selected_dates_count"] = len(ordered_df)
+        ordered_df.attrs["interval_mode"] = mode
+        return grouped, ordered_df
+
+    buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for rec in records:
+        d_str = str(rec["date_str"])
+        if d_str not in items_by_date:
+            continue
+        dt_val = date.fromisoformat(d_str[:10])
+        if mode == INTERVAL_14D:
+            doy = dt_val.timetuple().tm_yday
+            bucket_key = (dt_val.year, (doy - 1) // 14)
+        elif mode == INTERVAL_MONTHLY:
+            bucket_key = (dt_val.year, dt_val.month)
+        elif mode == INTERVAL_SEASONAL:
+            bucket_key = (dt_val.year, (dt_val.month - 1) // 3)
+        else:  # INTERVAL_YEARLY
+            bucket_key = (dt_val.year, 0)
+
+        rec_copy = dict(rec)
+        rec_copy["_month"] = dt_val.month
+        buckets.setdefault(bucket_key, []).append(rec_copy)
+
+    selected_rows: list[dict[str, Any]] = []
+    for bucket_key in sorted(buckets.keys(), reverse=True):
+        cands = buckets[bucket_key]
+
+        def _cand_rank(r: dict[str, Any]) -> tuple[float, int, float, int, str]:
+            cov_raw = r.get("coverage_pct", 100.0)
+            cov = float(cov_raw) if pd.notna(cov_raw) else 100.0
+            cld_raw = r.get("cloud_cover", np.nan)
+            cld = float(cld_raw) if pd.notna(cld_raw) else 50.0
+            month = int(r.get("_month", 7))
+            if mode == INTERVAL_YEARLY:
+                # Highest rounded coverage first, then subtle growing-season preference (May-Sep),
+                # then lowest cloud cover, then closest to mid-July.
+                summer_pen = 0 if (5 <= month <= 9) else 1
+                return (-round(cov, 0), summer_pen, cld, abs(month - 7), str(r["date_str"]))
+            return (-round(cov, 1), 0, cld, 0, str(r["date_str"]))
+
+        best = min(cands, key=_cand_rank)
+        best.pop("_month", None)
+        selected_rows.append(best)
+
+    selected_rows.sort(key=lambda r: str(r["date_str"]), reverse=True)
+    filtered_df = pd.DataFrame(selected_rows, columns=SUMMARY_COLUMNS)
+    grouped_items = [items_by_date[str(r["date_str"])] for r in selected_rows]
+    filtered_items_by_date = _NoDeepCopyDict(
+        {str(r["date_str"]): items_by_date[str(r["date_str"])] for r in selected_rows}
+    )
+
+    filtered_df.attrs["items_by_date"] = filtered_items_by_date
+    filtered_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
+    filtered_df.attrs["filtered_partial_dates"] = base_partial
+    filtered_df.attrs["total_dates_found"] = base_total
+    filtered_df.attrs["selected_dates_count"] = len(filtered_df)
+    filtered_df.attrs["interval_mode"] = mode
+    return grouped_items, filtered_df
 
 
 def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
@@ -423,6 +756,49 @@ def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
     return xr.Dataset(data_vars=collapsed, coords=spatial_coords, attrs=dict(raw_ds.attrs))
 
 
+def _finalize_search_results(
+    raw_items: Sequence[pystac.Item],
+    *,
+    sensor: str,
+    bbox_4326: Sequence[float],
+    aoi_polygon_4326: dict[str, Any] | None,
+    min_coverage_pct: float,
+    interval_mode: str,
+    limit: int | None,
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Group by date, filter partial swaths, apply temporal interval, and attach raw archive metadata."""
+    # Group all full-coverage dates first (without premature limit) so interval bucketing spans all years
+    _, full_df = group_items_by_date(
+        raw_items,
+        sensor=sensor,
+        limit=None,
+        bbox_4326=bbox_4326,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=float(min_coverage_pct),
+    )
+    raw_items_by_date = _NoDeepCopyDict(full_df.attrs.get("items_by_date", {}))
+
+    grouped_items, final_df = filter_by_temporal_interval(
+        full_df,
+        raw_items_by_date,
+        interval_mode=interval_mode,
+    )
+
+    if limit is not None and int(limit) > 0 and len(final_df) > int(limit):
+        keep_n = int(limit)
+        final_df = final_df.iloc[:keep_n].reset_index(drop=True)
+        grouped_items = grouped_items[:keep_n]
+        keep_dates = set(final_df["date_str"].astype(str))
+        final_df.attrs["items_by_date"] = _NoDeepCopyDict(
+            {d: v for d, v in final_df.attrs.get("items_by_date", {}).items() if d in keep_dates}
+        )
+        final_df.attrs["selected_dates_count"] = len(final_df)
+
+    final_df.attrs["raw_summary_df"] = full_df
+    final_df.attrs["raw_items_by_date"] = raw_items_by_date
+    return grouped_items, final_df
+
+
 # ---------------------------------------------------------------------------
 # 1. SENTINEL-2 L2A
 # ---------------------------------------------------------------------------
@@ -431,28 +807,35 @@ def search_sentinel2(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
-    limit: int = 50,
+    limit: int | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
+    interval_mode: str = INTERVAL_ALL,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
-    """Search Sentinel-2 L2A scenes on Planetary Computer, grouped by acquisition date."""
+    """Search Sentinel-2 L2A scenes on Planetary Computer, grouped by date with coverage & interval filters."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
 
-    datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
-    raw_fetch_limit = max(int(limit) * 4, 150)
-
-    catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
-    search = catalog.search(
-        collections=[SENTINEL2_COLLECTION],
-        bbox=[float(v) for v in bbox_4326],
-        datetime=datetime_range,
+    raw_items = _fetch_stac_items_full(
+        collection=SENTINEL2_COLLECTION,
+        bbox_4326=bbox_4326,
+        start_date=start_date,
+        end_date=end_date,
         query={"eo:cloud_cover": {"lte": float(max_cloud_cover)}},
-        max_items=raw_fetch_limit,
+        max_items_per_window=1000,
+        page_limit=250,
     )
-
-    raw_items = list(search.items())
-    return group_items_by_date(raw_items, sensor=SENSOR_S2, limit=int(limit))
+    return _finalize_search_results(
+        raw_items,
+        sensor=SENSOR_S2,
+        bbox_4326=bbox_4326,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=min_coverage_pct,
+        interval_mode=interval_mode,
+        limit=limit,
+    )
 
 
 def load_sentinel2_scene(
@@ -594,33 +977,42 @@ def search_landsat(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
-    limit: int = 50,
+    limit: int | None = None,
     exclude_l7_slc_off: bool = False,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
+    interval_mode: str = INTERVAL_ALL,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
-    """Search Landsat 4/5/7/8/9 Collection 2 Level-2 scenes, grouped by acquisition date."""
+    """Search Landsat 4/5/7/8/9 Collection 2 Level-2 scenes across the full 1984–present archive."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
 
-    datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
-    catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
-
-    # Fetch extra items to avoid splitting same-day adjacent paths/rows or starving after L7 filtering
-    fetch_limit = max(int(limit) * 6, 200) if exclude_l7_slc_off else max(int(limit) * 4, 150)
-    search = catalog.search(
-        collections=[LANDSAT_COLLECTION],
-        bbox=[float(v) for v in bbox_4326],
-        datetime=datetime_range,
-        query={"eo:cloud_cover": {"lte": float(max_cloud_cover)}},
-        max_items=fetch_limit,
+    raw_items = _fetch_stac_items_full(
+        collection=LANDSAT_COLLECTION,
+        bbox_4326=bbox_4326,
+        start_date=start_date,
+        end_date=end_date,
+        query={
+            "eo:cloud_cover": {"lte": float(max_cloud_cover)},
+            "platform": {"in": LANDSAT_OPERATIONAL_PLATFORMS},
+        },
+        max_items_per_window=1000,
+        page_limit=250,
     )
-
-    raw_items = list(search.items())
     if exclude_l7_slc_off:
         raw_items = [it for it in raw_items if not _is_landsat7_slc_off(it)]
 
-    return group_items_by_date(raw_items, sensor=SENSOR_LANDSAT, limit=int(limit))
+    return _finalize_search_results(
+        raw_items,
+        sensor=SENSOR_LANDSAT,
+        bbox_4326=bbox_4326,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=min_coverage_pct,
+        interval_mode=interval_mode,
+        limit=limit,
+    )
 
 
 def load_landsat_scene(
@@ -769,27 +1161,35 @@ def search_sentinel1(
     bbox_4326: Sequence[float],
     start_date: str | date | datetime,
     end_date: str | date | datetime,
-    limit: int = 50,
+    limit: int | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
+    interval_mode: str = INTERVAL_ALL,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
-    """Search Sentinel-1 SAR RTC scenes on Planetary Computer, grouped by acquisition date."""
+    """Search Sentinel-1 SAR RTC scenes on Planetary Computer, grouped by date with coverage & interval filters."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
 
-    datetime_range = f"{_format_date_bound(start_date)}/{_format_date_bound(end_date)}"
-    raw_fetch_limit = max(int(limit) * 4, 150)
-
-    catalog = Client.open(STAC_API_URL, modifier=planetary_computer.sign_inplace)
-    search = catalog.search(
-        collections=[SENTINEL1_COLLECTION],
-        bbox=[float(v) for v in bbox_4326],
-        datetime=datetime_range,
-        max_items=raw_fetch_limit,
+    raw_items = _fetch_stac_items_full(
+        collection=SENTINEL1_COLLECTION,
+        bbox_4326=bbox_4326,
+        start_date=start_date,
+        end_date=end_date,
+        query=None,
+        max_items_per_window=1000,
+        page_limit=250,
     )
-
-    raw_items = list(search.items())
-    return group_items_by_date(raw_items, sensor=SENSOR_S1, limit=int(limit))
+    return _finalize_search_results(
+        raw_items,
+        sensor=SENSOR_S1,
+        bbox_4326=bbox_4326,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=min_coverage_pct,
+        interval_mode=interval_mode,
+        limit=limit,
+    )
 
 
 def load_sentinel1_scene(
@@ -907,10 +1307,13 @@ def search_scenes(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
-    limit: int = 50,
+    limit: int | None = None,
     exclude_l7_slc_off: bool = False,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
+    interval_mode: str = INTERVAL_ALL,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
-    """Dispatch date-grouped STAC search to Sentinel-2 L2A, Landsat C2 L2, or Sentinel-1 RTC."""
+    """Dispatch full-archive date-grouped STAC search with coverage & temporal interval filters."""
     if sensor == SENSOR_S2:
         return search_sentinel2(
             bbox_4326=bbox_4326,
@@ -918,6 +1321,9 @@ def search_scenes(
             end_date=end_date,
             max_cloud_cover=max_cloud_cover,
             limit=limit,
+            aoi_polygon_4326=aoi_polygon_4326,
+            min_coverage_pct=min_coverage_pct,
+            interval_mode=interval_mode,
         )
     if sensor == SENSOR_LANDSAT:
         return search_landsat(
@@ -927,6 +1333,9 @@ def search_scenes(
             max_cloud_cover=max_cloud_cover,
             limit=limit,
             exclude_l7_slc_off=exclude_l7_slc_off,
+            aoi_polygon_4326=aoi_polygon_4326,
+            min_coverage_pct=min_coverage_pct,
+            interval_mode=interval_mode,
         )
     if sensor == SENSOR_S1:
         return search_sentinel1(
@@ -934,6 +1343,9 @@ def search_scenes(
             start_date=start_date,
             end_date=end_date,
             limit=limit,
+            aoi_polygon_4326=aoi_polygon_4326,
+            min_coverage_pct=min_coverage_pct,
+            interval_mode=interval_mode,
         )
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")
 

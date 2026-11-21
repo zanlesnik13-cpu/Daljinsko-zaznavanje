@@ -387,6 +387,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "comp_mode_rgb_nir_pill": "RGB / NIR",
         "crs_pill_d96": "D96/TM (EPSG:3794)",
         "crs_pill_utm": "UTM 33N (EPSG:32633)",
+        # Part 4: 1984 date limit, full historical search, 90% swath filter & temporal intervals
+        "t3_preset_10y": "10 let",
+        "t3_preset_1984": "1984–danes (Landsat)",
+        "exclude_partial_label": "Izključi delne / odrezane posnetke (< 90 % pokritosti AOI)",
+        "exclude_partial_help": (
+            "Pred nalaganjem rastrov izračuna geometrijsko pokritost AOI iz unije vseh istodnevnih posnetkov "
+            "in izloči delne prelete (< 90 %). V časovnih vrstah in Timelapse dodatno izloči posnetke z < 85 % veljavnih pikslov."
+        ),
+        "col_coverage": "Pokritost AOI [%]",
+        "interval_label": "Časovni korak / Interval vzorčenja:",
+        "interval_help": "Iz vsakega časovnega okna samodejno izbere en sam najboljši posnetek (najvišja pokritost AOI, nato najnižja oblačnost; pri letnem rahlo prednost poletju maj–sep).",
+        "interval_all": "Vsi posnetki",
+        "interval_14d": "Vsakih 14 dni",
+        "interval_monthly": "Mesečno",
+        "interval_seasonal": "Sezonsko (3 mes.)",
+        "interval_yearly": "Letno",
+        "interval_summary_caption": "Izbranih **{sel}** reprezentativnih datumov (interval: **{interval}**) izmed **{total}** najdenih datumov{partial_note}.",
+        "partial_filtered_note": " · {n} delnih posnetkov (< 90 % AOI) izločenih",
+        "sensor_min_date_hint": "Arhiv senzorja {sensor} se začne leta {year}. Za starejše posnetke (od 1984) preklopite na Landsat.",
     },
     "en": {
         # App chrome & header
@@ -770,6 +789,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "comp_mode_rgb_nir_pill": "RGB / NIR",
         "crs_pill_d96": "D96/TM (EPSG:3794)",
         "crs_pill_utm": "UTM 33N (EPSG:32633)",
+        # Part 4: 1984 date limit, full historical search, 90% swath filter & temporal intervals
+        "t3_preset_10y": "10 years",
+        "t3_preset_1984": "1984–present (Landsat)",
+        "exclude_partial_label": "Exclude partial / cut-off scenes (< 90% AOI coverage)",
+        "exclude_partial_help": (
+            "Computes geometric AOI coverage from the union of same-day STAC footprints before loading "
+            "rasters and excludes partial passes (< 90%). Time Series and Timelapse also skip scenes with < 85% valid swath pixels."
+        ),
+        "col_coverage": "AOI Coverage [%]",
+        "interval_label": "Temporal Sampling Interval:",
+        "interval_help": "Automatically picks the single best date per time window (highest AOI coverage, then lowest cloud cover; subtle May–Sep preference for Yearly mode).",
+        "interval_all": "All scenes",
+        "interval_14d": "Every 14 days",
+        "interval_monthly": "Monthly",
+        "interval_seasonal": "Seasonal (3 mo.)",
+        "interval_yearly": "Yearly",
+        "interval_summary_caption": "Selected **{sel}** representative dates (interval: **{interval}**) out of **{total}** matching dates{partial_note}.",
+        "partial_filtered_note": " · {n} partial scenes (< 90% AOI) excluded",
+        "sensor_min_date_hint": "{sensor} archive starts in {year}. Switch to Landsat for historical scenes back to 1984.",
     },
 }
 

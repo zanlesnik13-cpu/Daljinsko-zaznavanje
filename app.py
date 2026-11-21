@@ -105,9 +105,18 @@ from geodezija_crs import (
 )
 from i18n import t
 from stac_loader import (
+    DEFAULT_MIN_AOI_COVERAGE_PCT,
+    HISTORICAL_MIN_DATE,
+    INTERVAL_14D,
+    INTERVAL_ALL,
+    INTERVAL_MONTHLY,
+    INTERVAL_SEASONAL,
+    INTERVAL_YEARLY,
     SENSOR_LANDSAT,
     SENSOR_S1,
     SENSOR_S2,
+    TEMPORAL_INTERVAL_KEYS,
+    filter_by_temporal_interval,
     load_scene,
     search_scenes,
 )
@@ -598,6 +607,15 @@ SAR_VIS_SPECS: dict[str, dict[str, Any]] = {
 INDEX_KEYS: list[str] = ["NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
 SAR_METRIC_KEYS: list[str] = ["VV", "VH", "VV_VH"]
 
+INTERVAL_KEYS: list[str] = list(TEMPORAL_INTERVAL_KEYS)
+INTERVAL_I18N: dict[str, str] = {
+    INTERVAL_ALL: "interval_all",
+    INTERVAL_14D: "interval_14d",
+    INTERVAL_MONTHLY: "interval_monthly",
+    INTERVAL_SEASONAL: "interval_seasonal",
+    INTERVAL_YEARLY: "interval_yearly",
+}
+
 
 # ---------------------------------------------------------------------------
 # Pomožne funkcije: stanje seje, sinhronizacija senzorja/datumov, iskanje STAC
@@ -623,6 +641,12 @@ def _init_session_state() -> None:
         "sidebar_max_cloud": 20,
         "tab3_max_cloud": 20,
         "exclude_l7_slc_off": False,
+        "exclude_partial_swaths": True,
+        "sidebar_exclude_partial": True,
+        "tab3_exclude_partial": True,
+        "temporal_interval": INTERVAL_ALL,
+        "sidebar_interval_select": INTERVAL_ALL,
+        "tab3_interval_select": INTERVAL_ALL,
         "map_basemap": "satellite",
         "loc_search_mode": "place",
         "sidebar_aoi_mode": "map",
@@ -640,6 +664,8 @@ def _init_session_state() -> None:
         "draw_map_version": 0,
         "stac_items": [],
         "stac_summary_df": pd.DataFrame(),
+        "stac_raw_summary_df": pd.DataFrame(),
+        "stac_raw_items_by_date": {},
         "search_performed": False,
         "search_sensor": SENSOR_S2,
         "search_bbox_4326": None,
@@ -731,9 +757,10 @@ def _clear_loaded_products() -> None:
 
 
 def _clamp_dates_for_sensor(sensor_key: str) -> None:
-    """Zagotovi, da sta začetni in končni datum znotraj veljavnega razpona za izbrani senzor."""
+    """Zagotovi, da sta začetni in končni datum znotraj razpona [1984-01-01, danes]."""
+    _ = sensor_key
     today = date.today()
-    min_d: date = SENSOR_META[sensor_key]["min_date"]
+    min_d: date = HISTORICAL_MIN_DATE
     cur_start: date = st.session_state.get("search_start_date", today - timedelta(days=183))
     cur_end: date = st.session_state.get("search_end_date", today)
     if cur_start < min_d:
@@ -775,6 +802,8 @@ def _sync_sensor_state(source_key: str | None = None, explicit_sensor: str | Non
     if new_sensor != prev_sensor:
         st.session_state["stac_items"] = []
         st.session_state["stac_summary_df"] = pd.DataFrame()
+        st.session_state["stac_raw_summary_df"] = pd.DataFrame()
+        st.session_state["stac_raw_items_by_date"] = {}
         st.session_state["search_performed"] = False
         st.session_state["search_sensor"] = new_sensor
         st.session_state["last_rec_res_key"] = None
@@ -810,19 +839,56 @@ def _sync_max_cloud_state(source_key: str) -> None:
         st.session_state["tab3_max_cloud"] = c_int
 
 
+def _sync_partial_filter_state(source_key: str) -> None:
+    val = bool(st.session_state.get(source_key, True))
+    st.session_state["exclude_partial_swaths"] = val
+    st.session_state["sidebar_exclude_partial"] = val
+    st.session_state["tab3_exclude_partial"] = val
+
+
+def _sync_interval_state(source_key: str | None = None, explicit_interval: str | None = None) -> None:
+    """Sinhronizira časovni korak med stransko vrstico in Zavihkom 3 ter takoj prefiltrira obstoječe rezultate."""
+    prev_int = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
+    raw_val = (
+        explicit_interval
+        if explicit_interval is not None
+        else st.session_state.get(source_key or "temporal_interval", prev_int)
+    )
+    new_int = raw_val if raw_val in INTERVAL_KEYS else prev_int
+
+    st.session_state["temporal_interval"] = new_int
+    st.session_state["sidebar_interval_select"] = new_int
+    st.session_state["tab3_interval_select"] = new_int
+
+    raw_df = st.session_state.get("stac_raw_summary_df")
+    raw_by_date = st.session_state.get("stac_raw_items_by_date")
+    if (
+        st.session_state.get("search_performed", False)
+        and isinstance(raw_df, pd.DataFrame)
+        and not raw_df.empty
+        and isinstance(raw_by_date, dict)
+        and raw_by_date
+    ):
+        grouped_f, df_f = filter_by_temporal_interval(raw_df, raw_by_date, interval_mode=new_int)
+        df_f.attrs["raw_summary_df"] = raw_df
+        df_f.attrs["raw_items_by_date"] = raw_by_date
+        st.session_state["stac_items"] = grouped_f
+        st.session_state["stac_summary_df"] = df_f
+        st.session_state["pending_reset_scene_widgets"] = True
+
+
 def _apply_tab3_date_preset(preset_code: str) -> None:
-    """Hitro nastavi časovno obdobje (in pri 1990+ samodejno preklopi na Landsat) v Zavihku 3."""
+    """Hitro nastavi časovno obdobje (in pri 1984/1990+ samodejno preklopi na Landsat + Letno) v Zavihku 3."""
     today = date.today()
-    if preset_code == "1990_landsat":
+    if preset_code in ("1984_landsat", "1990_landsat"):
         _sync_sensor_state(explicit_sensor=SENSOR_LANDSAT)
-        target_start = date(1990, 1, 1)
+        target_start = date(1984, 1, 1) if preset_code == "1984_landsat" else date(1990, 1, 1)
+        _sync_interval_state(explicit_interval=INTERVAL_YEARLY)
     else:
-        days_map = {"6m": 183, "2y": 730, "5y": 1826}
+        days_map = {"6m": 183, "2y": 730, "5y": 1826, "10y": 3652}
         target_start = today - timedelta(days=days_map.get(preset_code, 183))
-        cur_sensor = st.session_state.get("selected_sensor", SENSOR_S2)
-        min_d = SENSOR_META[cur_sensor]["min_date"]
-        if target_start < min_d:
-            target_start = min_d
+        if target_start < HISTORICAL_MIN_DATE:
+            target_start = HISTORICAL_MIN_DATE
 
     st.session_state["search_start_date"] = target_start
     st.session_state["search_end_date"] = today
@@ -830,6 +896,24 @@ def _apply_tab3_date_preset(preset_code: str) -> None:
     st.session_state["sidebar_end_date"] = today
     st.session_state["tab3_start_date"] = target_start
     st.session_state["tab3_end_date"] = today
+
+
+def _format_interval_summary_caption(summary_df: pd.DataFrame, lang: str) -> str:
+    """Sestavi jasen povzetek števila najdenih vs. izbranih reprezentativnih datumov in izločenih delnih preletov."""
+    sel_n = int(len(summary_df))
+    total_n = int(summary_df.attrs.get("total_dates_found", sel_n))
+    partial_n = int(summary_df.attrs.get("filtered_partial_dates", 0))
+    int_mode = str(summary_df.attrs.get("interval_mode", st.session_state.get("temporal_interval", INTERVAL_ALL)))
+    int_label = t(INTERVAL_I18N.get(int_mode, "interval_all"), lang=lang)
+    partial_note = t("partial_filtered_note", lang=lang, n=partial_n) if partial_n > 0 else ""
+    return t(
+        "interval_summary_caption",
+        lang=lang,
+        sel=sel_n,
+        interval=int_label,
+        total=total_n,
+        partial_note=partial_note,
+    )
 
 
 def _execute_stac_search(
@@ -843,9 +927,12 @@ def _execute_stac_search(
     end_date: date,
     max_cloud_cover: float,
     exclude_l7_slc_off: bool,
-    limit: int = 50,
+    exclude_partial_swaths: bool = True,
+    interval_mode: str = INTERVAL_ALL,
+    limit: int | None = None,
 ) -> None:
-    """Izvede STAC iskanje in shrani združene datume posnetkov v stanje seje."""
+    """Izvede celotno zgodovinsko STAC iskanje s filtrom pokritosti AOI in časovnim vzorčenjem."""
+    min_cov = DEFAULT_MIN_AOI_COVERAGE_PCT if exclude_partial_swaths else 0.0
     items_res, summary_res = search_scenes(
         sensor=sensor,
         bbox_4326=bbox_4326,
@@ -854,9 +941,16 @@ def _execute_stac_search(
         max_cloud_cover=float(max_cloud_cover),
         limit=limit,
         exclude_l7_slc_off=exclude_l7_slc_off,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=min_cov,
+        interval_mode=interval_mode,
     )
     st.session_state["stac_items"] = items_res
     st.session_state["stac_summary_df"] = summary_res
+    st.session_state["stac_raw_summary_df"] = summary_res.attrs.get("raw_summary_df", summary_res)
+    st.session_state["stac_raw_items_by_date"] = summary_res.attrs.get(
+        "raw_items_by_date", summary_res.attrs.get("items_by_date", {})
+    )
     st.session_state["search_performed"] = True
     st.session_state["search_sensor"] = sensor
     st.session_state["search_bbox_4326"] = list(bbox_4326)
@@ -2999,18 +3093,17 @@ def main() -> None:
                         unsafe_allow_html=True,
                     )
 
-        # --- 4. Časovno obdobje in oblačnost (sinhronizirano z Zavihkom 3) ---
+        # --- 4. Časovno obdobje, časovni korak in oblačnost (sinhronizirano z Zavihkom 3) ---
         st.divider()
         st.subheader(t("sec_time"))
 
         today = date.today()
-        min_sensor_date: date = sensor_cfg["min_date"]
 
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             start_date = st.date_input(
                 t("start_date_label"),
-                min_value=min_sensor_date,
+                min_value=HISTORICAL_MIN_DATE,
                 max_value=today,
                 key="sidebar_start_date",
                 on_change=_sync_start_date_state,
@@ -3019,7 +3112,7 @@ def main() -> None:
         with col_d2:
             end_date = st.date_input(
                 t("end_date_label"),
-                min_value=min_sensor_date,
+                min_value=HISTORICAL_MIN_DATE,
                 max_value=today,
                 key="sidebar_end_date",
                 on_change=_sync_end_date_state,
@@ -3029,6 +3122,23 @@ def main() -> None:
         dates_valid = start_date <= end_date
         if not dates_valid:
             st.error(t("date_order_error"))
+        elif start_date < sensor_cfg["min_date"]:
+            st.caption(
+                f"ℹ️ {t('sensor_min_date_hint', sensor=sensor_cfg['short_name'], year=sensor_cfg['min_date'].year)}"
+            )
+
+        _touch_selector(
+            t("interval_label"),
+            options=INTERVAL_KEYS,
+            default=str(st.session_state.get("temporal_interval", INTERVAL_ALL)),
+            format_func=lambda k, _lang=lang: t(INTERVAL_I18N[k], lang=_lang),
+            help=t("interval_help"),
+            key="sidebar_interval_select",
+            on_change=_sync_interval_state,
+            args=("sidebar_interval_select",),
+            use_pills=True,
+        )
+        active_interval = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
 
         if sensor == SENSOR_S1:
             max_cloud_cover = 100
@@ -3042,6 +3152,14 @@ def main() -> None:
                 on_change=_sync_max_cloud_state,
                 args=("sidebar_max_cloud",),
             )
+
+        exclude_partial_swaths = st.checkbox(
+            t("exclude_partial_label"),
+            help=t("exclude_partial_help"),
+            key="sidebar_exclude_partial",
+            on_change=_sync_partial_filter_state,
+            args=("sidebar_exclude_partial",),
+        )
 
         can_search = (bbox_4326 is not None) and aoi_valid and dates_valid and (aoi_error is None)
         search_clicked = st.button(
@@ -3065,7 +3183,9 @@ def main() -> None:
                         end_date=end_date,
                         max_cloud_cover=float(max_cloud_cover),
                         exclude_l7_slc_off=exclude_l7_slc_off,
-                        limit=50,
+                        exclude_partial_swaths=bool(exclude_partial_swaths),
+                        interval_mode=active_interval,
+                        limit=None,
                     )
                     st.rerun()
                 except Exception as exc:
@@ -3173,15 +3293,23 @@ def main() -> None:
                 st.subheader(
                     t("t1_found_header", sensor=active_sensor_cfg["short_name"], n=len(items))
                 )
+                st.caption(_format_interval_summary_caption(summary_df, lang=lang))
 
                 if active_sensor == SENSOR_S1:
                     cloud_col = pd.Series(["— (SAR)"] * len(summary_df))
                 else:
                     cloud_col = summary_df["cloud_cover"].round(2)
 
+                cov_col = (
+                    summary_df["coverage_pct"].round(1)
+                    if "coverage_pct" in summary_df.columns
+                    else pd.Series([100.0] * len(summary_df))
+                )
+
                 display_df = pd.DataFrame(
                     {
                         t("col_date"): summary_df["date_str"],
+                        t("col_coverage"): cov_col,
                         t("col_cloud"): cloud_col,
                         t("col_tile"): summary_df["mgrs_tile"].apply(
                             lambda v: _format_tile_label(str(v), sensor=active_sensor)
@@ -4170,7 +4298,6 @@ def main() -> None:
             st.markdown(f"**{t('t3_ctrl_header')}**")
             t3_today = date.today()
             t3_sensor_cur = str(st.session_state["selected_sensor"])
-            t3_min_date: date = SENSOR_META[t3_sensor_cur]["min_date"]
 
             _touch_selector(
                 t("sensor_select_label"),
@@ -4188,7 +4315,7 @@ def main() -> None:
             with c_t3_d1:
                 t3_start = st.date_input(
                     t("start_date_label"),
-                    min_value=t3_min_date,
+                    min_value=HISTORICAL_MIN_DATE,
                     max_value=t3_today,
                     key="tab3_start_date",
                     on_change=_sync_start_date_state,
@@ -4197,7 +4324,7 @@ def main() -> None:
             with c_t3_d2:
                 t3_end = st.date_input(
                     t("end_date_label"),
-                    min_value=t3_min_date,
+                    min_value=HISTORICAL_MIN_DATE,
                     max_value=t3_today,
                     key="tab3_end_date",
                     on_change=_sync_end_date_state,
@@ -4218,8 +4345,8 @@ def main() -> None:
                         args=("tab3_max_cloud",),
                     )
 
-            # Hitri prednastavljeni časovni gumbi (vključno z 1990–danes za Landsat)
-            p1, p2, p3, p4 = st.columns(4)
+            # Hitri prednastavljeni časovni gumbi (6m, 2y, 5y, 10y, 1984–danes Landsat)
+            p1, p2, p3, p4, p5 = st.columns([0.9, 0.9, 0.9, 0.85, 1.45])
             with p1:
                 st.button(
                     t("t3_preset_6m"),
@@ -4246,21 +4373,57 @@ def main() -> None:
                 )
             with p4:
                 st.button(
-                    t("t3_preset_1990"),
+                    t("t3_preset_10y"),
                     width="stretch",
-                    key="t3_btn_preset_1990",
+                    key="t3_btn_preset_10y",
                     on_click=_apply_tab3_date_preset,
-                    args=("1990_landsat",),
+                    args=("10y",),
                 )
+            with p5:
+                st.button(
+                    t("t3_preset_1984"),
+                    width="stretch",
+                    key="t3_btn_preset_1984",
+                    on_click=_apply_tab3_date_preset,
+                    args=("1984_landsat",),
+                )
+
+            # Časovni korak vzorčenja + filter delnih preletov (< 90 % AOI)
+            c_t3_int, c_t3_cov = st.columns([1.6, 1.0], vertical_alignment="bottom")
+            with c_t3_int:
+                _touch_selector(
+                    t("interval_label"),
+                    options=INTERVAL_KEYS,
+                    default=str(st.session_state.get("temporal_interval", INTERVAL_ALL)),
+                    format_func=lambda k, _lang=lang: t(INTERVAL_I18N[k], lang=_lang),
+                    help=t("interval_help"),
+                    key="tab3_interval_select",
+                    on_change=_sync_interval_state,
+                    args=("tab3_interval_select",),
+                    use_pills=True,
+                )
+            with c_t3_cov:
+                t3_exclude_partial = st.checkbox(
+                    t("exclude_partial_label"),
+                    help=t("exclude_partial_help"),
+                    key="tab3_exclude_partial",
+                    on_change=_sync_partial_filter_state,
+                    args=("tab3_exclude_partial",),
+                )
+            t3_interval_cur = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
 
             t3_dates_ok = t3_start <= t3_end
             if not t3_dates_ok:
                 st.error(t("date_order_error"))
+            elif t3_start < SENSOR_META[t3_sensor_cur]["min_date"]:
+                st.caption(
+                    f"ℹ️ {t('sensor_min_date_hint', sensor=SENSOR_META[t3_sensor_cur]['short_name'], year=SENSOR_META[t3_sensor_cur]['min_date'].year)}"
+                )
 
             t3_target_bbox = bbox_4326 if (bbox_4326 is not None and aoi_valid and aoi_error is None) else active_bbox
             t3_can_refresh = (t3_target_bbox is not None) and aoi_valid and t3_dates_ok and (aoi_error is None)
 
-            col_ref_btn, col_ref_stat = st.columns([1.35, 1.65], vertical_alignment="center")
+            col_ref_btn, col_ref_stat = st.columns([1.2, 1.8], vertical_alignment="center")
             with col_ref_btn:
                 t3_refresh_clicked = st.button(
                     t("t3_btn_refresh"),
@@ -4276,13 +4439,8 @@ def main() -> None:
                     d_min = str(summary_df["date_str"].min())
                     d_max = str(summary_df["date_str"].max())
                     st.caption(
-                        t(
-                            "t3_loaded_status",
-                            sensor=active_sensor_cfg["short_name"],
-                            n=len(items),
-                            d1=d_min,
-                            d2=d_max,
-                        )
+                        f"{t('t3_loaded_status', sensor=active_sensor_cfg['short_name'], n=len(items), d1=d_min, d2=d_max)}  \n"
+                        f"{_format_interval_summary_caption(summary_df, lang=lang)}"
                     )
                 else:
                     st.caption(t("need_search_first"))
@@ -4301,7 +4459,9 @@ def main() -> None:
                         end_date=t3_end,
                         max_cloud_cover=float(t3_max_cloud),
                         exclude_l7_slc_off=bool(st.session_state.get("exclude_l7_slc_off", False)),
-                        limit=50,
+                        exclude_partial_swaths=bool(t3_exclude_partial),
+                        interval_mode=t3_interval_cur,
+                        limit=None,
                     )
                     st.rerun()
                 except Exception as exc:
@@ -4311,6 +4471,7 @@ def main() -> None:
             st.info(t("no_scenes_warn") if search_performed else t("need_search_first"))
         else:
             is_sar_t3 = active_sensor == SENSOR_S1
+            min_swath_guard = 85.0 if bool(st.session_state.get("exclude_partial_swaths", True)) else 0.0
             metric_options = SAR_METRIC_KEYS if is_sar_t3 else INDEX_KEYS
             metric_label_title = (
                 t("sar_metric_select_label") if is_sar_t3 else t("index_select_label")
@@ -4349,8 +4510,12 @@ def main() -> None:
                             max_epochs = total_available
                             st.caption(f"{t('t3_epochs_slider')} **{total_available}**")
                         else:
-                            upper_ep = min(40, total_available)
-                            default_ep = min(15, upper_ep)
+                            upper_ep = min(50, total_available)
+                            default_ep = (
+                                upper_ep
+                                if (t3_interval_cur != INTERVAL_ALL and upper_ep <= 45)
+                                else min(20, upper_ep)
+                            )
                             max_epochs = st.slider(
                                 t("t3_epochs_slider"),
                                 min_value=5,
@@ -4402,6 +4567,7 @@ def main() -> None:
                             progress_callback=_on_progress,
                             sensor=active_sensor,
                             aoi_polygon_4326=active_polygon,
+                            min_swath_coverage_pct=min_swath_guard,
                         )
                         prog_bar.empty()
                         status_slot.empty()
@@ -4746,8 +4912,12 @@ def main() -> None:
                                 tl_num_frames = avail_tl
                                 st.caption(f"{t('tl_frames_label')} **{avail_tl}**")
                             else:
-                                tl_max = min(15, avail_tl)
-                                tl_default = min(8, tl_max)
+                                tl_max = min(25, avail_tl)
+                                tl_default = (
+                                    min(12, tl_max)
+                                    if t3_interval_cur == INTERVAL_YEARLY
+                                    else min(8, tl_max)
+                                )
                                 tl_num_frames = st.slider(
                                     t("tl_frames_label"),
                                     min_value=3,
@@ -4801,6 +4971,7 @@ def main() -> None:
                                 duration_ms=int(round(tl_speed_sec * 1000)),
                                 max_width=700,
                                 progress_callback=_on_tl_progress,
+                                min_swath_coverage_pct=min_swath_guard,
                             )
                             tl_prog.empty()
                             tl_status.empty()
