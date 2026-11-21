@@ -527,10 +527,17 @@ def fetch_sentinel2_obstacle_mask(
     ant_height_m: float = 2.0,
     canopy_h_m: float = 18.0,
     building_h_m: float = 12.0,
-    radius_m: float = 150.0,
+    radius_m: float = 200.0,
     target_epsg: str = CRS_D96TM,
 ) -> dict[str, Any]:
-    """Stream latest clear 10 m Sentinel-2 L2A within 150 m and compute local obstacle mask."""
+    """Stream the clearest 10 m Sentinel-2 L2A scene (last 12 months, <=35% cloud, 200 m radius).
+
+    Runs completely independently of any sidebar cloud/date filters and logs exact
+    exceptions instead of silently hiding them.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
     zeros = np.zeros(N_AZ_SECTORS, dtype=np.float64)
     sta_e, sta_n = transform_coords(lon_deg, lat_deg, EPSG_WGS84, target_epsg)
     fallback: dict[str, Any] = {
@@ -543,90 +550,105 @@ def fetch_sentinel2_obstacle_mask(
         "y_coords": None,
         "station_e": sta_e,
         "station_n": sta_n,
+        "error": None,
     }
     try:
-        bbox_4326, _ = bbox_from_point_wgs84(lat_deg, lon_deg, radius_m)
+        bbox_4326, _ = bbox_from_point_wgs84(lat_deg, lon_deg, float(radius_m))
         today = date.today()
+        # Independent 12-month search, max_cloud=35%, no strict large-AOI swath rejection
         items, df = search_scenes(
             sensor=SENSOR_S2,
             bbox_4326=bbox_4326,
-            start_date=today - timedelta(days=180),
+            start_date=today - timedelta(days=365),
             end_date=today,
-            max_cloud_cover=20.0,
-            min_coverage_pct=85.0,
+            max_cloud_cover=35.0,
+            min_coverage_pct=0.0,
         )
         if not items or df.empty:
-            items, df = search_scenes(
-                sensor=SENSOR_S2,
-                bbox_4326=bbox_4326,
-                start_date=today - timedelta(days=365),
-                end_date=today,
-                max_cloud_cover=35.0,
-                min_coverage_pct=70.0,
-            )
-        if not items or df.empty:
+            fallback["error"] = "No Sentinel-2 L2A scenes found in the last 12 months (<=35% cloud)."
+            logger.warning("GNSS Sentinel-2 obstacle search returned no scenes for (%.5f, %.5f)", lat_deg, lon_deg)
             return fallback
 
-        # Pick newest clear scene (df is sorted newest-first)
-        best_group = items[0]
-        scene_date = str(df.iloc[0]["date_str"])
+        # Order candidates by lowest cloud cover first (clearest scene over the 200 m station clip)
+        cc_vals = df["cloud_cover"].fillna(50.0).to_numpy(dtype=np.float64)
+        cand_order = np.argsort(cc_vals)[:3]
 
-        ds = load_scene(
-            sensor=SENSOR_S2,
-            item=best_group,
-            bbox_4326=bbox_4326,
-            bands=["B04", "B03", "B02", "B08", "B11", "SCL"],
-            target_epsg=target_epsg,
-            resolution=10,
-        )
-        ds_m = apply_cloud_mask(ds, sensor=SENSOR_S2)
-        ndvi_da = compute_index(ds_m, "NDVI")
-        ndbi_da = compute_index(ds_m, "NDBI")
+        last_err: str | None = None
+        for idx in cand_order:
+            best_group = items[int(idx)]
+            scene_date = str(df.iloc[int(idx)]["date_str"])
+            try:
+                ds = load_scene(
+                    sensor=SENSOR_S2,
+                    item=best_group,
+                    bbox_4326=bbox_4326,
+                    bands=["B04", "B03", "B02", "B08", "B11", "SCL"],
+                    target_epsg=target_epsg,
+                    resolution=10,
+                )
+                ds_m, clear_pct = apply_cloud_mask(ds, mask_clouds=True, sensor=SENSOR_S2)
+                # If this scene is locally clouded right on top of the 200 m station, try next clearest
+                if clear_pct < 15.0 and len(cand_order) > 1 and int(idx) != int(cand_order[-1]):
+                    del ds, ds_m
+                    continue
 
-        x_vals = np.asarray(ndvi_da.coords["x"].values, dtype=np.float64)
-        y_vals = np.asarray(ndvi_da.coords["y"].values, dtype=np.float64)
-        obs_mask, obs_cls = compute_obstacle_mask_from_s2_indices(
-            ndvi_da.values,
-            ndbi_da.values,
-            x_vals,
-            y_vals,
-            sta_e,
-            sta_n,
-            ant_height_m=ant_height_m,
-            canopy_h_m=canopy_h_m,
-            building_h_m=building_h_m,
-            min_dist_m=10.0,
-            max_dist_m=radius_m,
-        )
+                ndvi_da = compute_index(ds_m, "NDVI")
+                ndbi_da = compute_index(ds_m, "NDBI")
 
-        # Build compact RGB preview array for Chart 3 (Local Obstacles Overview)
-        ch_list: list[np.ndarray] = []
-        for b_name in ("B04", "B03", "B02"):
-            arr = np.asarray(ds[b_name].values, dtype=np.float32)
-            fin = arr[np.isfinite(arr)]
-            lo = float(np.percentile(fin, 2.0)) if fin.size else 0.0
-            hi = float(np.percentile(fin, 98.0)) if fin.size else 0.3
-            if hi <= lo + 1e-6:
-                hi = lo + 0.3
-            norm = np.clip((np.nan_to_num(arr, nan=lo) - lo) / (hi - lo), 0.0, 1.0)
-            ch_list.append(np.clip(np.round(norm * 255.0), 0, 255).astype(np.uint8))
-        rgb_u8 = np.stack(ch_list, axis=-1)
+                x_vals = np.asarray(ndvi_da.coords["x"].values, dtype=np.float64)
+                y_vals = np.asarray(ndvi_da.coords["y"].values, dtype=np.float64)
+                obs_mask, obs_cls = compute_obstacle_mask_from_s2_indices(
+                    ndvi_da.values,
+                    ndbi_da.values,
+                    x_vals,
+                    y_vals,
+                    sta_e,
+                    sta_n,
+                    ant_height_m=ant_height_m,
+                    canopy_h_m=canopy_h_m,
+                    building_h_m=building_h_m,
+                    min_dist_m=10.0,
+                    max_dist_m=float(radius_m),
+                )
 
-        del ds, ds_m, ndvi_da, ndbi_da
-        gc.collect()
+                # Build crisp RGB preview array for Chart 3 (Local Obstacles Overview)
+                ch_list: list[np.ndarray] = []
+                for b_name in ("B04", "B03", "B02"):
+                    arr = np.asarray(ds[b_name].values, dtype=np.float32)
+                    fin = arr[np.isfinite(arr)]
+                    lo = float(np.percentile(fin, 2.0)) if fin.size else 0.0
+                    hi = float(np.percentile(fin, 98.0)) if fin.size else 0.3
+                    if hi <= lo + 1e-6:
+                        hi = lo + 0.3
+                    norm = np.clip((np.nan_to_num(arr, nan=lo) - lo) / (hi - lo), 0.0, 1.0)
+                    ch_list.append(np.clip(np.round(norm * 255.0), 0, 255).astype(np.uint8))
+                rgb_u8 = np.stack(ch_list, axis=-1)
 
-        return {
-            "obstacle_mask_deg": obs_mask,
-            "ok": True,
-            "scene_date": scene_date,
-            "rgb_u8": rgb_u8,
-            "obs_cls": obs_cls,
-            "x_coords": x_vals,
-            "y_coords": y_vals,
-            "station_e": sta_e,
-            "station_n": sta_n,
-        }
-    except Exception:
+                del ds, ds_m, ndvi_da, ndbi_da
+                gc.collect()
+
+                return {
+                    "obstacle_mask_deg": obs_mask,
+                    "ok": True,
+                    "scene_date": scene_date,
+                    "rgb_u8": rgb_u8,
+                    "obs_cls": obs_cls,
+                    "x_coords": x_vals,
+                    "y_coords": y_vals,
+                    "station_e": sta_e,
+                    "station_n": sta_n,
+                    "error": None,
+                }
+            except Exception as inner_exc:
+                last_err = str(inner_exc)
+                logger.warning("GNSS Sentinel-2 load failed for %s: %s", scene_date, inner_exc)
+                continue
+
+        fallback["error"] = last_err or "Failed to load Sentinel-2 L2A clip."
+        return fallback
+    except Exception as exc:
+        logger.exception("GNSS Sentinel-2 obstacle loader failed: %s", exc)
+        fallback["error"] = str(exc)
         return fallback
 
 
@@ -772,14 +794,14 @@ def run_gnss_mission_plan(
         "station_n": sta_n,
     }
     if use_s2_obstacles:
-        _prog(0.42, "Analiziram zadnji Sentinel-2 (10 m) za gozd in stavbe (150 m okolica)...")
+        _prog(0.42, "Analiziram zadnji Sentinel-2 (10 m) za gozd in stavbe (200 m okolica)...")
         s2_info = fetch_sentinel2_obstacle_mask(
             lat_deg,
             lon_deg,
             ant_height_m=ant_height_m,
             canopy_h_m=canopy_h_m,
             building_h_m=building_h_m,
-            radius_m=150.0,
+            radius_m=200.0,
             target_epsg=target_epsg,
         )
 

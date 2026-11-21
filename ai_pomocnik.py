@@ -1096,7 +1096,11 @@ def execute_ai_plan(
             )
             idx_da = ds["VV"]
         else:
-            req_bands = get_required_bands_for_sensor(plan["index_name"], sensor=sensor, include_mask=True)
+            req_bands = get_required_bands_for_sensor(
+                sensor=sensor,
+                metric_name=plan["index_name"],
+                include_cloud_mask=True,
+            )
             ds = load_scene(
                 sensor=sensor,
                 item=best_group,
@@ -1105,7 +1109,7 @@ def execute_ai_plan(
                 target_epsg=target_epsg,
                 resolution=res_m,
             )
-            ds_masked = apply_cloud_mask(ds, sensor=sensor)
+            ds_masked, _ = apply_cloud_mask(ds, sensor=sensor)
             idx_da = compute_index(ds_masked, plan["index_name"])
         stats = compute_index_stats(idx_da, resolution_m=float(res_m))
         tif_bytes = export_to_geotiff_bytes(idx_da, target_epsg=target_epsg)

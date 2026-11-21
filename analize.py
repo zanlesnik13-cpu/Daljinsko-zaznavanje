@@ -330,9 +330,20 @@ def apply_landsat_qa_mask(
 def apply_cloud_mask(
     ds: xr.Dataset,
     mask_clouds: bool = True,
+    sensor: str | None = None,
+    sensor_id: str | None = None,
+    **_kwargs: Any,
 ) -> tuple[xr.Dataset, float]:
-    """Unified multi-sensor cloud mask dispatcher (Sentinel-2 SCL, Landsat QA_PIXEL, or SAR)."""
-    if "SCL" in ds.data_vars:
+    """Unified multi-sensor cloud mask dispatcher (Sentinel-2 SCL, Landsat QA_PIXEL, or SAR).
+
+    Accepts optional ``sensor`` / ``sensor_id`` arguments for full compatibility across
+    all modules (``nesrece.py``, ``ai_pomocnik.py``, ``gnss_plan.py``, ``casovne_vrste.py``, ``app.py``).
+    """
+    eff_sensor = str(sensor or sensor_id or "").strip().lower()
+    if eff_sensor == "sentinel-1-rtc":
+        mask_clouds = False
+
+    if "SCL" in ds.data_vars and eff_sensor != "landsat-c2-l2":
         return apply_scl_mask(ds, mask_clouds=mask_clouds)
     if "QA_PIXEL" in ds.data_vars or "qa_pixel" in ds.data_vars:
         return apply_landsat_qa_mask(ds, mask_clouds=mask_clouds)

@@ -7735,7 +7735,11 @@ def main() -> None:
                 )
                 st.plotly_chart(fig_loc, width="stretch", key="tab7_local_obs_plotly")
             else:
-                st.info(t("gnss_local_unavail"))
+                s2_err = s2_inf.get("error")
+                if s2_err:
+                    st.warning(f"{t('gnss_local_unavail')} ({s2_err})")
+                else:
+                    st.info(t("gnss_local_unavail"))
 
             # 5. Export GNSS Mission Plan CSV
             st.download_button(

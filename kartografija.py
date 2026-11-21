@@ -682,16 +682,16 @@ def render_geodetic_map(
 
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), facecolor="#FFFFFF")
     try:
-        # Outer neatline border around the entire cartographic sheet
+        # Outer neatline border around the entire cartographic sheet (transparent fill!)
         sheet_border = mpatches.Rectangle(
             (0.015, 0.015),
             0.970,
             0.970,
             transform=fig.transFigure,
-            facecolor="#FFFFFF",
+            facecolor="none",
             edgecolor=COLOR_SLATE_700,
             linewidth=1.1,
-            zorder=0,
+            zorder=10,
         )
         fig.patches.append(sheet_border)
 
@@ -805,6 +805,7 @@ def render_geodetic_map(
                 leg_rect = None
 
         ax = fig.add_axes(map_rect)
+        ax.set_zorder(2)
         ax.set_facecolor(COLOR_NODATA)
 
         # Render Raster strictly in projected metric coordinates (1:1 equal aspect)
@@ -1245,6 +1246,7 @@ def render_geodetic_map(
                     cbar_h = min(lh * 0.44, 0.34)
                     cbar_y = ly + lh - 0.095 - cbar_h
                     cax = fig.add_axes([lx + 0.022, cbar_y, 0.024, cbar_h])
+                    cax.set_zorder(5)
                     cb = fig.colorbar(mappable, cax=cax, orientation="vertical")
                     cb.set_ticks(ticks)
                     cb.set_ticklabels([tick_fmt.format(t_v) for t_v in ticks])
@@ -1311,6 +1313,7 @@ def render_geodetic_map(
                 else:
                     # Horizontal colorbar for portrait / square
                     cax = fig.add_axes([lx + 0.030, ly + lh * 0.28, lw - 0.060, lh * 0.20])
+                    cax.set_zorder(5)
                     cb = fig.colorbar(mappable, cax=cax, orientation="horizontal")
                     cb.set_ticks(ticks)
                     cb.set_ticklabels([tick_fmt.format(t_v) for t_v in ticks])

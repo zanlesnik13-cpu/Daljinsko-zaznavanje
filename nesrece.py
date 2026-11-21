@@ -843,8 +843,8 @@ def run_disaster_assessment(
             lang=lang,
         )
     elif disaster_type == DISASTER_WILDFIRE:
-        ds_pre_m = apply_cloud_mask(ds_pre, sensor=sensor)
-        ds_ev_m = apply_cloud_mask(ds_ev, sensor=sensor)
+        ds_pre_m, _ = apply_cloud_mask(ds_pre, sensor=sensor)
+        ds_ev_m, _ = apply_cloud_mask(ds_ev, sensor=sensor)
         nbr_pre = compute_index(ds_pre_m, "NBR")
         nbr_post = compute_index(ds_ev_m, "NBR")
         class_da, continuous_da, breakdown_df, summary = classify_wildfire_dnbr(
@@ -854,8 +854,8 @@ def run_disaster_assessment(
             lang=lang,
         )
     else:
-        ds_pre_m = apply_cloud_mask(ds_pre, sensor=sensor)
-        ds_ev_m = apply_cloud_mask(ds_ev, sensor=sensor)
+        ds_pre_m, _ = apply_cloud_mask(ds_pre, sensor=sensor)
+        ds_ev_m, _ = apply_cloud_mask(ds_ev, sensor=sensor)
         ndvi_pre = compute_index(ds_pre_m, "NDVI")
         ndvi_post = compute_index(ds_ev_m, "NDVI")
         class_da, continuous_da, breakdown_df, summary = classify_forest_dndvi(
