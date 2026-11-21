@@ -66,23 +66,35 @@ from stac_loader import (
 # ---------------------------------------------------------------------------
 # Constants, Schema Allowed Values & Quick Example Prompts
 # ---------------------------------------------------------------------------
-DEFAULT_GEMINI_MODEL: str = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL: str = "gemini-3.5-flash"
+FALLBACK_GEMINI_MODELS: tuple[str, ...] = ("gemini-3.5-flash", "gemini-2.5-flash")
+GEMINI_MODELS_LIST_URL: str = "https://generativelanguage.googleapis.com/v1beta/models"
 
 GEMINI_MODEL_OPTIONS: tuple[dict[str, str], ...] = (
     {
+        "id": "gemini-3.5-flash",
+        "label_sl": "gemini-3.5-flash (Zelo hiter, najmanjša poraba tokenov — privzeto)",
+        "label_en": "gemini-3.5-flash (Very fast, lowest token usage — default)",
+    },
+    {
+        "id": "gemini-3.6-flash",
+        "label_sl": "gemini-3.6-flash (Hiter, uravnotežen)",
+        "label_en": "gemini-3.6-flash (Fast, balanced)",
+    },
+    {
+        "id": "gemini-3.8-flash",
+        "label_sl": "gemini-3.8-flash (Napredni Flash)",
+        "label_en": "gemini-3.8-flash (Advanced Flash)",
+    },
+    {
+        "id": "gemini-4-hydrogen",
+        "label_sl": "gemini-4-hydrogen (Gemini 4 Hydrogen)",
+        "label_en": "gemini-4-hydrogen (Gemini 4 Hydrogen)",
+    },
+    {
         "id": "gemini-2.5-flash",
-        "label_sl": "gemini-2.5-flash (Hiter in zanesljiv — privzeto)",
-        "label_en": "gemini-2.5-flash (Fast & reliable — default)",
-    },
-    {
-        "id": "gemini-2.5-pro",
-        "label_sl": "gemini-2.5-pro (Napredno sklepanje)",
-        "label_en": "gemini-2.5-pro (High reasoning)",
-    },
-    {
-        "id": "gemini-3-flash-preview",
-        "label_sl": "gemini-3-flash-preview (Nova generacija 3 Flash)",
-        "label_en": "gemini-3-flash-preview (Next-gen 3 Flash series)",
+        "label_sl": "gemini-2.5-flash (Klasični stabilni)",
+        "label_en": "gemini-2.5-flash (Classic stable)",
     },
     {
         "id": "custom",
@@ -100,6 +112,36 @@ def build_gemini_endpoint(model_id: str | None = None) -> str:
     if not clean or clean == "custom":
         clean = DEFAULT_GEMINI_MODEL
     return f"https://generativelanguage.googleapis.com/v1beta/models/{clean}:generateContent"
+
+
+def list_available_gemini_models(api_key: str, timeout: int = 10) -> list[str]:
+    """Query Google AI Studio REST API and return exact model IDs supporting ``generateContent``."""
+    clean_key = str(api_key or "").strip()
+    if not clean_key:
+        raise ValueError("API key is empty.")
+
+    resp = requests.get(
+        GEMINI_MODELS_LIST_URL,
+        params={"key": clean_key, "pageSize": 100},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    raw_models = payload.get("models") or []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw_models:
+        methods = entry.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name.startswith("models/"):
+            name = name[len("models/") :]
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 GEMINI_ENDPOINT: str = build_gemini_endpoint(DEFAULT_GEMINI_MODEL)
@@ -725,46 +767,55 @@ def parse_eo_request(
 ) -> dict[str, Any]:
     """Parse a natural-language EO query using the selected Gemini model or smart local fallback.
 
-    If a preview/custom Gemini model returns HTTP 404/400 or fails, gracefully falls back
-    to ``gemini-2.5-flash`` and finally to the built-in offline local parser.
+    If the selected model returns HTTP 404/400 or fails, gracefully cascades through
+    ``gemini-3.5-flash`` -> ``gemini-2.5-flash`` -> built-in offline local parser,
+    recording which model actually responded.
     """
     resolved_key, _source = get_active_gemini_api_key(api_key)
     req_model = str(model or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
-    if req_model == "custom":
+    if req_model.startswith("models/"):
+        req_model = req_model[len("models/") :]
+    if req_model == "custom" or not req_model:
         req_model = DEFAULT_GEMINI_MODEL
 
     if resolved_key:
-        try:
-            plan = parse_eo_request_gemini(query, api_key=resolved_key, model=req_model)
-            plan["fallback_note_sl"] = ""
-            plan["fallback_note_en"] = ""
-            return plan
-        except Exception as first_exc:
-            status_code = getattr(getattr(first_exc, "response", None), "status_code", None)
-            if req_model != DEFAULT_GEMINI_MODEL:
-                try:
-                    plan = parse_eo_request_gemini(
-                        query, api_key=resolved_key, model=DEFAULT_GEMINI_MODEL
-                    )
-                    code_txt = f" (HTTP {status_code})" if status_code else ""
+        candidates: list[str] = [req_model]
+        for fb in FALLBACK_GEMINI_MODELS:
+            if fb not in candidates:
+                candidates.append(fb)
+
+        first_status: int | None = None
+        for idx, cand_model in enumerate(candidates):
+            try:
+                plan = parse_eo_request_gemini(query, api_key=resolved_key, model=cand_model)
+                if idx == 0:
+                    plan["fallback_note_sl"] = ""
+                    plan["fallback_note_en"] = ""
+                else:
+                    code_txt = f" (HTTP {first_status})" if first_status else ""
                     plan["fallback_note_sl"] = (
-                        f"Model `{req_model}` ni bil dosegljiv{code_txt}; samodejni preklop na `{DEFAULT_GEMINI_MODEL}`."
+                        f"Model `{req_model}` ni bil dosegljiv{code_txt}; uspešen samodejni preklop na `{cand_model}`."
                     )
                     plan["fallback_note_en"] = (
-                        f"Model `{req_model}` unavailable{code_txt}; automatically fell back to `{DEFAULT_GEMINI_MODEL}`."
+                        f"Model `{req_model}` unavailable{code_txt}; automatically responded via `{cand_model}`."
                     )
-                    return plan
-                except Exception:
-                    pass
-            plan_loc = parse_eo_request_local(query)
-            code_txt = f" (HTTP {status_code})" if status_code else ""
-            plan_loc["fallback_note_sl"] = (
-                f"Gemini API (`{req_model}`) trenutno ni dosegljiv{code_txt}; uporabljen je bil lokalni pametni parser."
-            )
-            plan_loc["fallback_note_en"] = (
-                f"Gemini API (`{req_model}`) unavailable{code_txt}; used built-in smart local parser."
-            )
-            return plan_loc
+                return plan
+            except Exception as exc:
+                if idx == 0:
+                    first_status = getattr(getattr(exc, "response", None), "status_code", None)
+                continue
+
+        plan_loc = parse_eo_request_local(query)
+        code_txt = f" (HTTP {first_status})" if first_status else ""
+        plan_loc["fallback_note_sl"] = (
+            f"Gemini API (`{req_model}` in rezervni modeli) trenutno ni dosegljiv{code_txt}; "
+            f"uporabljen je bil vgrajeni lokalni pametni parser."
+        )
+        plan_loc["fallback_note_en"] = (
+            f"Gemini API (`{req_model}` and fallback models) unavailable{code_txt}; "
+            f"used built-in smart local parser."
+        )
+        return plan_loc
 
     plan_loc = parse_eo_request_local(query)
     plan_loc["fallback_note_sl"] = ""

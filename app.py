@@ -82,6 +82,7 @@ from ai_pomocnik import (
     GEMINI_MODEL_OPTIONS,
     execute_ai_plan,
     get_active_gemini_api_key,
+    list_available_gemini_models,
     parse_eo_request,
 )
 from analize import (
@@ -799,6 +800,7 @@ def _init_session_state() -> None:
         "tab6_query_input": "",
         "gemini_model": DEFAULT_GEMINI_MODEL,
         "gemini_custom_model": "",
+        "gemini_discovered_models": [],
         # Tab 7 GNSS Mission Planning state
         "tab7_gnss_result": None,
         # Resolution guard
@@ -6892,15 +6894,33 @@ def main() -> None:
                     key="tab6_btn_run",
                 )
 
-            # 3. Opcijske nastavitve Gemini API (z izbiro modela in jasnim statusom)
+            # 3. Opcijske nastavitve Gemini API (z izbiro modela, preverjanjem v živo in jasnim statusom)
             cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
             with st.expander(t("ai_api_expander"), expanded=False):
-                if cur_api_key:
-                    st.success(t("ai_status_gemini", source=key_src))
-                else:
-                    st.info(t("ai_status_local"))
+                discovered_models: list[str] = list(st.session_state.get("gemini_discovered_models") or [])
+                discovered_set = set(discovered_models)
 
-                col_key, col_mod = st.columns([1.1, 1.0])
+                mod_lbl_key = "label_en" if lang == "en" else "label_sl"
+                preset_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
+                mod_ids: list[str] = []
+                # Če smo že preverili žive modele na API ključu, jih najprej vključimo v spustni meni
+                for live_id in discovered_models:
+                    if live_id not in mod_ids and live_id != "custom":
+                        mod_ids.append(live_id)
+                for m in GEMINI_MODEL_OPTIONS:
+                    if m["id"] not in mod_ids:
+                        mod_ids.append(m["id"])
+
+                if st.session_state.get("gemini_model") not in mod_ids:
+                    st.session_state["gemini_model"] = mod_ids[0]
+
+                def _fmt_gemini_model(mid: str) -> str:
+                    base = preset_lbl_map.get(mid, mid)
+                    if mid in discovered_set:
+                        return f"✅ {base}"
+                    return base
+
+                col_key, col_mod = st.columns([1.05, 1.15])
                 with col_key:
                     st.text_input(
                         t("ai_key_input_label"),
@@ -6908,13 +6928,10 @@ def main() -> None:
                         key="tab6_gemini_key",
                     )
                 with col_mod:
-                    mod_ids = [m["id"] for m in GEMINI_MODEL_OPTIONS]
-                    mod_lbl_key = "label_en" if lang == "en" else "label_sl"
-                    mod_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
                     selected_mod_choice = st.selectbox(
                         t("ai_model_select_label"),
                         options=mod_ids,
-                        format_func=lambda mid: mod_lbl_map.get(mid, mid),
+                        format_func=_fmt_gemini_model,
                         key="gemini_model",
                     )
 
@@ -6927,6 +6944,34 @@ def main() -> None:
                     effective_gemini_model = (custom_mod_id or "").strip() or DEFAULT_GEMINI_MODEL
                 else:
                     effective_gemini_model = str(selected_mod_choice or DEFAULT_GEMINI_MODEL)
+
+                # Posodobljen ključ po vnosu + gumb za preverjanje živih modelov na uporabnikovem ključu
+                cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
+                if cur_api_key:
+                    st.success(t("ai_status_gemini", source=key_src, model=effective_gemini_model))
+                else:
+                    st.info(t("ai_status_local"))
+
+                if st.button(
+                    t("ai_btn_check_models"),
+                    width="stretch",
+                    key="tab6_btn_check_models",
+                ):
+                    if not cur_api_key:
+                        st.warning(t("ai_models_need_key"))
+                    else:
+                        try:
+                            live_list = list_available_gemini_models(cur_api_key)
+                            st.session_state["gemini_discovered_models"] = live_list
+                            st.session_state["tab6_models_check_count"] = len(live_list)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(t("ai_models_check_err", err=exc))
+
+                if st.session_state.get("tab6_models_check_count"):
+                    st.caption(
+                        t("ai_models_found_ok", n=int(st.session_state["tab6_models_check_count"]))
+                    )
 
         if btn_ai_run or auto_run_ai:
             q_clean = str(ai_query_text or "").strip()
