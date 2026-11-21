@@ -425,6 +425,56 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "geodetic_separation_caption": (
             "Izračuni in izvoz: **{crs}** (točen AOI) | Spletni prikaz: **EPSG:4326/3857**"
         ),
+        # Phase 2: Geodetic Cartography / Print Layout (Tab 4)
+        "tab4": "🗺️ Izdelava karte (D96/TM)",
+        "carto_header": "🗺️ Izdelava geodetske karte za tisk in objavo (D96/TM)",
+        "carto_intro": (
+            "Kartografski izris v strogem metričnem razmerju **1:1** (**EPSG:3794** D96/TM ali **EPSG:32633** UTM 33N) "
+            "brez Web Mercator distorzij — z metrično koordinatno mrežo, grafičnim in numeričnim merilom, "
+            "severnico, legendo in tehnično nogo (izvoz **300 DPI PDF / PNG**)."
+        ),
+        "carto_no_layers_info": (
+            "Trenutno še ni naloženega ali izračunanega nobenega rasterskega sloja. "
+            "Naložite posnetek v **Zavihku 1**, izračunajte spektralni indeks / mozaik / SAR masko v **Zavihku 2** "
+            "ali zaznavo sprememb v **Zavihku 3** — ali pa kliknite spodnji gumb za hiter prenos prvega najdenega posnetka."
+        ),
+        "carto_btn_quick_load": "⚡ Hitro naloži izbrani satelitski posnetek za izdelavo karte",
+        "carto_quick_load_spinner": "Prenašam satelitski posnetek v metrični projekciji {crs}...",
+        "carto_settings_header": "Nastavitve karte",
+        "carto_preview_header": "Predogled in izvoz karte",
+        "carto_layer_label": "Sloj za kartografski izris:",
+        "carto_title_label": "Naslov karte:",
+        "carto_subtitle_label": "Podnaslov:",
+        "carto_author_label": "Avtor / Ustanova:",
+        "carto_author_default": "Oddelek za geodezijo",
+        "carto_format_label": "Format papirja:",
+        "carto_fmt_a4_land": "A4 Ležeče",
+        "carto_fmt_a4_port": "A4 Pokončno",
+        "carto_fmt_square": "1:1 Kvadrat",
+        "carto_grid_spacing_label": "Razmak koordinatne mreže:",
+        "carto_grid_auto": "Avtomatsko",
+        "carto_grid_style_label": "Barva mreže:",
+        "carto_grid_light": "Svetla",
+        "carto_grid_dark": "Temna",
+        "carto_elements_label": "Kartografski elementi:",
+        "carto_chk_grid": "Koordinatna mreža",
+        "carto_chk_scalebar": "Grafično merilo",
+        "carto_chk_north": "Severnica",
+        "carto_chk_aoi": "Obroba AOI",
+        "carto_chk_legend": "Legenda",
+        "carto_btn_generate": "🗺️ Generiraj geodetsko karto",
+        "carto_spinner": "Izrisujem geodetsko karto (150 DPI predogled + 300 DPI PDF & PNG)...",
+        "carto_error": "Napaka pri generiranju geodetske karte: {err}",
+        "carto_prompt_generate": "Prilagodite nastavitve na levi in kliknite **Generiraj geodetsko karto** za predogled in izvoz.",
+        "carto_preview_caption": "Predogled (150 DPI) · Izračunano merilo: **M ≈ 1 : {scale}** · Mreža: **{grid} m** · Projekcija: **{crs}** (1:1 metrično)",
+        "carto_btn_dl_pdf": "📄 Prenesi karto za tisk (.pdf — 300 DPI)",
+        "carto_btn_dl_png": "🖼️ Prenesi sliko visoke ločljivosti (.png — 300 DPI)",
+        "carto_btn_dl_tif": "💾 Prenesi georeferenciran GeoTIFF (.tif)",
+        "carto_layer_tab1": "Zavihek 1 · {sensor} {vis} ({date})",
+        "carto_layer_tab2_idx": "Zavihek 2 · Indeks {idx} — {sensor} ({date})",
+        "carto_layer_tab2_sar": "Zavihek 2 · SAR Maska voda/poplav (VV < {thr:.1f} dB, {date})",
+        "carto_layer_tab2_comp": "Zavihek 2 · Brezoblačni mozaik {mode} ({d1}–{d2})",
+        "carto_layer_tab3_change": "Zavihek 3 · Zaznava sprememb Δ{idx} ({d1} → {d2})",
     },
     "en": {
         # App chrome & header
@@ -846,6 +896,56 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "geodetic_separation_caption": (
             "Computations & GeoTIFF export: **{crs}** (exact AOI) | Web slippy-map display: **EPSG:4326/3857**"
         ),
+        # Phase 2: Geodetic Cartography / Print Layout (Tab 4)
+        "tab4": "🗺️ Map Layout (D96/TM)",
+        "carto_header": "🗺️ Geodetic Cartography & Print Layout (D96/TM)",
+        "carto_intro": (
+            "Publication-grade cartographic layout strictly in **1:1** metric projection (**EPSG:3794** D96/TM or **EPSG:32633** UTM 33N) "
+            "with zero Web Mercator distortion — metric coordinate grid, graphic & numerical scale bar, "
+            "north arrow, scientific legend, and technical metadata footer (**300 DPI PDF / PNG**)."
+        ),
+        "carto_no_layers_info": (
+            "No raster layer has been loaded or computed yet. "
+            "Load a scene in **Tab 1**, compute a spectral index / composite / SAR water mask in **Tab 2**, "
+            "or run Change Detection in **Tab 3** — or click the quick-load button below to stream the selected scene directly."
+        ),
+        "carto_btn_quick_load": "⚡ Quick-load selected satellite scene for map layout",
+        "carto_quick_load_spinner": "Streaming satellite scene in metric projection {crs}...",
+        "carto_settings_header": "Map Settings",
+        "carto_preview_header": "Map Preview & Export",
+        "carto_layer_label": "Source raster layer:",
+        "carto_title_label": "Map Title:",
+        "carto_subtitle_label": "Subtitle:",
+        "carto_author_label": "Author / Institution:",
+        "carto_author_default": "Department of Geodesy",
+        "carto_format_label": "Paper Format:",
+        "carto_fmt_a4_land": "A4 Landscape",
+        "carto_fmt_a4_port": "A4 Portrait",
+        "carto_fmt_square": "1:1 Square",
+        "carto_grid_spacing_label": "Coordinate Grid Spacing:",
+        "carto_grid_auto": "Automatic",
+        "carto_grid_style_label": "Grid Color:",
+        "carto_grid_light": "Light",
+        "carto_grid_dark": "Dark",
+        "carto_elements_label": "Cartographic Elements:",
+        "carto_chk_grid": "Coordinate Grid",
+        "carto_chk_scalebar": "Scale Bar",
+        "carto_chk_north": "North Arrow",
+        "carto_chk_aoi": "AOI Outline",
+        "carto_chk_legend": "Legend",
+        "carto_btn_generate": "🗺️ Generate Geodetic Map",
+        "carto_spinner": "Rendering geodetic map (150 DPI preview + 300 DPI PDF & PNG)...",
+        "carto_error": "Error generating geodetic map: {err}",
+        "carto_prompt_generate": "Adjust the settings on the left and click **Generate Geodetic Map** to preview and export.",
+        "carto_preview_caption": "Preview (150 DPI) · Computed scale: **M ≈ 1 : {scale}** · Grid: **{grid} m** · Projection: **{crs}** (1:1 metric)",
+        "carto_btn_dl_pdf": "📄 Download Print Map (.pdf — 300 DPI)",
+        "carto_btn_dl_png": "🖼️ Download High-Res Image (.png — 300 DPI)",
+        "carto_btn_dl_tif": "💾 Download Georeferenced GeoTIFF (.tif)",
+        "carto_layer_tab1": "Tab 1 · {sensor} {vis} ({date})",
+        "carto_layer_tab2_idx": "Tab 2 · Index {idx} — {sensor} ({date})",
+        "carto_layer_tab2_sar": "Tab 2 · SAR Water/Flood Mask (VV < {thr:.1f} dB, {date})",
+        "carto_layer_tab2_comp": "Tab 2 · Cloud-Free Composite {mode} ({d1}–{d2})",
+        "carto_layer_tab3_change": "Tab 3 · Change Detection Δ{idx} ({d1} → {d2})",
     },
 }
 

@@ -44,6 +44,7 @@ if _APP_DIR not in sys.path:
 _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "geodezija_crs",
     "map_overlay",
+    "kartografija",
     "stac_loader",
     "analize",
     "casovne_vrste",
@@ -107,6 +108,7 @@ from geodezija_crs import (
     validate_aoi_size,
 )
 from i18n import t
+from kartografija import format_metric_number, render_geodetic_map
 from map_overlay import (
     build_horizontal_colorbar_html,
     build_satellite_slippy_map,
@@ -637,6 +639,19 @@ SAR_WATER_DISCRETE_RGBA: dict[int, tuple[int, int, int, int]] = {
     255: (0, 0, 0, 0),         # NoData transparent
 }
 
+CARTO_FORMAT_KEYS: list[str] = ["a4_landscape", "a4_portrait", "square"]
+CARTO_FORMAT_I18N: dict[str, str] = {
+    "a4_landscape": "carto_fmt_a4_land",
+    "a4_portrait": "carto_fmt_a4_port",
+    "square": "carto_fmt_square",
+}
+CARTO_GRID_OPTIONS: list[int] = [0, 500, 1000, 2000, 5000]  # 0 = Auto
+CARTO_GRID_STYLE_KEYS: list[str] = ["light", "dark"]
+CARTO_GRID_STYLE_I18N: dict[str, str] = {
+    "light": "carto_grid_light",
+    "dark": "carto_grid_dark",
+}
+
 
 # ---------------------------------------------------------------------------
 # Pomožne funkcije: stanje seje, sinhronizacija senzorja/datumov, iskanje STAC
@@ -734,6 +749,9 @@ def _init_session_state() -> None:
         "tab3_swipe_png_t1": None,
         "tab3_swipe_png_t2": None,
         "tab3_timelapse_data": None,
+        # Tab 4 Cartography / Print Layout state
+        "tab4_carto_result": None,
+        "tab4_carto_meta": None,
         # Resolution guard
         "last_rec_res_key": None,
         "selected_resolution": 10,
@@ -783,9 +801,293 @@ def _clear_loaded_products() -> None:
         "tab3_swipe_png_t1",
         "tab3_swipe_png_t2",
         "tab3_timelapse_data",
+        "tab4_carto_result",
+        "tab4_carto_meta",
     ):
         st.session_state[key] = None
     gc.collect()
+
+
+def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
+    """Samodejno odkrije vse trenutno naložene/izračunane rastre iz Zavihkov 1–3 za izdelavo karte."""
+    sources: list[dict[str, Any]] = []
+
+    # 1. Tab 1: Loaded satellite scene (RGB / NIR / SWIR / SAR VV / VH / SAR_FC)
+    ds_t1 = st.session_state.get("loaded_scene_ds")
+    meta_t1 = st.session_state.get("loaded_scene_meta")
+    if ds_t1 is not None and isinstance(meta_t1, dict):
+        vis_code = str(meta_t1.get("vis_code", "RGB"))
+        is_sar = meta_t1.get("sensor") == SENSOR_S1
+        bands_t1 = list(meta_t1.get("bands", []))
+        vis_label = (
+            t(SAR_VIS_SPECS[vis_code]["pill_key"], lang=lang)
+            if (is_sar and vis_code in SAR_VIS_SPECS)
+            else t(OPTICAL_COMPOSITE_SPECS.get(vis_code, OPTICAL_COMPOSITE_SPECS["RGB"])["pill_key"], lang=lang)
+        )
+        is_rgb_t1 = (not is_sar) or (vis_code == "SAR_FC") or (len(bands_t1) >= 2 and set(bands_t1) == {"VV", "VH"})
+        sar_spec = SAR_METRICS.get(vis_code, SAR_METRICS["VV"]) if (is_sar and not is_rgb_t1) else None
+        sources.append(
+            {
+                "id": "tab1_scene",
+                "label": t(
+                    "carto_layer_tab1",
+                    lang=lang,
+                    sensor=meta_t1.get("sensor_name", "Satellite"),
+                    vis=vis_label,
+                    date=meta_t1.get("date_str", ""),
+                ),
+                "raster": ds_t1,
+                "crs": meta_t1.get("crs", CRS_D96TM),
+                "is_rgb": is_rgb_t1,
+                "bands": bands_t1,
+                "use_percentile_stretch": bool(st.session_state.get("tab1_stretch", True)),
+                "gamma": float(st.session_state.get("tab1_gamma", 1.0)),
+                "cmap_name": sar_spec["cmap"] if sar_spec else "Greys_r",
+                "vmin": float(sar_spec["vmin"]) if sar_spec else -22.0,
+                "vmax": float(sar_spec["vmax"]) if sar_spec else -2.0,
+                "discrete_items": None,
+                "legend_title": vis_label,
+                "legend_units": sar_spec["units"] if sar_spec else "",
+                "stats_summary": [
+                    (t("col_tile", lang=lang), str(meta_t1.get("mgrs_tile", ""))),
+                    (
+                        t("col_cloud", lang=lang),
+                        f"{meta_t1['cloud_cover']:.1f} %"
+                        if meta_t1.get("cloud_cover") is not None
+                        else "SAR",
+                    ),
+                ],
+                "default_title": f"{meta_t1.get('sensor_name', 'Satellite')} — {vis_label}",
+                "default_subtitle": f"{meta_t1.get('date_str', '')} | {meta_t1.get('mgrs_tile', '')}",
+                "sensor_label": str(meta_t1.get("sensor_name", "Satellite")),
+                "date_label": str(meta_t1.get("date_str", "")),
+                "resolution_m": float(meta_t1.get("resolution_m", 10.0)),
+                "tif_bytes": st.session_state.get("loaded_tif_bytes"),
+                "tif_filename": st.session_state.get("loaded_tif_filename") or "satellite_scene.tif",
+                "file_stem": f"{meta_t1.get('sensor', 'sat')}_{vis_code}_{meta_t1.get('date_str', 'map')}",
+            }
+        )
+
+    # 2. Tab 2B.1: Spectral Index
+    idx_da = st.session_state.get("tab2_index_da")
+    idx_meta = st.session_state.get("tab2_index_meta")
+    idx_stats = st.session_state.get("tab2_index_stats")
+    if idx_da is not None and isinstance(idx_meta, dict):
+        idx_key = str(idx_meta.get("index_key", "NDVI"))
+        spec = SPECTRAL_INDICES.get(idx_key, SPECTRAL_INDICES["NDVI"])
+        stats_rows: list[tuple[str, str]] = []
+        if isinstance(idx_stats, dict) and idx_stats.get("valid_pixels", 0) > 0:
+            stats_rows = [
+                ("Min", f"{idx_stats['min']:.3f}"),
+                ("Mean" if lang == "en" else "Povprečje", f"{idx_stats['mean']:.3f}"),
+                ("Median" if lang == "en" else "Mediana", f"{idx_stats['median']:.3f}"),
+                ("Max", f"{idx_stats['max']:.3f}"),
+                (t("m_valid_ha", lang=lang), f"{idx_stats['valid_area_ha']:,.1f} ha"),
+            ]
+        sources.append(
+            {
+                "id": "tab2_index",
+                "label": t(
+                    "carto_layer_tab2_idx",
+                    lang=lang,
+                    idx=idx_key,
+                    sensor=idx_meta.get("sensor_name", "Optical"),
+                    date=idx_meta.get("date_str", ""),
+                ),
+                "raster": idx_da,
+                "crs": idx_meta.get("crs", CRS_D96TM),
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": spec["cmap"],
+                "vmin": float(spec["vmin"]),
+                "vmax": float(spec["vmax"]),
+                "discrete_items": None,
+                "legend_title": f"{idx_key} ({spec['formula']})",
+                "legend_units": "",
+                "stats_summary": stats_rows,
+                "default_title": f"{idx_key} — {idx_meta.get('sensor_name', 'Satellite')}",
+                "default_subtitle": f"{idx_meta.get('date_str', '')} | {idx_meta.get('mgrs_tile', '')}",
+                "sensor_label": str(idx_meta.get("sensor_name", "Optical")),
+                "date_label": str(idx_meta.get("date_str", "")),
+                "resolution_m": float(idx_meta.get("resolution_m", 10.0)),
+                "tif_bytes": st.session_state.get("tab2_tif_bytes"),
+                "tif_filename": st.session_state.get("tab2_tif_filename") or f"{idx_key}.tif",
+                "file_stem": f"{idx_key}_{idx_meta.get('date_str', 'map')}",
+            }
+        )
+
+    # 3. Tab 2A: SAR Water / Flood Mask
+    sar_ds = st.session_state.get("tab2_sar_ds")
+    sar_meta = st.session_state.get("tab2_sar_meta")
+    if sar_ds is not None and isinstance(sar_meta, dict):
+        thr_db = float(st.session_state.get("tab2_sar_water_thr", -16.0))
+        mask_da, water_stats = compute_sar_water_mask(
+            sar_ds,
+            threshold_db=thr_db,
+            polarization="VV",
+            resolution_m=float(sar_meta.get("resolution_m", 10.0)),
+        )
+        water_tif = export_to_geotiff_bytes(mask_da, target_epsg=sar_meta.get("crs", CRS_D96TM))
+        sources.append(
+            {
+                "id": "tab2_sar_water",
+                "label": t(
+                    "carto_layer_tab2_sar",
+                    lang=lang,
+                    thr=thr_db,
+                    date=sar_meta.get("date_str", ""),
+                ),
+                "raster": mask_da,
+                "crs": sar_meta.get("crs", CRS_D96TM),
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": "Greys",
+                "vmin": 0.0,
+                "vmax": 1.0,
+                "discrete_items": [
+                    (1, f"{t('sar_water_legend_water', lang=lang)} (VV < {thr_db:.1f} dB)", "#0369A1"),
+                    (0, t("sar_water_legend_land", lang=lang), "#CBD5E1"),
+                ],
+                "legend_title": t("sar_water_legend_water", lang=lang),
+                "legend_units": "",
+                "stats_summary": [
+                    (t("m_water_ha", lang=lang), f"{water_stats['water_area_ha']:,.2f} ha"),
+                    (t("m_water_pct", lang=lang), f"{water_stats['water_pct']:.2f} %"),
+                    (t("m_valid_ha", lang=lang), f"{water_stats['valid_area_ha']:,.2f} ha"),
+                ],
+                "default_title": t("sar_water_map_title", lang=lang, thr=thr_db, date=sar_meta.get("date_str", "")),
+                "default_subtitle": f"Sentinel-1 SAR RTC | {sar_meta.get('mgrs_tile', '')}",
+                "sensor_label": "Sentinel-1 SAR RTC",
+                "date_label": str(sar_meta.get("date_str", "")),
+                "resolution_m": float(sar_meta.get("resolution_m", 10.0)),
+                "tif_bytes": water_tif,
+                "tif_filename": f"S1_WaterMask_{sar_meta.get('date_str', 'map')}.tif",
+                "file_stem": f"S1_WaterMask_{sar_meta.get('date_str', 'map')}",
+            }
+        )
+
+    # 4. Tab 2B.2: Cloud-Free Median Composite
+    comp_obj = st.session_state.get("tab2_comp_obj")
+    comp_meta = st.session_state.get("tab2_comp_meta")
+    if comp_obj is not None and isinstance(comp_meta, dict):
+        comp_mode = str(comp_meta.get("mode", "RGB_NIR"))
+        d1 = str(comp_meta.get("date_start", ""))
+        d2 = str(comp_meta.get("date_end", ""))
+        if comp_mode == "RGB_NIR" and isinstance(comp_obj, xr.Dataset):
+            comp_disp = str(st.session_state.get("tab2_comp_rgb_nir_toggle", "RGB"))
+            comp_bands = ["B04", "B03", "B02"] if comp_disp == "RGB" else ["B08", "B04", "B03"]
+            sources.append(
+                {
+                    "id": "tab2_composite",
+                    "label": t("carto_layer_tab2_comp", lang=lang, mode=comp_disp, d1=d1, d2=d2),
+                    "raster": comp_obj,
+                    "crs": comp_meta.get("crs", CRS_D96TM),
+                    "is_rgb": True,
+                    "bands": comp_bands,
+                    "use_percentile_stretch": bool(st.session_state.get("tab2_comp_stretch", True)),
+                    "gamma": float(st.session_state.get("tab2_comp_gamma", 1.0)),
+                    "cmap_name": "RdYlGn",
+                    "vmin": 0.0,
+                    "vmax": 1.0,
+                    "discrete_items": None,
+                    "legend_title": f"{comp_disp} Median",
+                    "legend_units": "",
+                    "stats_summary": [
+                        (t("comp_m_scenes", lang=lang), f"{comp_meta.get('scenes_used', 0)}"),
+                        (t("m_valid_pct", lang=lang), f"{comp_meta.get('valid_pct', 0.0):.1f} %"),
+                    ],
+                    "default_title": f"{comp_meta.get('sensor_name', 'Satellite')} — {comp_disp} Median",
+                    "default_subtitle": f"{d1} – {d2} ({comp_meta.get('scenes_used', 0)} scenes)",
+                    "sensor_label": str(comp_meta.get("sensor_name", "Optical")),
+                    "date_label": f"{d1} – {d2}",
+                    "resolution_m": float(comp_meta.get("resolution_m", 10.0)),
+                    "tif_bytes": st.session_state.get("tab2_comp_tif_bytes"),
+                    "tif_filename": st.session_state.get("tab2_comp_tif_filename") or f"composite_{comp_disp}.tif",
+                    "file_stem": f"Composite_{comp_disp}_{d1}_{d2}",
+                }
+            )
+        elif isinstance(comp_obj, xr.DataArray):
+            spec_c = SPECTRAL_INDICES.get(comp_mode, SPECTRAL_INDICES["NDVI"])
+            sources.append(
+                {
+                    "id": "tab2_composite",
+                    "label": t("carto_layer_tab2_comp", lang=lang, mode=comp_mode, d1=d1, d2=d2),
+                    "raster": comp_obj,
+                    "crs": comp_meta.get("crs", CRS_D96TM),
+                    "is_rgb": False,
+                    "bands": None,
+                    "use_percentile_stretch": False,
+                    "gamma": 1.0,
+                    "cmap_name": spec_c["cmap"],
+                    "vmin": float(spec_c["vmin"]),
+                    "vmax": float(spec_c["vmax"]),
+                    "discrete_items": None,
+                    "legend_title": f"{comp_mode} Median",
+                    "legend_units": "",
+                    "stats_summary": [
+                        (t("comp_m_scenes", lang=lang), f"{comp_meta.get('scenes_used', 0)}"),
+                        (t("m_valid_pct", lang=lang), f"{comp_meta.get('valid_pct', 0.0):.1f} %"),
+                    ],
+                    "default_title": f"{comp_mode} Median — {comp_meta.get('sensor_name', 'Satellite')}",
+                    "default_subtitle": f"{d1} – {d2}",
+                    "sensor_label": str(comp_meta.get("sensor_name", "Optical")),
+                    "date_label": f"{d1} – {d2}",
+                    "resolution_m": float(comp_meta.get("resolution_m", 10.0)),
+                    "tif_bytes": st.session_state.get("tab2_comp_tif_bytes"),
+                    "tif_filename": st.session_state.get("tab2_comp_tif_filename") or f"composite_{comp_mode}.tif",
+                    "file_stem": f"Composite_{comp_mode}_{d1}_{d2}",
+                }
+            )
+
+    # 5. Tab 3: Change Detection (Δ Map)
+    diff_da = st.session_state.get("tab3_change_diff")
+    ch_meta = st.session_state.get("tab3_change_meta")
+    if diff_da is not None and isinstance(ch_meta, dict):
+        ch_idx = str(ch_meta.get("index_key", "NDVI"))
+        is_sar_ch = ch_meta.get("sensor") == SENSOR_S1
+        ch_spec = SAR_METRICS.get(ch_idx) if is_sar_ch else SPECTRAL_INDICES.get(ch_idx, SPECTRAL_INDICES["NDVI"])
+        diff_cmap = ch_spec["diff_cmap"] if ch_spec else "RdBu"
+        lim = 6.0 if is_sar_ch else 0.5
+        units_ch = "dB" if is_sar_ch else ""
+        d_t1 = str(ch_meta.get("date_t1", ""))
+        d_t2 = str(ch_meta.get("date_t2", ""))
+        s_cfg = SENSOR_META.get(ch_meta.get("sensor", SENSOR_S2), SENSOR_META[SENSOR_S2])
+        sources.append(
+            {
+                "id": "tab3_change",
+                "label": t("carto_layer_tab3_change", lang=lang, idx=ch_idx, d1=d_t1, d2=d_t2),
+                "raster": diff_da,
+                "crs": ch_meta.get("crs", CRS_D96TM),
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": diff_cmap,
+                "vmin": -lim,
+                "vmax": lim,
+                "discrete_items": None,
+                "legend_title": f"Δ{ch_idx} (T2 − T1)",
+                "legend_units": units_ch,
+                "stats_summary": [
+                    ("T1", d_t1),
+                    ("T2", d_t2),
+                ],
+                "default_title": f"Δ{ch_idx} ({d_t1} → {d_t2})",
+                "default_subtitle": s_cfg["short_name"],
+                "sensor_label": s_cfg["short_name"],
+                "date_label": f"{d_t1} → {d_t2}",
+                "resolution_m": float(ch_meta.get("resolution_m", 10.0)),
+                "tif_bytes": st.session_state.get("tab3_change_tif_bytes"),
+                "tif_filename": st.session_state.get("tab3_change_tif_filename") or f"delta_{ch_idx}.tif",
+                "file_stem": f"Delta_{ch_idx}_{d_t1}_to_{d_t2}",
+            }
+        )
+
+    return sources
 
 
 def _clip_raster_to_exact_aoi(
@@ -3332,7 +3634,7 @@ def main() -> None:
     )
     st.markdown(header_html, unsafe_allow_html=True)
 
-    tab1, tab2, tab3 = st.tabs([t("tab1"), t("tab2"), t("tab3")])
+    tab1, tab2, tab3, tab4 = st.tabs([t("tab1"), t("tab2"), t("tab3"), t("tab4")])
 
     items: list[Any] = st.session_state["stac_items"]
     summary_df: pd.DataFrame = st.session_state["stac_summary_df"]
@@ -5714,6 +6016,279 @@ def main() -> None:
                                         scene_id=chosen_frame["scene_id"],
                                     )
                                 )
+
+    # =======================================================================
+    # ZAVIHEK 4: GEODETSKA KARTOGRAFIJA / IZDELAVA KARTE ZA TISK (D96/TM)
+    # =======================================================================
+    with tab4:
+        st.subheader(t("carto_header"))
+        st.caption(t("carto_intro"))
+
+        carto_sources = _collect_carto_sources(lang)
+
+        if not carto_sources:
+            st.info(t("carto_no_layers_info"))
+            if search_performed and items and not summary_df.empty:
+                if st.button(
+                    t("carto_btn_quick_load"),
+                    type="primary",
+                    key="tab4_quick_load_btn",
+                ):
+                    is_sar_ql = active_sensor == SENSOR_S1
+                    ql_vis = "SAR_FC" if is_sar_ql else "RGB"
+                    ql_bands = (
+                        SAR_VIS_SPECS[ql_vis]["bands"]
+                        if is_sar_ql
+                        else OPTICAL_COMPOSITE_SPECS[ql_vis]["bands"]
+                    )
+                    ql_vars = (
+                        SAR_VIS_SPECS[ql_vis]["var_names"]
+                        if is_sar_ql
+                        else OPTICAL_COMPOSITE_SPECS[ql_vis]["bands"]
+                    )
+                    ql_row = summary_df.iloc[default_scene_idx]
+                    ql_item = items[default_scene_idx]
+                    with st.spinner(t("carto_quick_load_spinner", crs=target_crs)):
+                        try:
+                            ds_ql = load_scene(
+                                ql_item,
+                                bbox_4326=active_bbox,
+                                bands=ql_bands,
+                                crs=target_crs,
+                                resolution=int(selected_resolution),
+                                sensor=active_sensor,
+                                aoi_polygon=active_polygon,
+                            )
+                            ql_tif = export_to_geotiff_bytes(
+                                ds_ql[ql_vars], target_epsg=target_crs
+                            )
+                            epsg_num_ql = target_crs.split(":")[-1]
+                            ql_fname = (
+                                f"{active_sensor_cfg['prefix']}_{ql_vis}_"
+                                f"{ql_row['date_str']}_EPSG{epsg_num_ql}_{selected_resolution}m.tif"
+                            )
+                            st.session_state["loaded_scene_ds"] = ds_ql
+                            st.session_state["loaded_scene_display_ds"] = ds_ql
+                            st.session_state["loaded_scene_overlay_cache"] = None
+                            st.session_state["loaded_scene_meta"] = {
+                                "sensor": active_sensor,
+                                "sensor_name": active_sensor_cfg["short_name"],
+                                "date_str": str(ql_row["date_str"]),
+                                "cloud_cover": (
+                                    None
+                                    if pd.isna(ql_row["cloud_cover"])
+                                    else float(ql_row["cloud_cover"])
+                                ),
+                                "mgrs_tile": _format_tile_label(
+                                    str(ql_row["mgrs_tile"]), sensor=active_sensor
+                                ),
+                                "platform": str(ql_row["platform"]),
+                                "scene_id": str(ql_row["id"]),
+                                "crs": target_crs,
+                                "resolution_m": int(selected_resolution),
+                                "bands": ql_vars,
+                                "vis_code": ql_vis,
+                                "area_km2": float(st.session_state["search_area_km2"] or area_km2),
+                                "expanded_pan": False,
+                            }
+                            st.session_state["loaded_tif_bytes"] = ql_tif
+                            st.session_state["loaded_tif_filename"] = ql_fname
+                            gc.collect()
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(t("load_scene_error", err=exc))
+        else:
+            col_cfg, col_prev = st.columns([0.35, 0.65], gap="large")
+
+            with col_cfg:
+                with st.container(border=True):
+                    st.markdown(f"#### {t('carto_settings_header')}")
+
+                    src_ids = [s["id"] for s in carto_sources]
+                    src_map = {s["id"]: s for s in carto_sources}
+                    selected_src_id = st.selectbox(
+                        t("carto_layer_label"),
+                        options=src_ids,
+                        index=0,
+                        format_func=lambda sid: src_map[sid]["label"],
+                        key="tab4_source_select",
+                    )
+                    src = src_map[selected_src_id]
+
+                    # Posodobi privzeti naslov/podnaslov ob zamenjavi sloja
+                    if st.session_state.get("tab4_last_src_sig") != src["label"]:
+                        st.session_state["tab4_title_input"] = src["default_title"]
+                        st.session_state["tab4_subtitle_input"] = src["default_subtitle"]
+                        st.session_state["tab4_last_src_sig"] = src["label"]
+
+                    if "tab4_author_input" not in st.session_state:
+                        st.session_state["tab4_author_input"] = t("carto_author_default")
+
+                    carto_title = st.text_input(
+                        t("carto_title_label"),
+                        key="tab4_title_input",
+                    )
+                    carto_subtitle = st.text_input(
+                        t("carto_subtitle_label"),
+                        key="tab4_subtitle_input",
+                    )
+                    carto_author = st.text_input(
+                        t("carto_author_label"),
+                        key="tab4_author_input",
+                    )
+
+                    carto_fmt = _touch_selector(
+                        t("carto_format_label"),
+                        options=CARTO_FORMAT_KEYS,
+                        default="a4_landscape",
+                        format_func=lambda k, _lang=lang: t(CARTO_FORMAT_I18N[k], lang=_lang),
+                        key="tab4_page_format",
+                    )
+
+                    def _fmt_grid_opt(val: int, _lang: str = lang) -> str:
+                        if val == 0:
+                            return t("carto_grid_auto", lang=_lang)
+                        return f"{val // 1000} km" if val >= 1000 else f"{val} m"
+
+                    carto_grid_val = _touch_selector(
+                        t("carto_grid_spacing_label"),
+                        options=CARTO_GRID_OPTIONS,
+                        default=0,
+                        format_func=_fmt_grid_opt,
+                        key="tab4_grid_spacing",
+                    )
+
+                    carto_grid_style = _touch_selector(
+                        t("carto_grid_style_label"),
+                        options=CARTO_GRID_STYLE_KEYS,
+                        default="light",
+                        format_func=lambda k, _lang=lang: t(CARTO_GRID_STYLE_I18N[k], lang=_lang),
+                        key="tab4_grid_style",
+                    )
+
+                    st.caption(t("carto_elements_label"))
+                    chk_c1, chk_c2 = st.columns(2)
+                    with chk_c1:
+                        chk_grid = st.checkbox(t("carto_chk_grid"), value=True, key="tab4_chk_grid")
+                        chk_north = st.checkbox(t("carto_chk_north"), value=True, key="tab4_chk_north")
+                        chk_legend = st.checkbox(t("carto_chk_legend"), value=True, key="tab4_chk_legend")
+                    with chk_c2:
+                        chk_scale = st.checkbox(t("carto_chk_scalebar"), value=True, key="tab4_chk_scalebar")
+                        chk_aoi = st.checkbox(t("carto_chk_aoi"), value=True, key="tab4_chk_aoi")
+
+                    btn_gen_map = st.button(
+                        t("carto_btn_generate"),
+                        type="primary",
+                        width="stretch",
+                        key="tab4_btn_generate",
+                    )
+
+                if btn_gen_map:
+                    with st.spinner(t("carto_spinner")):
+                        try:
+                            res_map = render_geodetic_map(
+                                src["raster"],
+                                crs=src["crs"],
+                                is_rgb=bool(src["is_rgb"]),
+                                bands=src["bands"],
+                                use_percentile_stretch=bool(src["use_percentile_stretch"]),
+                                gamma=float(src["gamma"]),
+                                cmap_name=str(src["cmap_name"]),
+                                vmin=float(src["vmin"]),
+                                vmax=float(src["vmax"]),
+                                discrete_items=src["discrete_items"],
+                                legend_title=str(src["legend_title"]),
+                                legend_units=str(src["legend_units"]),
+                                stats_summary=src["stats_summary"],
+                                title=carto_title,
+                                subtitle=carto_subtitle,
+                                author=carto_author,
+                                sensor_label=str(src["sensor_label"]),
+                                date_label=str(src["date_label"]),
+                                resolution_m=float(src["resolution_m"]),
+                                page_format=str(carto_fmt),
+                                show_grid=bool(chk_grid),
+                                grid_spacing_m=(None if int(carto_grid_val) == 0 else int(carto_grid_val)),
+                                grid_style=str(carto_grid_style),
+                                show_scalebar=bool(chk_scale),
+                                show_north_arrow=bool(chk_north),
+                                show_legend=bool(chk_legend),
+                                show_aoi_outline=bool(chk_aoi),
+                                aoi_polygon_geojson=active_polygon,
+                                aoi_bbox_4326=active_bbox,
+                                aoi_legend_label=t("slippy_aoi_outline"),
+                                lang=lang,
+                            )
+                            tif_out = src["tif_bytes"]
+                            if tif_out is None:
+                                tif_src = (
+                                    src["raster"][src["bands"]]
+                                    if (isinstance(src["raster"], xr.Dataset) and src["bands"])
+                                    else src["raster"]
+                                )
+                                tif_out = export_to_geotiff_bytes(
+                                    tif_src,
+                                    target_epsg=src["crs"],
+                                )
+                            epsg_tag = str(src["crs"]).replace(":", "")
+                            stem = f"{src['file_stem']}_{epsg_tag}_{carto_fmt}"
+                            st.session_state["tab4_carto_result"] = res_map
+                            st.session_state["tab4_carto_meta"] = {
+                                "crs": str(src["crs"]),
+                                "stem": stem,
+                                "tif_bytes": tif_out,
+                                "tif_filename": src["tif_filename"],
+                            }
+                            gc.collect()
+                        except Exception as exc:
+                            st.error(t("carto_error", err=exc))
+
+            with col_prev:
+                st.markdown(f"#### {t('carto_preview_header')}")
+                carto_res: dict[str, Any] | None = st.session_state.get("tab4_carto_result")
+                carto_meta: dict[str, Any] | None = st.session_state.get("tab4_carto_meta")
+
+                if carto_res is None or carto_meta is None:
+                    st.info(t("carto_prompt_generate"))
+                else:
+                    st.image(carto_res["png_preview_bytes"], width="stretch")
+                    st.caption(
+                        t(
+                            "carto_preview_caption",
+                            scale=format_metric_number(carto_res["scale_denom"]),
+                            grid=format_metric_number(carto_res["grid_spacing_m"]),
+                            crs=carto_meta["crs"],
+                        )
+                    )
+
+                    dl_c1, dl_c2, dl_c3 = st.columns(3)
+                    with dl_c1:
+                        st.download_button(
+                            label=t("carto_btn_dl_pdf"),
+                            data=carto_res["pdf_bytes"],
+                            file_name=f"{carto_meta['stem']}_300dpi.pdf",
+                            mime="application/pdf",
+                            width="stretch",
+                            key="tab4_dl_pdf",
+                        )
+                    with dl_c2:
+                        st.download_button(
+                            label=t("carto_btn_dl_png"),
+                            data=carto_res["png_hires_bytes"],
+                            file_name=f"{carto_meta['stem']}_300dpi.png",
+                            mime="image/png",
+                            width="stretch",
+                            key="tab4_dl_png",
+                        )
+                    with dl_c3:
+                        st.download_button(
+                            label=t("carto_btn_dl_tif"),
+                            data=carto_meta["tif_bytes"],
+                            file_name=carto_meta["tif_filename"],
+                            mime="image/tiff",
+                            width="stretch",
+                            key="tab4_dl_tif",
+                        )
 
     # Prepreči odpiranje virtualne tipkovnice na preostalih dinamičnih selectboxih (tablice/telefoni)
     _inject_tablet_no_keyboard_js()
