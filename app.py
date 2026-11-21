@@ -19,7 +19,7 @@ import re
 import sys
 import unicodedata
 from datetime import date, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import folium
 from folium.plugins import Draw
@@ -32,6 +32,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import xarray as xr
+from shapely.geometry import box as shapely_box
 from shapely.geometry import mapping, shape
 from shapely.ops import unary_union
 from streamlit_folium import st_folium
@@ -42,6 +43,7 @@ if _APP_DIR not in sys.path:
 
 _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "geodezija_crs",
+    "map_overlay",
     "stac_loader",
     "analize",
     "casovne_vrste",
@@ -98,12 +100,19 @@ from geodezija_crs import (
     EPSG_WGS84,
     bbox_from_point_d96tm,
     bbox_from_point_wgs84,
+    clip_to_aoi_polygon,
     export_to_geotiff_bytes,
     transform_coords,
     validate_aoi_geometry,
     validate_aoi_size,
 )
 from i18n import t
+from map_overlay import (
+    build_horizontal_colorbar_html,
+    build_satellite_slippy_map,
+    expand_bbox_for_panning,
+    raster_to_map_overlay_png,
+)
 from stac_loader import (
     DEFAULT_MIN_AOI_COVERAGE_PCT,
     HISTORICAL_MIN_DATE,
@@ -616,6 +625,18 @@ INTERVAL_I18N: dict[str, str] = {
     INTERVAL_YEARLY: "interval_yearly",
 }
 
+VIEWER_MODE_KEYS: list[str] = ["slippy", "plotly"]
+VIEWER_MODE_I18N: dict[str, str] = {
+    "slippy": "viewer_mode_slippy",
+    "plotly": "viewer_mode_plotly",
+}
+
+SAR_WATER_DISCRETE_RGBA: dict[int, tuple[int, int, int, int]] = {
+    0: (203, 213, 225, 130),   # Kopno / Land (#CBD5E1 semi-transparent)
+    1: (3, 105, 161, 240),     # Voda / Poplava (#0369A1 crisp ocean blue)
+    255: (0, 0, 0, 0),         # NoData transparent
+}
+
 
 # ---------------------------------------------------------------------------
 # Pomožne funkcije: stanje seje, sinhronizacija senzorja/datumov, iskanje STAC
@@ -647,6 +668,7 @@ def _init_session_state() -> None:
         "temporal_interval": INTERVAL_ALL,
         "sidebar_interval_select": INTERVAL_ALL,
         "tab3_interval_select": INTERVAL_ALL,
+        "expand_pan_buffer": True,
         "map_basemap": "satellite",
         "loc_search_mode": "place",
         "sidebar_aoi_mode": "map",
@@ -674,11 +696,15 @@ def _init_session_state() -> None:
         "search_area_km2": None,
         # Tab 1 state
         "loaded_scene_ds": None,
+        "loaded_scene_display_ds": None,
+        "loaded_scene_overlay_cache": None,
         "loaded_scene_meta": None,
         "loaded_tif_bytes": None,
         "loaded_tif_filename": None,
         # Tab 2 state (optical, cloud-free composite & SAR)
         "tab2_index_da": None,
+        "tab2_index_display_da": None,
+        "tab2_index_overlay_cache": None,
         "tab2_index_stats": None,
         "tab2_index_meta": None,
         "tab2_tif_bytes": None,
@@ -688,6 +714,7 @@ def _init_session_state() -> None:
         "tab2_comp_tif_bytes": None,
         "tab2_comp_tif_filename": None,
         "tab2_sar_ds": None,
+        "tab2_sar_display_ds": None,
         "tab2_sar_meta": None,
         "tab2_sig_ds": None,
         "tab2_sig_meta": None,
@@ -720,10 +747,14 @@ def _clear_loaded_products() -> None:
     """Sprosti vse naložene rastre iz seje (zaščita 1 GB RAM pri menjavi AOI/senzorja)."""
     for key in (
         "loaded_scene_ds",
+        "loaded_scene_display_ds",
+        "loaded_scene_overlay_cache",
         "loaded_scene_meta",
         "loaded_tif_bytes",
         "loaded_tif_filename",
         "tab2_index_da",
+        "tab2_index_display_da",
+        "tab2_index_overlay_cache",
         "tab2_index_stats",
         "tab2_index_meta",
         "tab2_tif_bytes",
@@ -733,6 +764,7 @@ def _clear_loaded_products() -> None:
         "tab2_comp_tif_bytes",
         "tab2_comp_tif_filename",
         "tab2_sar_ds",
+        "tab2_sar_display_ds",
         "tab2_sar_meta",
         "tab2_sig_ds",
         "tab2_sig_meta",
@@ -754,6 +786,89 @@ def _clear_loaded_products() -> None:
     ):
         st.session_state[key] = None
     gc.collect()
+
+
+def _clip_raster_to_exact_aoi(
+    obj: xr.DataArray | xr.Dataset,
+    bbox_4326: Sequence[float] | None,
+    polygon_4326: dict[str, Any] | None = None,
+) -> xr.DataArray | xr.Dataset:
+    """Izreže razširjeni (+35 %) raster natančno na izvirni AOI za točne površine, statistiko in GeoTIFF."""
+    if polygon_4326 is not None:
+        return clip_to_aoi_polygon(obj, polygon_4326, drop=True)
+    if bbox_4326 is not None and len(bbox_4326) == 4:
+        min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox_4326)
+        box_geom = mapping(shapely_box(min_lon, min_lat, max_lon, max_lat))
+        return clip_to_aoi_polygon(obj, box_geom, drop=True)
+    return obj
+
+
+def _get_tab1_overlay_entry(
+    *,
+    ds_disp: xr.Dataset,
+    meta: dict[str, Any],
+    use_percentile: bool,
+    gamma: float,
+    lang: str,
+) -> tuple[str, list[list[float]], str]:
+    """Vrne (in predpomni v seji) PNG prekrivni sloj v EPSG:4326 za naložen posnetek iz Zavihka 1."""
+    is_sar = meta["sensor"] == SENSOR_S1
+    vis_code = str(meta["vis_code"])
+    cache_sig = (
+        meta["scene_id"],
+        vis_code,
+        meta["crs"],
+        meta["resolution_m"],
+        bool(use_percentile),
+        round(float(gamma), 2),
+        bool(meta.get("expanded_pan", False)),
+    )
+    cached = st.session_state.get("loaded_scene_overlay_cache")
+    if isinstance(cached, dict) and cached.get("sig") == cache_sig:
+        png_uri, bounds = cached["png_uri"], cached["bounds"]
+    else:
+        if is_sar and vis_code in ("VV", "VH"):
+            spec = SAR_METRICS[vis_code]
+            png_uri, bounds = raster_to_map_overlay_png(
+                ds_disp[vis_code],
+                src_epsg=meta["crs"],
+                is_rgb=False,
+                cmap_name=str(spec["cmap"]),
+                vmin=float(spec["vmin"]),
+                vmax=float(spec["vmax"]),
+            )
+        elif is_sar:
+            png_uri, bounds = raster_to_map_overlay_png(
+                ds_disp,
+                src_epsg=meta["crs"],
+                is_rgb=True,
+                bands=["VV", "VH"],
+                use_percentile_stretch=bool(use_percentile),
+                gamma=float(gamma),
+                fixed_ranges=[(-22.0, -2.0), (-28.0, -8.0), (2.0, 14.0)],
+            )
+        else:
+            png_uri, bounds = raster_to_map_overlay_png(
+                ds_disp,
+                src_epsg=meta["crs"],
+                is_rgb=True,
+                bands=list(meta["bands"]),
+                use_percentile_stretch=bool(use_percentile),
+                gamma=float(gamma),
+            )
+        st.session_state["loaded_scene_overlay_cache"] = {
+            "sig": cache_sig,
+            "png_uri": png_uri,
+            "bounds": bounds,
+        }
+
+    vis_pill = (
+        t(SAR_VIS_SPECS[vis_code]["pill_key"], lang=lang)
+        if is_sar
+        else t(OPTICAL_COMPOSITE_SPECS[vis_code]["pill_key"], lang=lang)
+    )
+    layer_name = f"🛰️ {meta['sensor_name']} {vis_pill} ({meta['date_str']})"
+    return png_uri, bounds, layer_name
 
 
 def _clamp_dates_for_sensor(sensor_key: str) -> None:
@@ -3379,6 +3494,14 @@ def main() -> None:
                             key="tab1_gamma",
                         )
 
+                    expand_pan_buffer = st.checkbox(
+                        t("expand_pan_label"),
+                        value=bool(st.session_state.get("expand_pan_buffer", True)),
+                        help=t("expand_pan_help"),
+                        key="tab1_expand_pan_chk",
+                    )
+                    st.session_state["expand_pan_buffer"] = bool(expand_pan_buffer)
+
                 if load_clicked and active_bbox is not None:
                     chosen_item = items[selected_idx]
                     chosen_row = summary_df.iloc[selected_idx]
@@ -3395,18 +3518,40 @@ def main() -> None:
                     ):
                         try:
                             st.session_state["loaded_scene_ds"] = None
+                            st.session_state["loaded_scene_display_ds"] = None
+                            st.session_state["loaded_scene_overlay_cache"] = None
                             st.session_state["loaded_tif_bytes"] = None
                             gc.collect()
 
-                            ds_loaded = load_scene(
-                                sensor=active_sensor,
-                                item=chosen_item,
-                                bbox_4326=active_bbox,
-                                bands=req_bands,
-                                target_epsg=target_crs,
-                                resolution=float(selected_resolution),
-                                aoi_polygon_4326=active_polygon,
-                            )
+                            use_pan_buf = bool(st.session_state.get("expand_pan_buffer", True))
+                            if use_pan_buf:
+                                load_bbox = expand_bbox_for_panning(
+                                    active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                                )
+                                ds_display = load_scene(
+                                    sensor=active_sensor,
+                                    item=chosen_item,
+                                    bbox_4326=load_bbox,
+                                    bands=req_bands,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    aoi_polygon_4326=None,
+                                )
+                                ds_loaded = _clip_raster_to_exact_aoi(
+                                    ds_display, active_bbox, active_polygon
+                                )
+                            else:
+                                ds_loaded = load_scene(
+                                    sensor=active_sensor,
+                                    item=chosen_item,
+                                    bbox_4326=active_bbox,
+                                    bands=req_bands,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    aoi_polygon_4326=active_polygon,
+                                )
+                                ds_display = ds_loaded
+
                             tif_bytes = export_to_geotiff_bytes(ds_loaded, target_epsg=target_crs)
                             epsg_num = target_crs.replace("EPSG:", "")
                             prefix = active_sensor_cfg["file_prefix"]
@@ -3419,6 +3564,7 @@ def main() -> None:
                                 list(vis_spec["var_names"]) if is_sar_active else list(req_bands)
                             )
                             st.session_state["loaded_scene_ds"] = ds_loaded
+                            st.session_state["loaded_scene_display_ds"] = ds_display
                             st.session_state["loaded_scene_meta"] = {
                                 "sensor": active_sensor,
                                 "sensor_name": active_sensor_cfg["short_name"],
@@ -3438,6 +3584,7 @@ def main() -> None:
                                 "bands": var_names,
                                 "vis_code": vis_code,
                                 "area_km2": float(st.session_state["search_area_km2"] or area_km2),
+                                "expanded_pan": use_pan_buf,
                             }
                             st.session_state["loaded_tif_bytes"] = tif_bytes
                             st.session_state["loaded_tif_filename"] = tif_filename
@@ -3446,6 +3593,8 @@ def main() -> None:
                             st.error(t("load_scene_error", err=exc))
 
                 ds_show: xr.Dataset | None = st.session_state["loaded_scene_ds"]
+                _raw_disp = st.session_state.get("loaded_scene_display_ds")
+                ds_disp_show: xr.Dataset | None = _raw_disp if _raw_disp is not None else ds_show
                 meta: dict[str, Any] | None = st.session_state["loaded_scene_meta"]
 
                 if ds_show is not None and meta is not None and meta.get("sensor") == active_sensor:
@@ -3460,37 +3609,123 @@ def main() -> None:
                     m4.metric(t("m_dims"), f"{w_px} × {h_px} px")
                     m5.metric(t("m_area"), f"{meta['area_km2']:.2f} km²")
 
-                    st.caption(t("viewer_zoom_hint"))
-                    if active_sensor == SENSOR_S1:
-                        vis_lbl = t(SAR_VIS_SPECS[meta["vis_code"]]["label_key"])
-                        fig_scene = _build_sar_scene_plotly(
-                            ds=ds_show,
-                            vis_code=meta["vis_code"],
-                            vis_label=vis_lbl,
-                            target_crs=meta["crs"],
-                            use_percentile_stretch=use_percentile,
-                            gamma=gamma_val,
-                            tile_lbl=meta["mgrs_tile"],
+                    col_vm1, col_op1 = st.columns([1.65, 1.0], vertical_alignment="bottom")
+                    with col_vm1:
+                        t1_view_mode = _touch_selector(
+                            t("viewer_mode_label"),
+                            options=VIEWER_MODE_KEYS,
+                            default="slippy",
+                            format_func=lambda k, _lang=lang: t(VIEWER_MODE_I18N[k], lang=_lang),
+                            key="tab1_viewer_mode",
                         )
-                    else:
-                        vis_lbl = t(OPTICAL_COMPOSITE_SPECS[meta["vis_code"]]["label_key"])
-                        fig_scene = _build_optical_rgb_plotly(
-                            ds=ds_show,
-                            bands=meta["bands"],
-                            composite_label=vis_lbl,
-                            target_crs=meta["crs"],
-                            use_percentile_stretch=use_percentile,
-                            gamma=gamma_val,
-                            sensor_name=meta["sensor_name"],
-                            tile_lbl=meta["mgrs_tile"],
+                    with col_op1:
+                        t1_opacity_pct = st.slider(
+                            t("opacity_layer_label"),
+                            min_value=0,
+                            max_value=100,
+                            value=100,
+                            step=5,
+                            disabled=(t1_view_mode != "slippy"),
+                            key="tab1_overlay_opacity",
                         )
 
-                    st.plotly_chart(
-                        fig_scene,
-                        width="stretch",
-                        config=PLOTLY_VIEWER_CONFIG,
-                        key="tab1_plotly_raster_viewer",
-                    )
+                    if t1_view_mode == "slippy" and ds_disp_show is not None:
+                        st.caption(t("slippy_hint"))
+                        if active_sensor == SENSOR_S1 and meta["vis_code"] in ("VV", "VH"):
+                            s_spec = SAR_METRICS[meta["vis_code"]]
+                            st.markdown(
+                                build_horizontal_colorbar_html(
+                                    cmap_name=str(s_spec["cmap"]),
+                                    vmin=float(s_spec["vmin"]),
+                                    vmax=float(s_spec["vmax"]),
+                                    label=f"Sentinel-1 {meta['vis_code']}",
+                                    units="dB",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+
+                        png_uri_t1, bounds_t1, layer_name_t1 = _get_tab1_overlay_entry(
+                            ds_disp=ds_disp_show,
+                            meta=meta,
+                            use_percentile=use_percentile,
+                            gamma=gamma_val,
+                            lang=lang,
+                        )
+                        c_lat_t1 = (
+                            0.5 * (active_bbox[1] + active_bbox[3])
+                            if active_bbox is not None
+                            else center_lat
+                        )
+                        c_lon_t1 = (
+                            0.5 * (active_bbox[0] + active_bbox[2])
+                            if active_bbox is not None
+                            else center_lon
+                        )
+                        slippy_t1 = build_satellite_slippy_map(
+                            center_lat=c_lat_t1,
+                            center_lon=c_lon_t1,
+                            zoom=None,
+                            basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                            overlay_layers=[
+                                {
+                                    "name": layer_name_t1,
+                                    "image": png_uri_t1,
+                                    "bounds": bounds_t1,
+                                    "opacity": float(t1_opacity_pct) / 100.0,
+                                    "show": True,
+                                    "zindex": 15,
+                                }
+                            ],
+                            aoi_bbox_4326=active_bbox,
+                            aoi_polygon_geojson=active_polygon,
+                            aoi_bbox_3794=st.session_state.get("search_bbox_3794") or bbox_3794,
+                            aoi_outline_label=t("slippy_aoi_outline"),
+                            lang=lang,
+                        )
+                        st_folium(
+                            slippy_t1,
+                            height=620,
+                            use_container_width=True,
+                            returned_objects=[],
+                            key=(
+                                f"tab1_slippy_{meta['scene_id']}_{meta['vis_code']}_"
+                                f"{t1_opacity_pct}_{use_percentile}_{gamma_val:.2f}_"
+                                f"{st.session_state.get('map_basemap', 'satellite')}"
+                            ),
+                        )
+                        st.caption(t("geodetic_separation_caption", crs=meta["crs"]))
+                    else:
+                        st.caption(t("viewer_zoom_hint"))
+                        if active_sensor == SENSOR_S1:
+                            vis_lbl = t(SAR_VIS_SPECS[meta["vis_code"]]["label_key"])
+                            fig_scene = _build_sar_scene_plotly(
+                                ds=ds_show,
+                                vis_code=meta["vis_code"],
+                                vis_label=vis_lbl,
+                                target_crs=meta["crs"],
+                                use_percentile_stretch=use_percentile,
+                                gamma=gamma_val,
+                                tile_lbl=meta["mgrs_tile"],
+                            )
+                        else:
+                            vis_lbl = t(OPTICAL_COMPOSITE_SPECS[meta["vis_code"]]["label_key"])
+                            fig_scene = _build_optical_rgb_plotly(
+                                ds=ds_show,
+                                bands=meta["bands"],
+                                composite_label=vis_lbl,
+                                target_crs=meta["crs"],
+                                use_percentile_stretch=use_percentile,
+                                gamma=gamma_val,
+                                sensor_name=meta["sensor_name"],
+                                tile_lbl=meta["mgrs_tile"],
+                            )
+
+                        st.plotly_chart(
+                            fig_scene,
+                            width="stretch",
+                            config=PLOTLY_VIEWER_CONFIG,
+                            key="tab1_plotly_raster_viewer",
+                        )
 
                     cloud_disp = (
                         "— (SAR)"
@@ -3575,18 +3810,40 @@ def main() -> None:
                 ):
                     try:
                         st.session_state["tab2_sar_ds"] = None
+                        st.session_state["tab2_sar_display_ds"] = None
                         gc.collect()
 
-                        ds_vv = load_scene(
-                            sensor=SENSOR_S1,
-                            item=chosen_item,
-                            bbox_4326=active_bbox,
-                            bands=["vv"],
-                            target_epsg=target_crs,
-                            resolution=float(selected_resolution),
-                            aoi_polygon_4326=active_polygon,
-                        )
+                        use_pan_buf_s1 = bool(st.session_state.get("expand_pan_buffer", True))
+                        if use_pan_buf_s1:
+                            s1_load_bbox = expand_bbox_for_panning(
+                                active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                            )
+                            ds_vv_disp = load_scene(
+                                sensor=SENSOR_S1,
+                                item=chosen_item,
+                                bbox_4326=s1_load_bbox,
+                                bands=["vv"],
+                                target_epsg=target_crs,
+                                resolution=float(selected_resolution),
+                                aoi_polygon_4326=None,
+                            )
+                            ds_vv = _clip_raster_to_exact_aoi(
+                                ds_vv_disp, active_bbox, active_polygon
+                            )
+                        else:
+                            ds_vv = load_scene(
+                                sensor=SENSOR_S1,
+                                item=chosen_item,
+                                bbox_4326=active_bbox,
+                                bands=["vv"],
+                                target_epsg=target_crs,
+                                resolution=float(selected_resolution),
+                                aoi_polygon_4326=active_polygon,
+                            )
+                            ds_vv_disp = ds_vv
+
                         st.session_state["tab2_sar_ds"] = ds_vv
+                        st.session_state["tab2_sar_display_ds"] = ds_vv_disp
                         st.session_state["tab2_sar_meta"] = {
                             "date_str": str(chosen_row["date_str"]),
                             "mgrs_tile": _format_tile_label(str(chosen_row["mgrs_tile"]), sensor=SENSOR_S1),
@@ -3599,6 +3856,10 @@ def main() -> None:
                         st.error(t("index_error", err=exc))
 
             ds_sar_loaded: xr.Dataset | None = st.session_state["tab2_sar_ds"]
+            _raw_sar_disp = st.session_state.get("tab2_sar_display_ds")
+            ds_sar_disp: xr.Dataset | None = (
+                _raw_sar_disp if _raw_sar_disp is not None else ds_sar_loaded
+            )
             sar_meta: dict[str, Any] | None = st.session_state["tab2_sar_meta"]
 
             if ds_sar_loaded is not None and sar_meta is not None:
@@ -3622,21 +3883,115 @@ def main() -> None:
                     w3.metric(t("m_sar_vv_mean"), f"{vv_stats['mean']:.2f} dB")
                     w4.metric(t("m_valid_ha"), f"{water_stats['valid_area_ha']:,.2f} ha")
 
-                    st.caption(t("viewer_zoom_hint"))
-                    fig_water = _build_sar_water_plotly(
-                        mask_da=mask_da,
-                        threshold_db=float(sar_thr_db),
-                        target_crs=sar_meta["crs"],
-                        date_str=sar_meta["date_str"],
-                        tile_lbl=sar_meta["mgrs_tile"],
-                        resolution_m=float(sar_meta["resolution_m"]),
-                    )
-                    st.plotly_chart(
-                        fig_water,
-                        width="stretch",
-                        config=PLOTLY_VIEWER_CONFIG,
-                        key="tab2_sar_water_plotly_viewer",
-                    )
+                    col_vm_s1, col_op_s1 = st.columns([1.65, 1.0], vertical_alignment="bottom")
+                    with col_vm_s1:
+                        t2_sar_view_mode = _touch_selector(
+                            t("viewer_mode_label"),
+                            options=VIEWER_MODE_KEYS,
+                            default="slippy",
+                            format_func=lambda k, _lang=lang: t(VIEWER_MODE_I18N[k], lang=_lang),
+                            key="tab2_sar_viewer_mode",
+                        )
+                    with col_op_s1:
+                        t2_sar_opacity_pct = st.slider(
+                            t("opacity_index_label"),
+                            min_value=0,
+                            max_value=100,
+                            value=85,
+                            step=5,
+                            disabled=(t2_sar_view_mode != "slippy"),
+                            key="tab2_sar_overlay_opacity",
+                        )
+
+                    if t2_sar_view_mode == "slippy" and ds_sar_disp is not None:
+                        mask_disp_da, _ = compute_sar_water_mask(
+                            ds_sar_disp,
+                            threshold_db=float(sar_thr_db),
+                            polarization="VV",
+                            resolution_m=float(sar_meta["resolution_m"]),
+                        )
+                        st.caption(t("slippy_hint"))
+                        st.markdown(
+                            build_horizontal_colorbar_html(
+                                cmap_name="Greys",
+                                vmin=0.0,
+                                vmax=1.0,
+                                label=t(
+                                    "sar_water_map_title",
+                                    thr=sar_thr_db,
+                                    date=sar_meta["date_str"],
+                                ),
+                                discrete_items=[
+                                    (t("sar_water_legend_water"), "#0369A1"),
+                                    (t("sar_water_legend_land"), "#CBD5E1"),
+                                ],
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        w_uri, w_bounds = raster_to_map_overlay_png(
+                            mask_disp_da,
+                            src_epsg=sar_meta["crs"],
+                            is_rgb=False,
+                            discrete_rgba_map=SAR_WATER_DISCRETE_RGBA,
+                        )
+                        c_lat_s1 = (
+                            0.5 * (active_bbox[1] + active_bbox[3])
+                            if active_bbox is not None
+                            else center_lat
+                        )
+                        c_lon_s1 = (
+                            0.5 * (active_bbox[0] + active_bbox[2])
+                            if active_bbox is not None
+                            else center_lon
+                        )
+                        slippy_s1 = build_satellite_slippy_map(
+                            center_lat=c_lat_s1,
+                            center_lon=c_lon_s1,
+                            zoom=None,
+                            basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                            overlay_layers=[
+                                {
+                                    "name": f"🌊 SAR Water Mask ({sar_meta['date_str']}, VV < {sar_thr_db:.1f} dB)",
+                                    "image": w_uri,
+                                    "bounds": w_bounds,
+                                    "opacity": float(t2_sar_opacity_pct) / 100.0,
+                                    "show": True,
+                                    "zindex": 20,
+                                }
+                            ],
+                            aoi_bbox_4326=active_bbox,
+                            aoi_polygon_geojson=active_polygon,
+                            aoi_bbox_3794=st.session_state.get("search_bbox_3794") or bbox_3794,
+                            aoi_outline_label=t("slippy_aoi_outline"),
+                            lang=lang,
+                        )
+                        st_folium(
+                            slippy_s1,
+                            height=620,
+                            use_container_width=True,
+                            returned_objects=[],
+                            key=(
+                                f"tab2_sar_slippy_{sar_meta['scene_id']}_{sar_thr_db:.1f}_"
+                                f"{t2_sar_opacity_pct}_{st.session_state.get('map_basemap', 'satellite')}"
+                            ),
+                        )
+                        st.caption(t("geodetic_separation_caption", crs=sar_meta["crs"]))
+                    else:
+                        st.caption(t("viewer_zoom_hint"))
+                        fig_water = _build_sar_water_plotly(
+                            mask_da=mask_da,
+                            threshold_db=float(sar_thr_db),
+                            target_crs=sar_meta["crs"],
+                            date_str=sar_meta["date_str"],
+                            tile_lbl=sar_meta["mgrs_tile"],
+                            resolution_m=float(sar_meta["resolution_m"]),
+                        )
+                        st.plotly_chart(
+                            fig_water,
+                            width="stretch",
+                            config=PLOTLY_VIEWER_CONFIG,
+                            key="tab2_sar_water_plotly_viewer",
+                        )
 
                     hist_vv = _build_sar_vv_histogram(
                         vv_da=ds_sar_loaded["VV"],
@@ -3722,20 +4077,44 @@ def main() -> None:
                     ):
                         try:
                             st.session_state["tab2_index_da"] = None
+                            st.session_state["tab2_index_display_da"] = None
+                            st.session_state["tab2_index_overlay_cache"] = None
                             st.session_state["tab2_tif_bytes"] = None
                             gc.collect()
 
-                            ds_raw = load_scene(
-                                sensor=active_sensor,
-                                item=chosen_item,
-                                bbox_4326=active_bbox,
-                                bands=req_bands,
-                                target_epsg=target_crs,
-                                resolution=float(selected_resolution),
-                                aoi_polygon_4326=active_polygon,
-                            )
-                            ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
-                            index_da = compute_index(ds_masked, t2_index_key)
+                            use_pan_buf_t2 = bool(st.session_state.get("expand_pan_buffer", True))
+                            if use_pan_buf_t2:
+                                t2_load_bbox = expand_bbox_for_panning(
+                                    active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                                )
+                                ds_raw = load_scene(
+                                    sensor=active_sensor,
+                                    item=chosen_item,
+                                    bbox_4326=t2_load_bbox,
+                                    bands=req_bands,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    aoi_polygon_4326=None,
+                                )
+                                ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
+                                index_display_da = compute_index(ds_masked, t2_index_key)
+                                index_da = _clip_raster_to_exact_aoi(
+                                    index_display_da, active_bbox, active_polygon
+                                )
+                            else:
+                                ds_raw = load_scene(
+                                    sensor=active_sensor,
+                                    item=chosen_item,
+                                    bbox_4326=active_bbox,
+                                    bands=req_bands,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    aoi_polygon_4326=active_polygon,
+                                )
+                                ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
+                                index_da = compute_index(ds_masked, t2_index_key)
+                                index_display_da = index_da
+
                             stats = compute_index_stats(index_da, resolution_m=float(selected_resolution))
                             del ds_raw, ds_masked
                             gc.collect()
@@ -3749,18 +4128,21 @@ def main() -> None:
                             )
 
                             st.session_state["tab2_index_da"] = index_da
+                            st.session_state["tab2_index_display_da"] = index_display_da
                             st.session_state["tab2_index_stats"] = stats
                             st.session_state["tab2_index_meta"] = {
                                 "sensor": active_sensor,
                                 "sensor_name": active_sensor_cfg["short_name"],
                                 "index_key": t2_index_key,
                                 "date_str": str(chosen_row["date_str"]),
+                                "scene_id": str(chosen_row["id"]),
                                 "mgrs_tile": _format_tile_label(
                                     str(chosen_row["mgrs_tile"]), sensor=active_sensor
                                 ),
                                 "crs": target_crs,
                                 "resolution_m": int(selected_resolution),
                                 "mask_clouds": bool(t2_mask_clouds),
+                                "expanded_pan": use_pan_buf_t2,
                             }
                             st.session_state["tab2_tif_bytes"] = tif_bytes
                             st.session_state["tab2_tif_filename"] = tif_filename
@@ -3769,6 +4151,10 @@ def main() -> None:
                             st.error(t("index_error", err=exc))
 
                 idx_da: xr.DataArray | None = st.session_state["tab2_index_da"]
+                _raw_idx_disp = st.session_state.get("tab2_index_display_da")
+                idx_disp_da: xr.DataArray | None = (
+                    _raw_idx_disp if _raw_idx_disp is not None else idx_da
+                )
                 idx_stats: dict[str, Any] | None = st.session_state["tab2_index_stats"]
                 idx_meta: dict[str, Any] | None = st.session_state["tab2_index_meta"]
 
@@ -3788,22 +4174,163 @@ def main() -> None:
                         k4.metric(t("m_valid_pct"), f"{idx_stats['valid_pct']:.1f} %")
                         k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
 
-                        st.caption(t("viewer_zoom_hint"))
-                        fig_idx = _build_index_plotly(
-                            index_da=idx_da,
-                            index_key=idx_meta["index_key"],
-                            target_crs=idx_meta["crs"],
-                            date_str=idx_meta["date_str"],
-                            tile_lbl=idx_meta["mgrs_tile"],
-                            resolution_m=float(idx_meta["resolution_m"]),
-                            sensor_name=idx_meta["sensor_name"],
-                        )
-                        st.plotly_chart(
-                            fig_idx,
-                            width="stretch",
-                            config=PLOTLY_VIEWER_CONFIG,
-                            key="tab2_index_plotly_viewer",
-                        )
+                        col_vm2, col_op2 = st.columns([1.65, 1.0], vertical_alignment="bottom")
+                        with col_vm2:
+                            t2_view_mode = _touch_selector(
+                                t("viewer_mode_label"),
+                                options=VIEWER_MODE_KEYS,
+                                default="slippy",
+                                format_func=lambda k, _lang=lang: t(VIEWER_MODE_I18N[k], lang=_lang),
+                                key="tab2_index_viewer_mode",
+                            )
+                        with col_op2:
+                            t2_opacity_pct = st.slider(
+                                t("opacity_index_label"),
+                                min_value=0,
+                                max_value=100,
+                                value=85,
+                                step=5,
+                                disabled=(t2_view_mode != "slippy"),
+                                key="tab2_index_overlay_opacity",
+                            )
+
+                        if t2_view_mode == "slippy" and idx_disp_da is not None:
+                            idx_key_s = str(idx_meta["index_key"])
+                            idx_spec = SPECTRAL_INDICES[idx_key_s]
+                            st.caption(t("slippy_hint"))
+                            st.markdown(
+                                build_horizontal_colorbar_html(
+                                    cmap_name=str(idx_spec["cmap"]),
+                                    vmin=float(idx_spec["vmin"]),
+                                    vmax=float(idx_spec["vmax"]),
+                                    label=f"{idx_meta['sensor_name']} — {idx_key_s} ({idx_meta['date_str']})",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+
+                            idx_cache_sig = (
+                                idx_meta.get("scene_id", idx_meta["date_str"]),
+                                idx_key_s,
+                                idx_meta["crs"],
+                                idx_meta["resolution_m"],
+                                bool(idx_meta.get("mask_clouds", True)),
+                                bool(idx_meta.get("expanded_pan", False)),
+                            )
+                            idx_cached = st.session_state.get("tab2_index_overlay_cache")
+                            if isinstance(idx_cached, dict) and idx_cached.get("sig") == idx_cache_sig:
+                                idx_uri, idx_bounds = idx_cached["png_uri"], idx_cached["bounds"]
+                            else:
+                                idx_uri, idx_bounds = raster_to_map_overlay_png(
+                                    idx_disp_da,
+                                    src_epsg=idx_meta["crs"],
+                                    is_rgb=False,
+                                    cmap_name=str(idx_spec["cmap"]),
+                                    vmin=float(idx_spec["vmin"]),
+                                    vmax=float(idx_spec["vmax"]),
+                                )
+                                st.session_state["tab2_index_overlay_cache"] = {
+                                    "sig": idx_cache_sig,
+                                    "png_uri": idx_uri,
+                                    "bounds": idx_bounds,
+                                }
+
+                            t2_overlays: list[dict[str, Any]] = []
+                            # Če je v Zavihku 1 že naložen satelitski posnetek istega senzorja, ga ponudimo kot spodnji sloj v LayerControl
+                            _raw_t1_disp = st.session_state.get("loaded_scene_display_ds")
+                            t1_disp = (
+                                _raw_t1_disp
+                                if _raw_t1_disp is not None
+                                else st.session_state.get("loaded_scene_ds")
+                            )
+                            t1_meta = st.session_state.get("loaded_scene_meta")
+                            if (
+                                t1_disp is not None
+                                and t1_meta is not None
+                                and t1_meta.get("sensor") == active_sensor
+                            ):
+                                try:
+                                    t1_uri, t1_bnds, t1_lbl = _get_tab1_overlay_entry(
+                                        ds_disp=t1_disp,
+                                        meta=t1_meta,
+                                        use_percentile=bool(st.session_state.get("tab1_stretch", True)),
+                                        gamma=float(st.session_state.get("tab1_gamma", 1.0)),
+                                        lang=lang,
+                                    )
+                                    t2_overlays.append(
+                                        {
+                                            "name": t1_lbl,
+                                            "image": t1_uri,
+                                            "bounds": t1_bnds,
+                                            "opacity": 1.0,
+                                            "show": False,
+                                            "zindex": 12,
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+
+                            t2_overlays.append(
+                                {
+                                    "name": f"📊 {idx_key_s} ({idx_meta['date_str']})",
+                                    "image": idx_uri,
+                                    "bounds": idx_bounds,
+                                    "opacity": float(t2_opacity_pct) / 100.0,
+                                    "show": True,
+                                    "zindex": 20,
+                                }
+                            )
+
+                            c_lat_t2 = (
+                                0.5 * (active_bbox[1] + active_bbox[3])
+                                if active_bbox is not None
+                                else center_lat
+                            )
+                            c_lon_t2 = (
+                                0.5 * (active_bbox[0] + active_bbox[2])
+                                if active_bbox is not None
+                                else center_lon
+                            )
+                            slippy_t2 = build_satellite_slippy_map(
+                                center_lat=c_lat_t2,
+                                center_lon=c_lon_t2,
+                                zoom=None,
+                                basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                                overlay_layers=t2_overlays,
+                                aoi_bbox_4326=active_bbox,
+                                aoi_polygon_geojson=active_polygon,
+                                aoi_bbox_3794=st.session_state.get("search_bbox_3794") or bbox_3794,
+                                aoi_outline_label=t("slippy_aoi_outline"),
+                                lang=lang,
+                            )
+                            st_folium(
+                                slippy_t2,
+                                height=620,
+                                use_container_width=True,
+                                returned_objects=[],
+                                key=(
+                                    f"tab2_idx_slippy_{idx_meta.get('scene_id', idx_meta['date_str'])}_"
+                                    f"{idx_key_s}_{t2_opacity_pct}_{len(t2_overlays)}_"
+                                    f"{st.session_state.get('map_basemap', 'satellite')}"
+                                ),
+                            )
+                            st.caption(t("geodetic_separation_caption", crs=idx_meta["crs"]))
+                        else:
+                            st.caption(t("viewer_zoom_hint"))
+                            fig_idx = _build_index_plotly(
+                                index_da=idx_da,
+                                index_key=idx_meta["index_key"],
+                                target_crs=idx_meta["crs"],
+                                date_str=idx_meta["date_str"],
+                                tile_lbl=idx_meta["mgrs_tile"],
+                                resolution_m=float(idx_meta["resolution_m"]),
+                                sensor_name=idx_meta["sensor_name"],
+                            )
+                            st.plotly_chart(
+                                fig_idx,
+                                width="stretch",
+                                config=PLOTLY_VIEWER_CONFIG,
+                                key="tab2_index_plotly_viewer",
+                            )
 
                         st.caption(
                             t(
@@ -3957,6 +4484,27 @@ def main() -> None:
                     cm3.metric(t("m_valid_pct"), f"{comp_meta_show['valid_pct']:.1f} %")
                     cm4.metric(t("m_valid_ha"), f"{comp_meta_show['valid_area_ha']:,.2f} ha")
 
+                    col_vm_c, col_op_c = st.columns([1.65, 1.0], vertical_alignment="bottom")
+                    with col_vm_c:
+                        comp_view_mode = _touch_selector(
+                            t("viewer_mode_label"),
+                            options=VIEWER_MODE_KEYS,
+                            default="slippy",
+                            format_func=lambda k, _lang=lang: t(VIEWER_MODE_I18N[k], lang=_lang),
+                            key="tab2_comp_viewer_mode",
+                        )
+                    with col_op_c:
+                        comp_default_op = 100 if comp_meta_show["mode"] == "RGB_NIR" else 85
+                        comp_opacity_pct = st.slider(
+                            t("opacity_layer_label") if comp_meta_show["mode"] == "RGB_NIR" else t("opacity_index_label"),
+                            min_value=0,
+                            max_value=100,
+                            value=comp_default_op,
+                            step=5,
+                            disabled=(comp_view_mode != "slippy"),
+                            key=f"tab2_comp_opacity_{comp_meta_show['mode']}",
+                        )
+
                     if comp_meta_show["mode"] == "RGB_NIR" and isinstance(comp_obj, xr.Dataset):
                         col_cd, col_cs, col_cg = st.columns([1.3, 0.85, 0.95], vertical_alignment="center")
                         with col_cd:
@@ -3989,61 +4537,177 @@ def main() -> None:
                             )
 
                         comp_bands = ["B04", "B03", "B02"] if comp_disp == "RGB" else ["B08", "B04", "B03"]
-                        rgb_u8 = _compose_rgb_uint8(
-                            comp_obj, comp_bands, use_percentile_stretch=comp_stretch, gamma=comp_gamma
-                        )
-                        title_key = "comp_title_rgb" if comp_disp == "RGB" else "comp_title_nir"
-                        comp_title = (
-                            f"<b>{comp_meta_show['sensor_name']} — "
-                            f"{t(title_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
-                            f"<span style='font-size:12px;color:#475569'>"
-                            f"{t('fig_res_bands', crs=comp_meta_show['crs'], res=float(comp_meta_show['resolution_m']), bands='-'.join(comp_bands))}</span>"
-                        )
-                        st.caption(t("viewer_zoom_hint"))
-                        fig_comp = render_interactive_raster_plotly(
-                            mode="rgb",
-                            x_coords=comp_obj.coords["x"].values,
-                            y_coords=comp_obj.coords["y"].values,
-                            rgb_uint8=rgb_u8,
-                            title=comp_title,
-                            target_crs=comp_meta_show["crs"],
-                        )
-                        st.plotly_chart(
-                            fig_comp,
-                            width="stretch",
-                            config=PLOTLY_VIEWER_CONFIG,
-                            key="tab2_comp_rgb_plotly_viewer",
-                        )
+                        if comp_view_mode == "slippy":
+                            st.caption(t("slippy_hint"))
+                            c_uri, c_bounds = raster_to_map_overlay_png(
+                                comp_obj,
+                                src_epsg=comp_meta_show["crs"],
+                                is_rgb=True,
+                                bands=comp_bands,
+                                use_percentile_stretch=comp_stretch,
+                                gamma=comp_gamma,
+                            )
+                            c_lat_c = (
+                                0.5 * (active_bbox[1] + active_bbox[3])
+                                if active_bbox is not None
+                                else center_lat
+                            )
+                            c_lon_c = (
+                                0.5 * (active_bbox[0] + active_bbox[2])
+                                if active_bbox is not None
+                                else center_lon
+                            )
+                            slippy_comp = build_satellite_slippy_map(
+                                center_lat=c_lat_c,
+                                center_lon=c_lon_c,
+                                zoom=None,
+                                basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                                overlay_layers=[
+                                    {
+                                        "name": f"☁️ {comp_disp} Median ({comp_meta_show['date_start']}–{comp_meta_show['date_end']})",
+                                        "image": c_uri,
+                                        "bounds": c_bounds,
+                                        "opacity": float(comp_opacity_pct) / 100.0,
+                                        "show": True,
+                                        "zindex": 18,
+                                    }
+                                ],
+                                aoi_bbox_4326=active_bbox,
+                                aoi_polygon_geojson=active_polygon,
+                                aoi_bbox_3794=st.session_state.get("search_bbox_3794") or bbox_3794,
+                                aoi_outline_label=t("slippy_aoi_outline"),
+                                lang=lang,
+                            )
+                            st_folium(
+                                slippy_comp,
+                                height=620,
+                                use_container_width=True,
+                                returned_objects=[],
+                                key=(
+                                    f"tab2_comp_rgb_slippy_{comp_disp}_{comp_opacity_pct}_"
+                                    f"{comp_stretch}_{comp_gamma:.2f}_{comp_meta_show['date_end']}_"
+                                    f"{st.session_state.get('map_basemap', 'satellite')}"
+                                ),
+                            )
+                            st.caption(t("geodetic_separation_caption", crs=comp_meta_show["crs"]))
+                        else:
+                            rgb_u8 = _compose_rgb_uint8(
+                                comp_obj, comp_bands, use_percentile_stretch=comp_stretch, gamma=comp_gamma
+                            )
+                            title_key = "comp_title_rgb" if comp_disp == "RGB" else "comp_title_nir"
+                            comp_title = (
+                                f"<b>{comp_meta_show['sensor_name']} — "
+                                f"{t(title_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
+                                f"<span style='font-size:12px;color:#475569'>"
+                                f"{t('fig_res_bands', crs=comp_meta_show['crs'], res=float(comp_meta_show['resolution_m']), bands='-'.join(comp_bands))}</span>"
+                            )
+                            st.caption(t("viewer_zoom_hint"))
+                            fig_comp = render_interactive_raster_plotly(
+                                mode="rgb",
+                                x_coords=comp_obj.coords["x"].values,
+                                y_coords=comp_obj.coords["y"].values,
+                                rgb_uint8=rgb_u8,
+                                title=comp_title,
+                                target_crs=comp_meta_show["crs"],
+                            )
+                            st.plotly_chart(
+                                fig_comp,
+                                width="stretch",
+                                config=PLOTLY_VIEWER_CONFIG,
+                                key="tab2_comp_rgb_plotly_viewer",
+                            )
                     elif isinstance(comp_obj, xr.DataArray):
                         c_idx_key = str(comp_meta_show["mode"])
                         c_spec = SPECTRAL_INDICES[c_idx_key]
                         c_stats = compute_index_stats(comp_obj, resolution_m=float(comp_meta_show["resolution_m"]))
-                        comp_title = (
-                            f"<b>{comp_meta_show['sensor_name']} — "
-                            f"{t('comp_title_idx', idx=c_idx_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
-                            f"<span style='font-size:12px;color:#475569'>"
-                            f"{comp_meta_show['crs']} | {comp_meta_show['resolution_m']} m | "
-                            f"{t('m_mean')}: {c_stats['mean']:.3f} · {t('m_median')}: {c_stats['median']:.3f}</span>"
-                        )
-                        st.caption(t("viewer_zoom_hint"))
-                        fig_comp = render_interactive_raster_plotly(
-                            mode="heatmap",
-                            x_coords=comp_obj.coords["x"].values,
-                            y_coords=comp_obj.coords["y"].values,
-                            z_data=comp_obj.values,
-                            cmap_name=str(c_spec["cmap"]),
-                            zmin=float(c_spec["vmin"]),
-                            zmax=float(c_spec["vmax"]),
-                            cbar_title=c_idx_key,
-                            title=comp_title,
-                            target_crs=comp_meta_show["crs"],
-                        )
-                        st.plotly_chart(
-                            fig_comp,
-                            width="stretch",
-                            config=PLOTLY_VIEWER_CONFIG,
-                            key="tab2_comp_idx_plotly_viewer",
-                        )
+                        if comp_view_mode == "slippy":
+                            st.caption(t("slippy_hint"))
+                            st.markdown(
+                                build_horizontal_colorbar_html(
+                                    cmap_name=str(c_spec["cmap"]),
+                                    vmin=float(c_spec["vmin"]),
+                                    vmax=float(c_spec["vmax"]),
+                                    label=f"{comp_meta_show['sensor_name']} — {c_idx_key} Median ({comp_meta_show['date_start']}–{comp_meta_show['date_end']})",
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            ci_uri, ci_bounds = raster_to_map_overlay_png(
+                                comp_obj,
+                                src_epsg=comp_meta_show["crs"],
+                                is_rgb=False,
+                                cmap_name=str(c_spec["cmap"]),
+                                vmin=float(c_spec["vmin"]),
+                                vmax=float(c_spec["vmax"]),
+                            )
+                            c_lat_c = (
+                                0.5 * (active_bbox[1] + active_bbox[3])
+                                if active_bbox is not None
+                                else center_lat
+                            )
+                            c_lon_c = (
+                                0.5 * (active_bbox[0] + active_bbox[2])
+                                if active_bbox is not None
+                                else center_lon
+                            )
+                            slippy_ci = build_satellite_slippy_map(
+                                center_lat=c_lat_c,
+                                center_lon=c_lon_c,
+                                zoom=None,
+                                basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                                overlay_layers=[
+                                    {
+                                        "name": f"☁️ {c_idx_key} Median ({comp_meta_show['date_start']}–{comp_meta_show['date_end']})",
+                                        "image": ci_uri,
+                                        "bounds": ci_bounds,
+                                        "opacity": float(comp_opacity_pct) / 100.0,
+                                        "show": True,
+                                        "zindex": 18,
+                                    }
+                                ],
+                                aoi_bbox_4326=active_bbox,
+                                aoi_polygon_geojson=active_polygon,
+                                aoi_bbox_3794=st.session_state.get("search_bbox_3794") or bbox_3794,
+                                aoi_outline_label=t("slippy_aoi_outline"),
+                                lang=lang,
+                            )
+                            st_folium(
+                                slippy_ci,
+                                height=620,
+                                use_container_width=True,
+                                returned_objects=[],
+                                key=(
+                                    f"tab2_comp_idx_slippy_{c_idx_key}_{comp_opacity_pct}_"
+                                    f"{comp_meta_show['date_end']}_{st.session_state.get('map_basemap', 'satellite')}"
+                                ),
+                            )
+                            st.caption(t("geodetic_separation_caption", crs=comp_meta_show["crs"]))
+                        else:
+                            comp_title = (
+                                f"<b>{comp_meta_show['sensor_name']} — "
+                                f"{t('comp_title_idx', idx=c_idx_key, d1=comp_meta_show['date_start'], d2=comp_meta_show['date_end'], n=comp_meta_show['scenes_used'])}</b><br>"
+                                f"<span style='font-size:12px;color:#475569'>"
+                                f"{comp_meta_show['crs']} | {comp_meta_show['resolution_m']} m | "
+                                f"{t('m_mean')}: {c_stats['mean']:.3f} · {t('m_median')}: {c_stats['median']:.3f}</span>"
+                            )
+                            st.caption(t("viewer_zoom_hint"))
+                            fig_comp = render_interactive_raster_plotly(
+                                mode="heatmap",
+                                x_coords=comp_obj.coords["x"].values,
+                                y_coords=comp_obj.coords["y"].values,
+                                z_data=comp_obj.values,
+                                cmap_name=str(c_spec["cmap"]),
+                                zmin=float(c_spec["vmin"]),
+                                zmax=float(c_spec["vmax"]),
+                                cbar_title=c_idx_key,
+                                title=comp_title,
+                                target_crs=comp_meta_show["crs"],
+                            )
+                            st.plotly_chart(
+                                fig_comp,
+                                width="stretch",
+                                config=PLOTLY_VIEWER_CONFIG,
+                                key="tab2_comp_idx_plotly_viewer",
+                            )
 
                     st.caption(
                         t(

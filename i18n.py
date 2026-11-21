@@ -406,6 +406,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "interval_summary_caption": "Izbranih **{sel}** reprezentativnih datumov (interval: **{interval}**) izmed **{total}** najdenih datumov{partial_note}.",
         "partial_filtered_note": " · {n} delnih posnetkov (< 90 % AOI) izločenih",
         "sensor_min_date_hint": "Arhiv senzorja {sensor} se začne leta {year}. Za starejše posnetke (od 1984) preklopite na Landsat.",
+        # Phase 1: Interactive Satellite Slippy Map
+        "viewer_mode_label": "Način prikaza:",
+        "viewer_mode_slippy": "🗺️ Interaktivni zemljevid (Premikanje & Zoom)",
+        "viewer_mode_plotly": "📐 Metrični prikaz D96/TM (Plotly)",
+        "opacity_layer_label": "Prosojnost sloja [%]:",
+        "opacity_index_label": "Prosojnost indeksa [%]:",
+        "expand_pan_label": "Razširi območje prenosa (+35 %) za premikanje po karti",
+        "expand_pan_help": (
+            "Naloži +35 % širšo satelitsko okolico za gladko premikanje po interaktivni karti, "
+            "medtem ko vse površine [ha], statistika, histogrami in GeoTIFF izvoz ostanejo 100 % omejeni na vaš točen AOI."
+        ),
+        "slippy_aoi_outline": "Meja AOI (območje analize)",
+        "slippy_hint": (
+            "💡 Interaktivni satelitski zemljevid: premikajte pogled z miško ali prstom (Pan), povečujte do ravni ulic in parcel (Zoom) "
+            "ter v zgornjem desnem kotu vklapljajte/izklapljajte sloje (QGIS stil)."
+        ),
+        "geodetic_separation_caption": (
+            "Izračuni in izvoz: **{crs}** (točen AOI) | Spletni prikaz: **EPSG:4326/3857**"
+        ),
     },
     "en": {
         # App chrome & header
@@ -808,6 +827,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "interval_summary_caption": "Selected **{sel}** representative dates (interval: **{interval}**) out of **{total}** matching dates{partial_note}.",
         "partial_filtered_note": " · {n} partial scenes (< 90% AOI) excluded",
         "sensor_min_date_hint": "{sensor} archive starts in {year}. Switch to Landsat for historical scenes back to 1984.",
+        # Phase 1: Interactive Satellite Slippy Map
+        "viewer_mode_label": "Viewer mode:",
+        "viewer_mode_slippy": "🗺️ Interactive Slippy Map (Pan & Zoom)",
+        "viewer_mode_plotly": "📐 Metric D96/TM Viewer (Plotly)",
+        "opacity_layer_label": "Layer Opacity [%]:",
+        "opacity_index_label": "Index Opacity [%]:",
+        "expand_pan_label": "Expand download area (+35%) for map panning",
+        "expand_pan_help": (
+            "Streams a +35% wider satellite context for smooth slippy-map panning while keeping all "
+            "area statistics [ha], histograms, and GeoTIFF exports strictly locked to your exact AOI."
+        ),
+        "slippy_aoi_outline": "AOI Boundary (analysis area)",
+        "slippy_hint": (
+            "💡 Interactive satellite map: pan smoothly with mouse or touch, zoom down to street and parcel level, "
+            "and toggle layers on/off in the top-right QGIS-style layer panel."
+        ),
+        "geodetic_separation_caption": (
+            "Computations & GeoTIFF export: **{crs}** (exact AOI) | Web slippy-map display: **EPSG:4326/3857**"
+        ),
     },
 }
 
