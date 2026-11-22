@@ -34,6 +34,7 @@ from geodezija_crs import (
     EPSG_D96TM,
     EPSG_WGS84,
     bbox_from_point_wgs84,
+    get_best_metric_crs,
     transform_coords,
 )
 from stac_loader import (
@@ -765,8 +766,11 @@ def run_gnss_mission_plan(
         if progress_cb is not None:
             progress_cb(frac, msg)
 
+    if not target_epsg or str(target_epsg).strip().lower() == "auto":
+        target_epsg, _ = get_best_metric_crs(lat_deg, lon_deg, mode="auto")
+
     sel_const = [c for c in constellations if c in CONSTELLATIONS] or ["GPS", "Galileo"]
-    sta_e, sta_n = transform_coords(lon_deg, lat_deg, EPSG_WGS84, EPSG_D96TM)
+    sta_e, sta_n = transform_coords(lon_deg, lat_deg, EPSG_WGS84, target_epsg)
 
     # 1. Horizon Obstruction Mask (Terrain DEM + Local Sentinel-2 Obstacles)
     terrain_mask = np.zeros(N_AZ_SECTORS, dtype=np.float64)

@@ -193,8 +193,12 @@ def _crs_display_info(crs_spec: int | str | CRS, lang: str = "sl") -> tuple[str,
     epsg = crs_obj.to_epsg()
     if epsg == EPSG_D96TM:
         return ("D96/TM (EPSG:3794)", "e [m]", "n [m]")
-    if epsg == EPSG_UTM33N:
-        return ("UTM 33N (EPSG:32633)", "E [m]", "N [m]")
+    if epsg is not None and 32601 <= epsg <= 32660:
+        zone = epsg - 32600
+        return (f"UTM {zone}N (EPSG:{epsg})", "E [m]", "N [m]")
+    if epsg is not None and 32701 <= epsg <= 32760:
+        zone = epsg - 32700
+        return (f"UTM {zone}S (EPSG:{epsg})", "E [m]", "N [m]")
     label = f"EPSG:{epsg}" if epsg else crs_obj.name
     return (label, "X [m]", "Y [m]")
 

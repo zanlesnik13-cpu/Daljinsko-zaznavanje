@@ -28,7 +28,7 @@ from rasterio.enums import Resampling
 import rioxarray  # noqa: F401 - registers .rio accessor on xarray objects
 import xarray as xr
 
-from geodezija_crs import EPSG_D96TM, EPSG_WGS84, transform_coords, validate_aoi_size
+from geodezija_crs import EPSG_D96TM, EPSG_WGS84, get_best_metric_crs, transform_coords, validate_aoi_size
 
 # Persistent cartographic basemap definitions (mirrors app.py)
 SLIPPY_BASEMAP_SPECS: dict[str, dict[str, Any]] = {
@@ -393,8 +393,11 @@ def build_horizontal_colorbar_html(
     )
 
 
-def _d96tm_bbox_to_wgs84_ring(bbox_3794: Sequence[float]) -> list[list[float]]:
-    min_e, min_n, max_e, max_n = (float(v) for v in bbox_3794)
+def _metric_bbox_to_wgs84_ring(
+    bbox_metric: Sequence[float],
+    metric_crs: int | str = EPSG_D96TM,
+) -> list[list[float]]:
+    min_e, min_n, max_e, max_n = (float(v) for v in bbox_metric)
     corners = [
         (min_e, min_n),
         (max_e, min_n),
@@ -404,9 +407,13 @@ def _d96tm_bbox_to_wgs84_ring(bbox_3794: Sequence[float]) -> list[list[float]]:
     ]
     ring: list[list[float]] = []
     for e_val, n_val in corners:
-        lon, lat = transform_coords(e_val, n_val, EPSG_D96TM, EPSG_WGS84)
+        lon, lat = transform_coords(e_val, n_val, metric_crs, EPSG_WGS84)
         ring.append([lat, lon])
     return ring
+
+
+def _d96tm_bbox_to_wgs84_ring(bbox_3794: Sequence[float]) -> list[list[float]]:
+    return _metric_bbox_to_wgs84_ring(bbox_3794, metric_crs=EPSG_D96TM)
 
 
 def build_satellite_slippy_map(
@@ -419,6 +426,7 @@ def build_satellite_slippy_map(
     aoi_polygon_geojson: dict[str, Any] | None = None,
     *,
     aoi_bbox_3794: Sequence[float] | None = None,
+    aoi_metric_crs: int | str | None = None,
     aoi_outline_label: str = "AOI (meja analize)",
     lang: str = "sl",
 ) -> folium.Map:
@@ -498,7 +506,11 @@ def build_satellite_slippy_map(
                 tooltip=aoi_outline_label,
             ).add_to(aoi_fg)
         elif aoi_bbox_3794 is not None and len(aoi_bbox_3794) == 4:
-            ring = _d96tm_bbox_to_wgs84_ring(aoi_bbox_3794)
+            if aoi_metric_crs is not None:
+                eff_ring_crs: int | str = aoi_metric_crs
+            else:
+                eff_ring_crs, _ = get_best_metric_crs(float(center_lat), float(center_lon), mode="auto")
+            ring = _metric_bbox_to_wgs84_ring(aoi_bbox_3794, metric_crs=eff_ring_crs)
             folium.Polygon(
                 locations=ring,
                 color="#0F766E",

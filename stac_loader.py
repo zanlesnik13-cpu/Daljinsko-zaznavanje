@@ -1434,3 +1434,56 @@ def load_scene(
             aoi_polygon_4326=aoi_polygon_4326,
         )
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")
+
+
+def load_copernicus_dem(
+    bbox_4326: Sequence[float],
+    target_epsg: int | str = "EPSG:3794",
+    resolution: float = 30.0,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+) -> xr.DataArray | None:
+    """Stream Copernicus DEM 30 m (``cop-dem-glo-30``) clipped to the AOI in ``target_epsg``.
+
+    Returns a float32 elevation ``xr.DataArray`` [m a.s.l.] with invalid voids
+    (``<= -500 m``) masked to ``np.nan``, or ``None`` if no tiles cover the AOI.
+    """
+    try:
+        catalog = get_stac_catalog()
+        search = catalog.search(
+            collections=["cop-dem-glo-30"],
+            bbox=list(bbox_4326),
+            max_items=8,
+        )
+        items = list(search.items())
+        if not items:
+            return None
+
+        ds = odc.stac.load(
+            items,
+            bands=["data"],
+            bbox=list(bbox_4326),
+            crs=str(target_epsg),
+            resolution=float(resolution),
+            groupby="solar_day",
+        )
+        da = ds["data"].isel(time=0, drop=True).compute().astype(np.float32)
+        da = da.where(da > -500.0)
+        da = da.rio.write_crs(str(target_epsg), inplace=False)
+        da = da.rio.write_nodata(np.nan, inplace=False)
+        if aoi_polygon_4326 is not None:
+            da = clip_to_aoi_polygon(da, aoi_polygon_4326, drop=False)
+        da = da.assign_attrs(
+            {
+                "long_name": "Copernicus DEM GLO-30 Elevation",
+                "units": "m",
+                "source": "cop-dem-glo-30",
+                "resolution_m": float(resolution),
+            }
+        )
+        del ds
+        gc.collect()
+        return da
+    except Exception as exc:
+        logger.warning("Copernicus DEM 30 m streaming unavailable for bbox %s: %s", bbox_4326, exc)
+        return None
+

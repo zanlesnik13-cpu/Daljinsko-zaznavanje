@@ -94,6 +94,7 @@ from analize import (
     compute_index_stats,
     compute_quick_land_cover,
     compute_sar_water_mask,
+    compute_snow_glacier_stats,
     extract_sar_metric,
     extract_spectral_signature,
     get_required_bands_for_sensor,
@@ -117,6 +118,10 @@ from geodezija_crs import (
     bbox_from_point_wgs84,
     clip_to_aoi_polygon,
     export_to_geotiff_bytes,
+    format_crs_label,
+    get_auto_utm_epsg,
+    get_best_metric_crs,
+    is_in_slovenia,
     transform_coords,
     validate_aoi_geometry,
     validate_aoi_size,
@@ -158,6 +163,7 @@ from stac_loader import (
     SENSOR_S2,
     TEMPORAL_INTERVAL_KEYS,
     filter_by_temporal_interval,
+    load_copernicus_dem,
     load_scene,
     search_scenes,
 )
@@ -586,6 +592,12 @@ AOI_MODE_I18N: dict[str, str] = {
     "geojson": "aoi_mode_geojson",
 }
 
+CRS_MODE_KEYS: list[str] = ["auto", "d96", "utm"]
+CRS_MODE_I18N: dict[str, str] = {
+    "auto": "crs_mode_auto",
+    "d96": "crs_mode_d96",
+    "utm": "crs_mode_utm",
+}
 CRS_KEYS: list[str] = [CRS_D96TM, CRS_UTM33N]
 CRS_I18N: dict[str, str] = {
     CRS_D96TM: "crs_d96_label",
@@ -645,8 +657,35 @@ SAR_VIS_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
-INDEX_KEYS: list[str] = ["NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
+INDEX_KEYS: list[str] = ["NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "NDSI"]
 SAR_METRIC_KEYS: list[str] = ["VV", "VH", "VV_VH"]
+
+SNOW_GLACIER_PRESETS: dict[str, dict[str, Any]] = {
+    "triglav_kanin": {
+        "label_key": "snow_preset_triglav",
+        "lat": 46.378,
+        "lon": 13.836,
+        "radius_m": 4000,
+    },
+    "pasterze": {
+        "label_key": "snow_preset_pasterze",
+        "lat": 47.086,
+        "lon": 12.725,
+        "radius_m": 5000,
+    },
+    "aletsch": {
+        "label_key": "snow_preset_aletsch",
+        "lat": 46.440,
+        "lon": 8.075,
+        "radius_m": 7000,
+    },
+}
+
+SNOW_MASK_DISCRETE_RGBA: dict[int, tuple[int, int, int, int]] = {
+    0: (226, 232, 240, 80),    # Kopno / Brez snega (#E2E8F0 subtle)
+    1: (14, 165, 233, 235),    # Sneg / Led / Ledenik (#0EA5E9 crisp ice cyan)
+    255: (0, 0, 0, 0),         # NoData transparent
+}
 
 INTERVAL_KEYS: list[str] = list(TEMPORAL_INTERVAL_KEYS)
 INTERVAL_I18N: dict[str, str] = {
@@ -764,6 +803,12 @@ def _init_session_state() -> None:
         "tab2_index_meta": None,
         "tab2_tif_bytes": None,
         "tab2_tif_filename": None,
+        "tab2_snow_mask_da": None,
+        "tab2_snow_display_da": None,
+        "tab2_snow_stats": None,
+        "tab2_snow_tif_bytes": None,
+        "tab2_snow_tif_filename": None,
+        "sidebar_crs_mode": "auto",
         "tab2_comp_obj": None,
         "tab2_comp_meta": None,
         "tab2_comp_tif_bytes": None,
@@ -832,6 +877,11 @@ def _clear_loaded_products() -> None:
         "tab2_index_meta",
         "tab2_tif_bytes",
         "tab2_tif_filename",
+        "tab2_snow_mask_da",
+        "tab2_snow_display_da",
+        "tab2_snow_stats",
+        "tab2_snow_tif_bytes",
+        "tab2_snow_tif_filename",
         "tab2_comp_obj",
         "tab2_comp_meta",
         "tab2_comp_tif_bytes",
@@ -972,6 +1022,50 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                 "tif_bytes": st.session_state.get("tab2_tif_bytes"),
                 "tif_filename": st.session_state.get("tab2_tif_filename") or f"{idx_key}.tif",
                 "file_stem": f"{idx_key}_{idx_meta.get('date_str', 'map')}",
+            }
+        )
+
+    # 2b. Tab 2B.1: Snow / Ice / Glacier Mask (NDSI)
+    snow_mask_da = st.session_state.get("tab2_snow_mask_da")
+    snow_stats = st.session_state.get("tab2_snow_stats")
+    if snow_mask_da is not None and isinstance(snow_stats, dict) and isinstance(idx_meta, dict):
+        sn_thr = float(snow_stats.get("ndsi_thresh", 0.40))
+        sn_rows: list[tuple[str, str]] = [
+            (t("snow_kpi_area", lang=lang), f"{snow_stats['snow_area_km2']:,.2f} km² ({snow_stats['snow_area_ha']:,.1f} ha)"),
+            (t("snow_kpi_share", lang=lang), f"{snow_stats['snow_pct']:.1f} %"),
+        ]
+        if snow_stats.get("dem_available") and snow_stats.get("snowline_p10_m") is not None:
+            sn_rows.append(
+                (t("snow_kpi_snowline", lang=lang), f"{snow_stats['snowline_p10_m']:,.0f} m")
+            )
+        sources.append(
+            {
+                "id": "tab2_snow_mask",
+                "label": t("carto_layer_tab2_snow", lang=lang, thr=sn_thr, date=idx_meta.get("date_str", "")),
+                "raster": snow_mask_da,
+                "crs": idx_meta.get("crs", CRS_D96TM),
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": "Blues",
+                "vmin": 0.0,
+                "vmax": 1.0,
+                "discrete_items": [
+                    (0, t("snow_mask_legend_free", lang=lang), "#E2E8F0"),
+                    (1, t("snow_mask_legend_snow", lang=lang), "#0EA5E9"),
+                ],
+                "legend_title": f"NDSI ≥ {sn_thr:.2f}",
+                "legend_units": "",
+                "stats_summary": sn_rows,
+                "default_title": f"Snow / Ice Extent (NDSI ≥ {sn_thr:.2f})" if lang == "en" else f"Obseg snega in ledu (NDSI ≥ {sn_thr:.2f})",
+                "default_subtitle": f"{idx_meta.get('sensor_name', 'Optical')} | {idx_meta.get('date_str', '')}",
+                "sensor_label": str(idx_meta.get("sensor_name", "Optical")),
+                "date_label": str(idx_meta.get("date_str", "")),
+                "resolution_m": float(idx_meta.get("resolution_m", 10.0)),
+                "tif_bytes": st.session_state.get("tab2_snow_tif_bytes"),
+                "tif_filename": st.session_state.get("tab2_snow_tif_filename") or "snow_mask.tif",
+                "file_stem": f"SnowMask_NDSI_{idx_meta.get('date_str', 'map')}",
             }
         )
 
@@ -1548,6 +1642,32 @@ def _apply_tab3_date_preset(preset_code: str) -> None:
     st.session_state["sidebar_end_date"] = today
     st.session_state["tab3_start_date"] = target_start
     st.session_state["tab3_end_date"] = today
+
+
+def _apply_snow_glacier_preset(preset_key: str) -> None:
+    """1-klik preklop na ledeniški / snežni primer: nastavi AOI, Avto-UTM CRS in indeks NDSI."""
+    spec = SNOW_GLACIER_PRESETS.get(preset_key)
+    if spec is None:
+        return
+    st.session_state["map_lat"] = float(spec["lat"])
+    st.session_state["map_lon"] = float(spec["lon"])
+    st.session_state["map_radius_m"] = int(spec["radius_m"])
+    st.session_state["sidebar_map_radius_slider"] = int(spec["radius_m"])
+    st.session_state["pending_aoi_mode"] = "map"
+    st.session_state["drawn_polygon_4326"] = None
+    st.session_state["sidebar_crs_mode"] = "auto"
+    st.session_state["tab2_index_select"] = "NDSI"
+    st.session_state["tab3_ts_metric_sentinel-2-l2a"] = "NDSI"
+    st.session_state["tab3_ts_metric_landsat-c2-l2"] = "NDSI"
+    st.session_state["tab3_ch_metric_sentinel-2-l2a"] = "NDSI"
+    st.session_state["tab3_ch_metric_landsat-c2-l2"] = "NDSI"
+    st.session_state["tab3_tl_layer_sentinel-2-l2a"] = "NDSI"
+    st.session_state["tab3_tl_layer_landsat-c2-l2"] = "NDSI"
+    st.session_state["map_jump_version"] = int(st.session_state.get("map_jump_version", 0)) + 1
+    st.session_state["search_performed"] = False
+    st.session_state["stac_items"] = []
+    st.session_state["stac_summary_df"] = pd.DataFrame()
+    _clear_loaded_products()
 
 
 def _format_interval_summary_caption(summary_df: pd.DataFrame, lang: str) -> str:
@@ -2162,9 +2282,12 @@ def _format_tile_label(tile: str, sensor: str = SENSOR_S2) -> str:
     return clean
 
 
-def _d96tm_corners_to_wgs84_polygon(bbox_3794: list[float]) -> list[list[float]]:
-    min_e, min_n, max_e, max_n = bbox_3794
-    corners_3794 = [
+def _d96tm_corners_to_wgs84_polygon(
+    bbox_metric: list[float],
+    metric_crs: int | str = EPSG_D96TM,
+) -> list[list[float]]:
+    min_e, min_n, max_e, max_n = bbox_metric
+    corners_metric = [
         (min_e, min_n),
         (max_e, min_n),
         (max_e, max_n),
@@ -2172,8 +2295,8 @@ def _d96tm_corners_to_wgs84_polygon(bbox_3794: list[float]) -> list[list[float]]
         (min_e, min_n),
     ]
     poly_latlon: list[list[float]] = []
-    for e_val, n_val in corners_3794:
-        lon, lat = transform_coords(e_val, n_val, EPSG_D96TM, EPSG_WGS84)
+    for e_val, n_val in corners_metric:
+        lon, lat = transform_coords(e_val, n_val, metric_crs, EPSG_WGS84)
         poly_latlon.append([lat, lon])
     return poly_latlon
 
@@ -2181,15 +2304,16 @@ def _d96tm_corners_to_wgs84_polygon(bbox_3794: list[float]) -> list[list[float]]
 def _polygon_bounds_to_bboxes(
     poly_geom_4326: dict[str, Any],
 ) -> tuple[list[float], list[float], float, float]:
-    """Izračuna WGS84/D96TM okvir in središče za poljuben GeoJSON poligon."""
+    """Izračuna WGS84 in lokalni metrični okvir (D96/TM v SLO / lokalni UTM po svetu) ter središče."""
     geom = shape(poly_geom_4326)
     min_lon, min_lat, max_lon, max_lat = geom.bounds
     bbox_4326 = [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
-    e1, n1 = transform_coords(min_lon, min_lat, EPSG_WGS84, EPSG_D96TM)
-    e2, n2 = transform_coords(max_lon, max_lat, EPSG_WGS84, EPSG_D96TM)
-    bbox_3794 = [min(e1, e2), min(n1, n2), max(e1, e2), max(n1, n2)]
     centroid = geom.centroid
-    return bbox_4326, bbox_3794, float(centroid.y), float(centroid.x)
+    metric_crs, _ = get_best_metric_crs(float(centroid.y), float(centroid.x), mode="auto")
+    e1, n1 = transform_coords(min_lon, min_lat, EPSG_WGS84, metric_crs)
+    e2, n2 = transform_coords(max_lon, max_lat, EPSG_WGS84, metric_crs)
+    bbox_metric = [min(e1, e2), min(n1, n2), max(e1, e2), max(n1, n2)]
+    return bbox_4326, bbox_metric, float(centroid.y), float(centroid.x)
 
 
 def _extract_drawn_polygon(map_out: Any) -> dict[str, Any] | None:
@@ -2281,7 +2405,8 @@ def _build_aoi_folium_map(
             tooltip=t("map_tooltip_aoi_gj"),
         ).add_to(fmap)
     elif bbox_3794 is not None:
-        poly_coords = _d96tm_corners_to_wgs84_polygon(bbox_3794)
+        eff_map_crs, _ = get_best_metric_crs(float(center_lat), float(center_lon), mode="auto")
+        poly_coords = _d96tm_corners_to_wgs84_polygon(bbox_3794, metric_crs=eff_map_crs)
         folium.Polygon(
             locations=poly_coords,
             color="#0F766E",
@@ -2458,7 +2583,8 @@ def _mpl_to_plotly_colorscale(cmap_name: str, n: int = 32) -> list[list[Any]]:
 def _axis_labels_for_crs(target_crs: str) -> tuple[str, str]:
     if target_crs == CRS_D96TM:
         return t("axis_e_d96"), t("axis_n_d96")
-    return t("axis_e_utm"), t("axis_n_utm")
+    crs_lbl = format_crs_label(target_crs, short=False)
+    return t("axis_e_utm_dyn", crs_label=crs_lbl), t("axis_n_utm_dyn", crs_label=crs_lbl)
 
 
 def _stretch_channel(
@@ -3729,10 +3855,13 @@ def main() -> None:
             center_lon = float(st.session_state["map_lon"])
             bbox_4326, bbox_3794 = bbox_from_point_wgs84(center_lat, center_lon, float(radius_m))
 
-            e_c, n_c = transform_coords(center_lon, center_lat, EPSG_WGS84, EPSG_D96TM)
+            box_crs_m, _ = get_best_metric_crs(center_lat, center_lon, mode="auto")
+            box_crs_short = format_crs_label(box_crs_m, short=True)
+            e_c, n_c = transform_coords(center_lon, center_lat, EPSG_WGS84, box_crs_m)
+            axis_e_sym, axis_n_sym = ("e", "n") if box_crs_m == CRS_D96TM else ("E", "N")
             st.markdown(
                 f"<div class='coord-box'>"
-                f"<strong>D96/TM:</strong> e = {e_c:,.1f} m · n = {n_c:,.1f} m<br>"
+                f"<strong>{box_crs_short}:</strong> {axis_e_sym} = {e_c:,.1f} m · {axis_n_sym} = {n_c:,.1f} m<br>"
                 f"<strong>WGS84:</strong> {center_lat:.5f}°, {center_lon:.5f}°"
                 f"</div>",
                 unsafe_allow_html=True,
@@ -3914,14 +4043,18 @@ def main() -> None:
         )
         st.session_state["selected_resolution"] = int(selected_resolution)
 
-        target_crs = _touch_selector(
+        crs_mode = _touch_selector(
             t("output_crs_label"),
-            options=CRS_KEYS,
-            default=CRS_D96TM,
-            format_func=lambda c, _lang=lang: t(CRS_PILL_I18N[c], lang=_lang),
-            key="sidebar_crs_select",
+            options=CRS_MODE_KEYS,
+            default="auto",
+            format_func=lambda m, _lang=lang: t(CRS_MODE_I18N[m], lang=_lang),
+            key="sidebar_crs_mode",
             use_pills=True,
         )
+        target_crs, target_crs_label = get_best_metric_crs(
+            float(center_lat), float(center_lon), mode=str(crs_mode)
+        )
+        st.caption(t("crs_active_caption", crs_label=target_crs_label))
 
         # En sam subtilen inline RAM statusni indikator namesto ponavljajočih se opozoril
         if bbox_4326 is not None and aoi_error is None:
@@ -3950,7 +4083,7 @@ def main() -> None:
                 )
 
             with st.expander(t("sidebar_geo_details_expander"), expanded=False):
-                st.caption(f"**CRS:** {t(CRS_I18N[target_crs])}")
+                st.caption(f"**CRS:** {target_crs_label}")
                 if not aoi_valid:
                     st.caption(t("aoi_too_large", area=area_km2))
                 elif selected_resolution < rec_res:
@@ -3958,11 +4091,12 @@ def main() -> None:
                 elif area_km2 > 100.0:
                     st.caption(t("aoi_large_warn", area=area_km2, res=rec_res))
                 if bbox_3794 is not None:
+                    box_crs, _ = get_best_metric_crs(float(center_lat), float(center_lon), mode="auto")
                     st.markdown(
                         f"<div class='coord-box'>"
-                        f"<strong>EPSG:3794 [m]</strong><br>"
-                        f"e: {bbox_3794[0]:,.1f} → {bbox_3794[2]:,.1f}<br>"
-                        f"n: {bbox_3794[1]:,.1f} → {bbox_3794[3]:,.1f}<br>"
+                        f"<strong>{box_crs} [m]</strong><br>"
+                        f"E: {bbox_3794[0]:,.1f} → {bbox_3794[2]:,.1f}<br>"
+                        f"N: {bbox_3794[1]:,.1f} → {bbox_3794[3]:,.1f}<br>"
                         f"<strong>EPSG:4326 [°]</strong><br>"
                         f"lon: {bbox_4326[0]:.5f} → {bbox_4326[2]:.5f}<br>"
                         f"lat: {bbox_4326[1]:.5f} → {bbox_4326[3]:.5f}"
@@ -4085,7 +4219,7 @@ def main() -> None:
         f"</div>"
         f'<div class="geo-badges">'
         f'<span class="geo-badge">🛰️ {sensor_cfg["short_name"]}</span>'
-        f'<span class="geo-badge geo-badge-slate">{t(CRS_SHORT_I18N[target_crs])}</span>'
+        f'<span class="geo-badge geo-badge-slate">📐 {format_crs_label(target_crs, short=True)}</span>'
         f'<span class="geo-badge geo-badge-slate">{selected_resolution} m</span>'
         f'<span class="geo-badge geo-badge-slate">{area_pill_val}</span>'
         f"{active_polygon_badge}"
@@ -4557,6 +4691,19 @@ def main() -> None:
         if not search_performed or not items or summary_df.empty:
             st.subheader(t("t2_sar_header") if active_sensor == SENSOR_S1 else t("t2_header"))
             st.info(t("need_search_first"))
+            with st.container(border=True):
+                st.markdown(f"**{t('snow_presets_header')}**")
+                st.caption(t("snow_presets_hint"))
+                sp_cols = st.columns(3)
+                for sp_col, (sp_key, sp_spec) in zip(sp_cols, SNOW_GLACIER_PRESETS.items()):
+                    with sp_col:
+                        st.button(
+                            t(sp_spec["label_key"]),
+                            width="stretch",
+                            key=f"tab2_empty_snow_preset_{sp_key}",
+                            on_click=_apply_snow_glacier_preset,
+                            args=(sp_key,),
+                        )
 
         # --- Način 2A: Sentinel-1 SAR Water / Flood Mask ---
         elif active_sensor == SENSOR_S1:
@@ -4841,6 +4988,44 @@ def main() -> None:
                         f"{t(f'idx_{t2_index_key}_desc')} — `{SPECTRAL_INDICES[t2_index_key]['formula']}`"
                     )
 
+                    # Hitri 1-klik ledeniški / snežni primeri (Triglav/Kanin, Pasterze, Aletsch)
+                    with st.expander(t("snow_presets_header"), expanded=(t2_index_key == "NDSI")):
+                        st.caption(t("snow_presets_hint"))
+                        sp_c1, sp_c2, sp_c3 = st.columns(3)
+                        for sp_col, (sp_key, sp_spec) in zip(
+                            (sp_c1, sp_c2, sp_c3), SNOW_GLACIER_PRESETS.items()
+                        ):
+                            with sp_col:
+                                st.button(
+                                    t(sp_spec["label_key"]),
+                                    width="stretch",
+                                    key=f"tab2_idx_snow_preset_{sp_key}",
+                                    on_click=_apply_snow_glacier_preset,
+                                    args=(sp_key,),
+                                )
+
+                    t2_ndsi_thr = 0.40
+                    t2_use_dem_snow = True
+                    if t2_index_key == "NDSI":
+                        sn_c1, sn_c2 = st.columns([1.15, 1.0], vertical_alignment="center")
+                        with sn_c1:
+                            t2_ndsi_thr = st.slider(
+                                t("snow_ndsi_thr_label"),
+                                min_value=0.20,
+                                max_value=0.65,
+                                value=0.40,
+                                step=0.05,
+                                help=t("snow_ndsi_thr_help"),
+                                key="tab2_ndsi_thresh",
+                            )
+                        with sn_c2:
+                            t2_use_dem_snow = st.checkbox(
+                                t("snow_use_dem_label"),
+                                value=True,
+                                help=t("snow_use_dem_help"),
+                                key="tab2_ndsi_use_dem",
+                            )
+
                     col_scl2, col_btn2 = st.columns([1.15, 1.0], vertical_alignment="center")
                     with col_scl2:
                         t2_mask_clouds = st.checkbox(
@@ -4863,6 +5048,8 @@ def main() -> None:
                     req_bands = get_required_bands_for_sensor(
                         active_sensor, t2_index_key, include_cloud_mask=t2_mask_clouds
                     )
+                    if t2_index_key == "NDSI" and "B08" not in req_bands:
+                        req_bands.append("B08")
 
                     with st.spinner(
                         t("spinner_index", bands=", ".join(req_bands), idx=t2_index_key, date=chosen_row["date_str"])
@@ -4872,6 +5059,11 @@ def main() -> None:
                             st.session_state["tab2_index_display_da"] = None
                             st.session_state["tab2_index_overlay_cache"] = None
                             st.session_state["tab2_tif_bytes"] = None
+                            st.session_state["tab2_snow_mask_da"] = None
+                            st.session_state["tab2_snow_display_da"] = None
+                            st.session_state["tab2_snow_stats"] = None
+                            st.session_state["tab2_snow_tif_bytes"] = None
+                            st.session_state["tab2_snow_tif_filename"] = None
                             gc.collect()
 
                             use_pan_buf_t2 = bool(st.session_state.get("expand_pan_buffer", True))
@@ -4888,7 +5080,9 @@ def main() -> None:
                                     resolution=float(selected_resolution),
                                     aoi_polygon_4326=None,
                                 )
-                                ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
+                                ds_masked, _ = apply_cloud_mask(
+                                    ds_raw, mask_clouds=t2_mask_clouds, sensor=active_sensor
+                                )
                                 index_display_da = compute_index(ds_masked, t2_index_key)
                                 index_da = _clip_raster_to_exact_aoi(
                                     index_display_da, active_bbox, active_polygon
@@ -4903,9 +5097,62 @@ def main() -> None:
                                     resolution=float(selected_resolution),
                                     aoi_polygon_4326=active_polygon,
                                 )
-                                ds_masked, _ = apply_cloud_mask(ds_raw, mask_clouds=t2_mask_clouds)
+                                ds_masked, _ = apply_cloud_mask(
+                                    ds_raw, mask_clouds=t2_mask_clouds, sensor=active_sensor
+                                )
                                 index_da = compute_index(ds_masked, t2_index_key)
                                 index_display_da = index_da
+
+                            snow_mask_da_res = None
+                            snow_display_da_res = None
+                            snow_stats_res = None
+                            snow_tif_bytes_res = None
+                            snow_tif_fname_res = None
+                            if t2_index_key == "NDSI":
+                                dem_da_snow = (
+                                    load_copernicus_dem(
+                                        bbox_4326=active_bbox,
+                                        target_epsg=target_crs,
+                                        resolution=30.0,
+                                        aoi_polygon_4326=active_polygon,
+                                    )
+                                    if t2_use_dem_snow
+                                    else None
+                                )
+                                if use_pan_buf_t2:
+                                    snow_display_da_res, _ = compute_snow_glacier_stats(
+                                        ds_masked,
+                                        dem_da=None,
+                                        ndsi_thresh=float(t2_ndsi_thr),
+                                        resolution_m=float(selected_resolution),
+                                    )
+                                    ds_aoi_snow = _clip_raster_to_exact_aoi(
+                                        ds_masked, active_bbox, active_polygon
+                                    )
+                                    snow_mask_da_res, snow_stats_res = compute_snow_glacier_stats(
+                                        ds_aoi_snow,
+                                        dem_da=dem_da_snow,
+                                        ndsi_thresh=float(t2_ndsi_thr),
+                                        resolution_m=float(selected_resolution),
+                                    )
+                                else:
+                                    snow_mask_da_res, snow_stats_res = compute_snow_glacier_stats(
+                                        ds_masked,
+                                        dem_da=dem_da_snow,
+                                        ndsi_thresh=float(t2_ndsi_thr),
+                                        resolution_m=float(selected_resolution),
+                                    )
+                                    snow_display_da_res = snow_mask_da_res
+                                snow_tif_bytes_res = export_to_geotiff_bytes(
+                                    snow_mask_da_res, target_epsg=target_crs
+                                )
+                                epsg_num_sn = target_crs.replace("EPSG:", "")
+                                prefix_sn = active_sensor_cfg["file_prefix"]
+                                snow_tif_fname_res = (
+                                    f"{prefix_sn}_{chosen_row['date_str']}_SNOW_MASK_NDSI_"
+                                    f"EPSG{epsg_num_sn}_{selected_resolution}m.tif"
+                                )
+                                del dem_da_snow
 
                             stats = compute_index_stats(index_da, resolution_m=float(selected_resolution))
                             del ds_raw, ds_masked
@@ -4938,6 +5185,11 @@ def main() -> None:
                             }
                             st.session_state["tab2_tif_bytes"] = tif_bytes
                             st.session_state["tab2_tif_filename"] = tif_filename
+                            st.session_state["tab2_snow_mask_da"] = snow_mask_da_res
+                            st.session_state["tab2_snow_display_da"] = snow_display_da_res
+                            st.session_state["tab2_snow_stats"] = snow_stats_res
+                            st.session_state["tab2_snow_tif_bytes"] = snow_tif_bytes_res
+                            st.session_state["tab2_snow_tif_filename"] = snow_tif_fname_res
                             gc.collect()
                         except Exception as exc:
                             st.error(t("index_error", err=exc))
@@ -4959,6 +5211,40 @@ def main() -> None:
                     if idx_stats["valid_pixels"] == 0:
                         st.warning(t("t2_no_valid_pixels"))
                     else:
+                        # Namenski snežni / ledeniški KPI pas, kadar je izračunan NDSI
+                        sn_stats_show = st.session_state.get("tab2_snow_stats")
+                        sn_disp_show = st.session_state.get("tab2_snow_display_da")
+                        if idx_meta.get("index_key") == "NDSI" and isinstance(sn_stats_show, dict):
+                            sk1, sk2, sk3, sk4 = st.columns(4)
+                            sk1.metric(
+                                t("snow_kpi_area"),
+                                f"{sn_stats_show['snow_area_km2']:,.2f} km²",
+                                delta=f"{sn_stats_show['snow_area_ha']:,.1f} ha",
+                                delta_color="off",
+                            )
+                            sk2.metric(
+                                t("snow_kpi_share"),
+                                f"{sn_stats_show['snow_pct']:.1f} %",
+                                delta=format_crs_label(idx_meta["crs"], short=True),
+                                delta_color="off",
+                            )
+                            if (
+                                sn_stats_show.get("dem_available")
+                                and sn_stats_show.get("snowline_p10_m") is not None
+                            ):
+                                sk3.metric(
+                                    t("snow_kpi_snowline"),
+                                    f"{sn_stats_show['snowline_p10_m']:,.0f} m n.m.",
+                                )
+                                sk4.metric(
+                                    t("snow_kpi_elev_range"),
+                                    f"{sn_stats_show['snow_median_elev_m']:,.0f} / {sn_stats_show['snow_max_elev_m']:,.0f} m",
+                                )
+                            else:
+                                sk3.metric(t("snow_kpi_snowline"), t("snow_kpi_snowline_na"))
+                                sk4.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.1f} ha")
+                            st.caption(t("snow_depth_scientific_note"))
+
                         k1, k2, k3, k4, k5 = st.columns(5)
                         k1.metric(t("m_mean"), f"{idx_stats['mean']:.3f}")
                         k2.metric(t("m_median"), f"{idx_stats['median']:.3f}")
@@ -5067,10 +5353,39 @@ def main() -> None:
                                     "image": idx_uri,
                                     "bounds": idx_bounds,
                                     "opacity": float(t2_opacity_pct) / 100.0,
-                                    "show": True,
-                                    "zindex": 20,
+                                    "show": not (idx_key_s == "NDSI" and sn_disp_show is not None),
+                                    "zindex": 18,
                                 }
                             )
+
+                            # Za NDSI dodamo še jasen sloj maske snega in ledu (NDSI >= prag & B08 > 0.11)
+                            if (
+                                idx_key_s == "NDSI"
+                                and sn_disp_show is not None
+                                and isinstance(sn_stats_show, dict)
+                            ):
+                                try:
+                                    sn_uri, sn_bnds = raster_to_map_overlay_png(
+                                        sn_disp_show,
+                                        src_epsg=idx_meta["crs"],
+                                        is_rgb=False,
+                                        discrete_rgba_map=SNOW_MASK_DISCRETE_RGBA,
+                                    )
+                                    t2_overlays.append(
+                                        {
+                                            "name": t(
+                                                "snow_mask_layer_name",
+                                                thr=float(sn_stats_show.get("ndsi_thresh", 0.40)),
+                                            ),
+                                            "image": sn_uri,
+                                            "bounds": sn_bnds,
+                                            "opacity": float(t2_opacity_pct) / 100.0,
+                                            "show": True,
+                                            "zindex": 22,
+                                        }
+                                    )
+                                except Exception:
+                                    pass
 
                             c_lat_t2 = (
                                 0.5 * (active_bbox[1] + active_bbox[3])
@@ -5145,7 +5460,27 @@ def main() -> None:
                         st.plotly_chart(hist_fig, width="stretch", key="tab2_index_hist")
 
                         idx_tif = st.session_state["tab2_tif_bytes"]
-                        if idx_tif:
+                        snow_tif = st.session_state.get("tab2_snow_tif_bytes")
+                        if idx_tif and snow_tif and idx_meta.get("index_key") == "NDSI":
+                            dl_i1, dl_i2 = st.columns(2)
+                            with dl_i1:
+                                st.download_button(
+                                    label=t("btn_download_index_tif"),
+                                    data=idx_tif,
+                                    file_name=st.session_state["tab2_tif_filename"] or "index.tif",
+                                    mime="image/tiff",
+                                    width="stretch",
+                                    help=t("help_download_index_tif", idx=idx_meta["index_key"], crs=idx_meta["crs"]),
+                                )
+                            with dl_i2:
+                                st.download_button(
+                                    label=t("btn_download_snow_tif"),
+                                    data=snow_tif,
+                                    file_name=st.session_state.get("tab2_snow_tif_filename") or "snow_mask.tif",
+                                    mime="image/tiff",
+                                    width="stretch",
+                                )
+                        elif idx_tif:
                             st.download_button(
                                 label=t("btn_download_index_tif"),
                                 data=idx_tif,
@@ -5844,6 +6179,21 @@ def main() -> None:
                     args=("1984_landsat",),
                 )
 
+            with st.expander(t("snow_presets_header"), expanded=False):
+                st.caption(t("snow_presets_hint"))
+                t3_sp1, t3_sp2, t3_sp3 = st.columns(3)
+                for sp_col, (sp_key, sp_spec) in zip(
+                    (t3_sp1, t3_sp2, t3_sp3), SNOW_GLACIER_PRESETS.items()
+                ):
+                    with sp_col:
+                        st.button(
+                            t(sp_spec["label_key"]),
+                            width="stretch",
+                            key=f"tab3_snow_preset_{sp_key}",
+                            on_click=_apply_snow_glacier_preset,
+                            args=(sp_key,),
+                        )
+
             # Časovni korak vzorčenja + filter delnih preletov (< 90 % AOI)
             c_t3_int, c_t3_cov = st.columns([1.6, 1.0], vertical_alignment="bottom")
             with c_t3_int:
@@ -6414,7 +6764,7 @@ def main() -> None:
                     if is_sar_t3:
                         tl_layer_options = ["VV", "VH", "VV_VH"]
                     else:
-                        tl_layer_options = ["RGB", "NIR", "NDVI", "NDWI", "MNDWI", "NDBI", "NBR"]
+                        tl_layer_options = ["RGB", "NIR", *INDEX_KEYS]
 
                     def _fmt_tl_layer_pill(code: str, _lang: str = lang) -> str:
                         if code == "VV_VH":
@@ -7610,9 +7960,17 @@ def main() -> None:
         with st.container(border=True):
             g_lat_cur = float(st.session_state.get("tab7_lat_input", aoi_c_lat))
             g_lon_cur = float(st.session_state.get("tab7_lon_input", aoi_c_lon))
-            g_e_cur, g_n_cur = transform_coords(g_lon_cur, g_lat_cur, EPSG_WGS84, EPSG_D96TM)
+            g_crs_cur, g_crs_lbl = get_best_metric_crs(g_lat_cur, g_lon_cur, mode=str(crs_mode))
+            g_e_cur, g_n_cur = transform_coords(g_lon_cur, g_lat_cur, EPSG_WGS84, g_crs_cur)
             st.markdown(
-                t("gnss_station_banner", e=g_e_cur, n=g_n_cur, lat=g_lat_cur, lon=g_lon_cur)
+                t(
+                    "gnss_station_banner_crs",
+                    crs_label=g_crs_lbl,
+                    e=g_e_cur,
+                    n=g_n_cur,
+                    lat=g_lat_cur,
+                    lon=g_lon_cur,
+                )
             )
 
             gc1, gc2, gc3, gc4 = st.columns([1.0, 1.0, 1.0, 1.0])

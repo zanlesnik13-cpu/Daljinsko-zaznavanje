@@ -129,25 +129,118 @@ def transform_coords(
     return (float(dst_x), float(dst_y))
 
 
+def is_in_slovenia(lat: float, lon: float) -> bool:
+    """Return ``True`` if ``(lat, lon)`` lies within Slovenia's D96/TM validity bounds."""
+    lat_f = float(lat)
+    lon_f = float(lon)
+    return (45.35 <= lat_f <= 46.95) and (13.30 <= lon_f <= 16.65)
+
+
+def get_auto_utm_epsg(lat: float, lon: float) -> tuple[int, str]:
+    """Compute the exact local WGS 84 / UTM EPSG code and human-readable label anywhere on Earth.
+
+    Uses ``zone = int((lon + 180) // 6) + 1`` clamped to ``[1, 60]``, returning
+    ``(32600 + zone, "WGS 84 / UTM {zone}N (EPSG:326xx)")`` in the Northern Hemisphere
+    (``lat >= 0``) or ``(32700 + zone, "WGS 84 / UTM {zone}S (EPSG:327xx)")`` in the
+    Southern Hemisphere (``lat < 0``).
+    """
+    lat_f = float(lat)
+    lon_f = float(lon)
+    if not (-90.0 <= lat_f <= 90.0):
+        raise ValueError(f"Latitude must be between -90 and 90, got {lat}.")
+    if not (-180.0 <= lon_f <= 180.0):
+        raise ValueError(f"Longitude must be between -180 and 180, got {lon}.")
+
+    zone = max(1, min(60, int((lon_f + 180.0) // 6) + 1))
+    if lat_f >= 0.0:
+        epsg = 32600 + zone
+        hemi = "N"
+    else:
+        epsg = 32700 + zone
+        hemi = "S"
+    return epsg, f"WGS 84 / UTM {zone}{hemi} (EPSG:{epsg})"
+
+
+def get_best_metric_crs(
+    lat: float,
+    lon: float,
+    mode: str = "auto",
+) -> tuple[str, str]:
+    """Resolve the active local metric CRS string and display name for ``(lat, lon)``.
+
+    Parameters
+    ----------
+    lat, lon : float
+        AOI center coordinates in WGS84 degrees.
+    mode : str, default ``"auto"``
+        - ``"auto"``: ``EPSG:3794`` (D96/TM) inside Slovenia, exact local UTM worldwide.
+        - ``"d96"``: Force ``EPSG:3794`` (D96/TM).
+        - ``"utm"``: Force exact local UTM (``EPSG:326xx`` / ``EPSG:327xx``).
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(crs_str, display_name)``, e.g. ``("EPSG:32632", "WGS 84 / UTM 32N (EPSG:32632)")``.
+    """
+    m = str(mode or "auto").strip().lower()
+    if m == "d96" or (m == "auto" and is_in_slovenia(lat, lon)):
+        return CRS_D96TM, "D96/TM (EPSG:3794)"
+    epsg, name = get_auto_utm_epsg(lat, lon)
+    return f"EPSG:{epsg}", name
+
+
+def format_crs_label(
+    epsg_or_crs: int | str | CRS,
+    *,
+    short: bool = False,
+) -> str:
+    """Return a clean human-readable label for D96/TM or any global UTM EPSG code."""
+    crs_obj = normalize_crs(epsg_or_crs)
+    epsg = crs_obj.to_epsg()
+    if epsg == EPSG_D96TM:
+        return "D96/TM (3794)" if short else "D96/TM (EPSG:3794)"
+    if epsg is not None and 32601 <= epsg <= 32660:
+        zone = epsg - 32600
+        return f"UTM {zone}N ({epsg})" if short else f"WGS 84 / UTM {zone}N (EPSG:{epsg})"
+    if epsg is not None and 32701 <= epsg <= 32760:
+        zone = epsg - 32700
+        return f"UTM {zone}S ({epsg})" if short else f"WGS 84 / UTM {zone}S (EPSG:{epsg})"
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    return crs_obj.name
+
+
+def _metric_box_to_wgs84_bbox(
+    min_e: float,
+    min_n: float,
+    max_e: float,
+    max_n: float,
+    metric_crs: int | str | CRS = CRS_D96TM,
+) -> list[float]:
+    """Convert a projected metric bounding box to its enclosing EPSG:4326 bounding box.
+
+    Edges are densified before reprojection so meridian convergence and
+    projection curvature are accurately captured.
+    """
+    geom_metric = box(min_e, min_n, max_e, max_n)
+    max_seg = max((max_e - min_e) / 16.0, (max_n - min_n) / 16.0, 50.0)
+    geom_metric = geom_metric.segmentize(max_segment_length=max_seg)
+
+    src_key = _crs_cache_key(normalize_crs(metric_crs))
+    transformer = _get_transformer(src_key, CRS_WGS84)
+    geom_4326 = shapely_transform(transformer.transform, geom_metric)
+    min_lon, min_lat, max_lon, max_lat = geom_4326.bounds
+    return [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
+
+
 def _d96tm_box_to_wgs84_bbox(
     min_e: float,
     min_n: float,
     max_e: float,
     max_n: float,
 ) -> list[float]:
-    """Convert an EPSG:3794 bounding box to its enclosing EPSG:4326 bounding box.
-
-    Edges are densified before reprojection so meridian convergence and
-    projection curvature are accurately captured.
-    """
-    geom_3794 = box(min_e, min_n, max_e, max_n)
-    max_seg = max((max_e - min_e) / 16.0, (max_n - min_n) / 16.0, 50.0)
-    geom_3794 = geom_3794.segmentize(max_segment_length=max_seg)
-
-    transformer = _get_transformer(CRS_D96TM, CRS_WGS84)
-    geom_4326 = shapely_transform(transformer.transform, geom_3794)
-    min_lon, min_lat, max_lon, max_lat = geom_4326.bounds
-    return [float(min_lon), float(min_lat), float(max_lon), float(max_lat)]
+    """Convert an EPSG:3794 bounding box to its enclosing EPSG:4326 bounding box."""
+    return _metric_box_to_wgs84_bbox(min_e, min_n, max_e, max_n, metric_crs=CRS_D96TM)
 
 
 def bbox_from_point_d96tm(
@@ -190,27 +283,11 @@ def bbox_from_point_wgs84(
     lon: float,
     radius_m: float,
 ) -> tuple[list[float], list[float]]:
-    """Build an exact square AOI around a WGS84 point ``(lat, lon)``.
+    """Build an exact distortion-free square AOI around a WGS84 point ``(lat, lon)``.
 
-    Projects ``(lon, lat)`` to EPSG:3794 (D96/TM), buffers by exact metric
-    ``radius_m``, and returns both the enclosing EPSG:4326 bounding box and the
-    exact EPSG:3794 metric bounding box.
-
-    Parameters
-    ----------
-    lat : float
-        Latitude in degrees (EPSG:4326), in ``[-90, 90]``.
-    lon : float
-        Longitude in degrees (EPSG:4326), in ``[-180, 180]``.
-    radius_m : float
-        Half-width of the square AOI in meters (total side length = ``2 * radius_m``).
-
-    Returns
-    -------
-    tuple[list[float], list[float]]
-        ``(bbox_4326, bbox_3794)`` where:
-        - ``bbox_4326 = [min_lon, min_lat, max_lon, max_lat]``
-        - ``bbox_3794 = [min_e, min_n, max_e, max_n]``
+    Uses ``EPSG:3794`` (D96/TM) when inside Slovenia and the exact local WGS 84 / UTM
+    zone (``EPSG:326xx`` / ``EPSG:327xx``) anywhere else on Earth, buffers by exact
+    metric ``radius_m``, and returns ``(bbox_4326, bbox_metric)``.
     """
     if not (-90.0 <= float(lat) <= 90.0):
         raise ValueError(f"Latitude must be between -90 and 90, got {lat}.")
@@ -219,8 +296,12 @@ def bbox_from_point_wgs84(
     if radius_m <= 0:
         raise ValueError(f"radius_m must be strictly positive, got {radius_m}.")
 
-    e, n = transform_coords(lon, lat, EPSG_WGS84, EPSG_D96TM)
-    return bbox_from_point_d96tm(e, n, radius_m)
+    metric_crs, _ = get_best_metric_crs(float(lat), float(lon), mode="auto")
+    e, n = transform_coords(float(lon), float(lat), EPSG_WGS84, metric_crs)
+    r_val = float(radius_m)
+    bbox_metric = [e - r_val, n - r_val, e + r_val, n + r_val]
+    bbox_4326 = _metric_box_to_wgs84_bbox(*bbox_metric, metric_crs=metric_crs)
+    return bbox_4326, bbox_metric
 
 
 def _recommended_resolution_for_area(area_km2: float) -> int:
@@ -238,22 +319,11 @@ def validate_aoi_size(
     bbox_4326: Sequence[float],
     max_area_km2: float = 900.0,
 ) -> tuple[float, bool, int]:
-    """Validate an EPSG:4326 AOI bounding box by computing exact area in EPSG:3794.
+    """Validate an EPSG:4326 AOI bounding box by computing exact metric area worldwide.
 
-    Also recommends a RAM-safe target resolution (10 m -> 20 m -> 30 m -> 60 m)
-    to stay comfortably within Streamlit Community Cloud's 1 GB RAM limit.
-
-    Parameters
-    ----------
-    bbox_4326 : Sequence[float]
-        Bounding box ``[min_lon, min_lat, max_lon, max_lat]`` in EPSG:4326.
-    max_area_km2 : float, default 900.0
-        Maximum permitted AOI area in square kilometers.
-
-    Returns
-    -------
-    tuple[float, bool, int]
-        ``(area_km2, is_valid, recommended_resolution_m)``
+    Computes exact area in ``EPSG:3794`` inside Slovenia or in the exact local
+    UTM zone (``EPSG:326xx`` / ``EPSG:327xx``) anywhere else on Earth, eliminating
+    global projection distortion.
     """
     if len(bbox_4326) != 4:
         raise ValueError(
@@ -270,9 +340,12 @@ def validate_aoi_size(
     max_seg = max((max_lon - min_lon) / 16.0, (max_lat - min_lat) / 16.0, 1e-4)
     geom_4326 = geom_4326.segmentize(max_segment_length=max_seg)
 
-    transformer = _get_transformer(CRS_WGS84, CRS_D96TM)
-    geom_3794 = shapely_transform(transformer.transform, geom_4326)
-    area_km2 = float(geom_3794.area / 1_000_000.0)
+    c_lat = 0.5 * (min_lat + max_lat)
+    c_lon = 0.5 * (min_lon + max_lon)
+    metric_crs, _ = get_best_metric_crs(c_lat, c_lon, mode="auto")
+    transformer = _get_transformer(CRS_WGS84, metric_crs)
+    geom_metric = shapely_transform(transformer.transform, geom_4326)
+    area_km2 = float(geom_metric.area / 1_000_000.0)
 
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
     recommended_resolution_m = _recommended_resolution_for_area(area_km2)
@@ -284,11 +357,7 @@ def validate_aoi_geometry(
     geometry_4326: dict[str, object] | BaseGeometry,
     max_area_km2: float = 900.0,
 ) -> tuple[float, bool, int]:
-    """Compute exact area in km^2 in EPSG:3794 for an arbitrary EPSG:4326 polygon.
-
-    Returns ``(area_km2, is_valid, recommended_resolution_m)`` using the same
-    1 GB RAM-safe resolution tiers as :func:`validate_aoi_size`.
-    """
+    """Compute exact area in km^2 in the local metric CRS (D96/TM in SLO / local UTM globally)."""
     geom_4326 = geometry_4326 if isinstance(geometry_4326, BaseGeometry) else shape(geometry_4326)
     if geom_4326.is_empty:
         return (0.0, False, 10)
@@ -297,9 +366,12 @@ def validate_aoi_geometry(
     max_seg = max((max_x - min_x) / 16.0, (max_y - min_y) / 16.0, 1e-4)
     geom_dense = geom_4326.segmentize(max_segment_length=max_seg)
 
-    transformer = _get_transformer(CRS_WGS84, CRS_D96TM)
-    geom_3794 = shapely_transform(transformer.transform, geom_dense)
-    area_km2 = float(geom_3794.area / 1_000_000.0)
+    c_lat = 0.5 * (min_y + max_y)
+    c_lon = 0.5 * (min_x + max_x)
+    metric_crs, _ = get_best_metric_crs(c_lat, c_lon, mode="auto")
+    transformer = _get_transformer(CRS_WGS84, metric_crs)
+    geom_metric = shapely_transform(transformer.transform, geom_dense)
+    area_km2 = float(geom_metric.area / 1_000_000.0)
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
     recommended_resolution_m = _recommended_resolution_for_area(area_km2)
 

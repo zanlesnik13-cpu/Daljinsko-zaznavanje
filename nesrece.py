@@ -713,6 +713,13 @@ def run_disaster_assessment(
         if progress_cb is not None:
             progress_cb(pct, msg)
 
+    if not target_crs or str(target_crs).strip().lower() == "auto":
+        from geodezija_crs import get_best_metric_crs
+
+        c_lon = 0.5 * (float(bbox_4326[0]) + float(bbox_4326[2]))
+        c_lat = 0.5 * (float(bbox_4326[1]) + float(bbox_4326[3]))
+        target_crs, _ = get_best_metric_crs(c_lat, c_lon, mode="auto")
+
     sensor = select_sensor_for_disaster(disaster_type, event_date)
     is_sar = sensor == SENSOR_S1
     win_days = max(int(search_window_days), 25)

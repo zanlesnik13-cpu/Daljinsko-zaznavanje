@@ -83,6 +83,14 @@ SPECTRAL_INDICES: dict[str, dict[str, Any]] = {
         "vmax": 0.8,
         "diff_cmap": "BrBG",
     },
+    "NDSI": {
+        "bands": ("B03", "B11"),
+        "formula": "(B03 - B11) / (B03 + B11)",
+        "cmap": "PuBu",
+        "vmin": -0.2,
+        "vmax": 0.9,
+        "diff_cmap": "RdBu",
+    },
 }
 
 SAR_METRICS: dict[str, dict[str, Any]] = {
@@ -728,4 +736,153 @@ def compute_quick_land_cover(
     summary_df.attrs["valid_pixels"] = valid_pixels
     summary_df.attrs["valid_area_ha"] = round(valid_pixels * px_area_ha, 3)
     return lc_da, summary_df
+
+
+def compute_snow_glacier_stats(
+    ds: xr.Dataset,
+    dem_da: xr.DataArray | None = None,
+    ndsi_thresh: float = 0.40,
+    nir_thresh: float = 0.11,
+    resolution_m: float | None = None,
+) -> tuple[xr.DataArray, dict[str, Any]]:
+    """Classify Snow / Ice / Glacier extent via ESA/NASA NDSI + NIR mask and optional DEM snowline.
+
+    Uses the standard ESA/NASA optical cryosphere rule:
+    ``is_snow = (NDSI >= ndsi_thresh) & (B08 > nir_thresh)`` (when ``B08`` is present),
+    where the ``NIR > 0.11`` condition cleanly separates bright snow/ice from dark water bodies.
+
+    When ``dem_da`` (e.g., Copernicus DEM 30 m) is supplied, computes the glaciological
+    snowline altitude (10th percentile elevation of snow/ice pixels), plus median and max
+    snow elevations [m a.s.l.].
+
+    Returns
+    -------
+    tuple[xr.DataArray, dict[str, Any]]
+        ``(snow_mask_da, stats)`` where ``snow_mask_da`` is a ``uint8`` georeferenced raster
+        (``1`` = Snow/Ice/Glacier, ``0`` = Snow-Free Land/Water, ``255`` = NoData/Cloud)
+        and ``stats`` contains exact ``snow_area_ha``, ``snow_area_km2``, ``snow_pct``,
+        and DEM elevation statistics (``snowline_p10_m``, ``snow_median_elev_m``, ``snow_max_elev_m``).
+    """
+    ndsi_da = compute_index(ds, "NDSI")
+    ndsi_vals = ndsi_da.values.astype(np.float32, copy=False)
+
+    # Infer exact metric pixel size from argument, dataset attrs, or coordinates
+    if resolution_m is not None and float(resolution_m) > 0:
+        res_m = float(resolution_m)
+    else:
+        attr_res = ds.attrs.get("resolution_m")
+        if attr_res is not None and float(attr_res) > 0:
+            res_m = float(attr_res)
+        else:
+            x_c = np.asarray(ndsi_da.coords["x"].values, dtype=np.float64)
+            res_m = float(abs(np.median(np.diff(x_c)))) if x_c.size > 1 else 10.0
+
+    has_nir = "B08" in ds.data_vars
+    if has_nir:
+        nir_vals = ds["B08"].values.astype(np.float32, copy=False)
+        valid = np.isfinite(ndsi_vals) & np.isfinite(nir_vals)
+        is_snow = valid & (ndsi_vals >= np.float32(ndsi_thresh)) & (nir_vals > np.float32(nir_thresh))
+    else:
+        valid = np.isfinite(ndsi_vals)
+        is_snow = valid & (ndsi_vals >= np.float32(ndsi_thresh))
+
+    mask_arr = np.full(ndsi_vals.shape, 255, dtype=np.uint8)
+    mask_arr[valid] = 0
+    mask_arr[is_snow] = 1
+
+    total_pixels = int(ndsi_vals.size)
+    valid_pixels = int(np.count_nonzero(valid))
+    snow_pixels = int(np.count_nonzero(is_snow))
+    px_area_ha = (res_m ** 2) / 10_000.0
+    snow_area_ha = snow_pixels * px_area_ha
+    snow_area_km2 = snow_area_ha / 100.0
+    valid_area_ha = valid_pixels * px_area_ha
+    valid_pct = (100.0 * valid_pixels / total_pixels) if total_pixels > 0 else 0.0
+    snow_pct = (100.0 * snow_pixels / valid_pixels) if valid_pixels > 0 else 0.0
+
+    # Snowline elevation via Copernicus DEM 30 m (if provided)
+    dem_available = False
+    snowline_p10_m: float | None = None
+    snow_median_elev_m: float | None = None
+    snow_max_elev_m: float | None = None
+    snow_min_elev_m: float | None = None
+
+    if dem_da is not None and snow_pixels > 0:
+        try:
+            from rasterio.enums import Resampling
+
+            dem_aligned = dem_da
+            if dem_aligned.shape != ndsi_da.shape or (
+                dem_aligned.rio.crs is not None
+                and ndsi_da.rio.crs is not None
+                and dem_aligned.rio.crs != ndsi_da.rio.crs
+            ):
+                dem_aligned = dem_aligned.rio.reproject_match(
+                    ndsi_da,
+                    resampling=Resampling.bilinear,
+                    nodata=np.nan,
+                )
+            dem_vals = dem_aligned.values.astype(np.float32, copy=False)
+            snow_elevs = dem_vals[is_snow & np.isfinite(dem_vals) & (dem_vals > -500.0)]
+            if snow_elevs.size > 0:
+                p10, med, mx, mn = (
+                    float(np.percentile(snow_elevs, 10.0)),
+                    float(np.median(snow_elevs)),
+                    float(np.max(snow_elevs)),
+                    float(np.min(snow_elevs)),
+                )
+                dem_available = True
+                snowline_p10_m = round(p10, 1)
+                snow_median_elev_m = round(med, 1)
+                snow_max_elev_m = round(mx, 1)
+                snow_min_elev_m = round(mn, 1)
+        except Exception:
+            pass
+
+    rule_str = (
+        f"NDSI >= {ndsi_thresh:.2f} & B08 > {nir_thresh:.2f}"
+        if has_nir
+        else f"NDSI >= {ndsi_thresh:.2f}"
+    )
+    snow_mask_da = xr.DataArray(
+        mask_arr,
+        dims=ndsi_da.dims,
+        coords=ndsi_da.coords,
+        name="SNOW_ICE_MASK",
+        attrs={
+            "long_name": f"Snow / Ice / Glacier Mask ({rule_str})",
+            "ndsi_thresh": float(ndsi_thresh),
+            "nir_thresh": float(nir_thresh),
+            "nir_water_filter": bool(has_nir),
+            "classes": "0=Snow-Free, 1=Snow/Ice/Glacier, 255=NoData",
+            "resolution_m": float(res_m),
+            "scene_id": ds.attrs.get("scene_id", ""),
+            "datetime": ds.attrs.get("datetime", ""),
+        },
+    )
+    crs = ds.rio.crs or ndsi_da.rio.crs
+    if crs is not None:
+        snow_mask_da = snow_mask_da.rio.write_crs(crs, inplace=False)
+    snow_mask_da = snow_mask_da.rio.write_nodata(255, inplace=False)
+
+    stats: dict[str, Any] = {
+        "ndsi_thresh": float(ndsi_thresh),
+        "nir_thresh": float(nir_thresh),
+        "nir_water_filter": bool(has_nir),
+        "resolution_m": float(res_m),
+        "snow_pixels": snow_pixels,
+        "snow_area_ha": round(snow_area_ha, 3),
+        "snow_area_km2": round(snow_area_km2, 4),
+        "snow_pct": round(snow_pct, 2),
+        "valid_pixels": valid_pixels,
+        "valid_area_ha": round(valid_area_ha, 3),
+        "valid_pct": round(valid_pct, 2),
+        "dem_available": dem_available,
+        "snowline_p10_m": snowline_p10_m,
+        "snow_median_elev_m": snow_median_elev_m,
+        "snow_max_elev_m": snow_max_elev_m,
+        "snow_min_elev_m": snow_min_elev_m,
+    }
+    return snow_mask_da, stats
+
 

@@ -620,6 +620,40 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "comp3_swipe_pair_label": "Par datumov za zavesno primerjavo:",
         "comp3_strip_header": "🎞️ Sinhroniziran vizualni pas ({n} datumi)",
         "comp3_delta_header": "📊 Kvantitativna karta sprememb (Δ = {d_last} − {d_first})",
+        # Upgrade A: Global Geodetic CRS (Auto-UTM worldwide) & Snow/Ice/Glacier NDSI Monitoring
+        "crs_mode_auto": "🌍 Avtomatsko (D96/TM v SLO / Lokalni UTM po svetu)",
+        "crs_mode_d96": "🇸🇮 D96/TM (EPSG:3794)",
+        "crs_mode_utm": "📐 Lokalni UTM (EPSG:326xx/327xx)",
+        "crs_active_caption": "Aktivni metrični CRS: **{crs_label}**",
+        "axis_e_utm_dyn": "Vzhodna koordinata E [m]  ({crs_label})",
+        "axis_n_utm_dyn": "Severna koordinata N [m]  ({crs_label})",
+        "gnss_station_banner_crs": "Stojišče GNSS — **{crs_label}:** `E = {e:,.1f} m`, `N = {n:,.1f} m` · **WGS84:** `φ = {lat:.5f}°`, `λ = {lon:.5f}°`",
+        "idx_NDSI_label": "NDSI — Sneg in ledeniki (B03, B11)",
+        "idx_NDSI_desc": "Normalizirani diferenčni snežni indeks: loči sneg in ledeniški led od oblakov, skal in tal.",
+        "snow_presets_header": "❄️ Sneg in Ledeniki (NDSI) — Hitri primeri (1 klik)",
+        "snow_presets_hint": "Izberite alpski ali ledeniški primer (samodejno nastavi AOI, lokalni UTM CRS in indeks NDSI — idealno tudi za 40-letni Landsat umik ledenikov):",
+        "snow_preset_triglav": "🏔️ Triglav / Kanin (SLO)",
+        "snow_preset_pasterze": "🧊 Ledenik Pasterze — Grossglockner (AT)",
+        "snow_preset_aletsch": "❄️ Ledenik Aletsch (CH)",
+        "snow_ndsi_thr_label": "Prag maske snega/ledu (NDSI ≥):",
+        "snow_ndsi_thr_help": "Standardno ESA/NASA pravilo: NDSI ≥ 0,40 in NIR (B08) > 0,11 (izloči temne vodne površine).",
+        "snow_use_dem_label": "Oceni višino snežne meje (Copernicus DEM 30 m)",
+        "snow_use_dem_help": "Poda 10. percentil nadmorske višine snežnih pikslov (snežna meja), mediano in najvišjo točko snega [m n.m.].",
+        "snow_kpi_area": "Površina snega / ledu",
+        "snow_kpi_share": "Delež pokritosti AOI",
+        "snow_kpi_snowline": "Ocenjena višina snežne meje (P10)",
+        "snow_kpi_snowline_na": "Ni DEM / brez snega",
+        "snow_kpi_elev_range": "Mediana / Max višina snega",
+        "snow_depth_scientific_note": (
+            "ℹ️ **Znanstvena opomba:** Optični sateliti (Sentinel-2 / Landsat) geodetsko natančno merijo "
+            "**površino snega in ledenikov [km² / ha]** ter (v kombinaciji s Copernicus DEM 30 m) **višino snežne meje [m n.m.]**, "
+            "medtem ko določitev fizične **višine/debeline snežne odeje [cm]** zahteva terenske meritve, LiDAR ali mikrovalovne senzorje."
+        ),
+        "snow_mask_layer_name": "❄️ Maska snega in ledu (NDSI ≥ {thr:.2f})",
+        "snow_mask_legend_snow": "Sneg / Led / Ledenik",
+        "snow_mask_legend_free": "Brez snega / Kopno / Voda",
+        "btn_download_snow_tif": "💾 Prenesi masko snega/ledu kot GeoTIFF (.tif)",
+        "carto_layer_tab2_snow": "Zavihek 2 · Maska snega/ledu NDSI ≥ {thr:.2f} ({date})",
     },
     "en": {
         # App chrome & header
@@ -1236,6 +1270,40 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "comp3_swipe_pair_label": "Date pair for curtain swipe:",
         "comp3_strip_header": "🎞️ Synchronized Visual Strip ({n} Dates)",
         "comp3_delta_header": "📊 Quantitative Change Map (Δ = {d_last} − {d_first})",
+        # Upgrade A: Global Geodetic CRS (Auto-UTM worldwide) & Snow/Ice/Glacier NDSI Monitoring
+        "crs_mode_auto": "🌍 Auto (D96/TM in SLO / Local UTM worldwide)",
+        "crs_mode_d96": "🇸🇮 D96/TM (EPSG:3794)",
+        "crs_mode_utm": "📐 Local UTM (EPSG:326xx/327xx)",
+        "crs_active_caption": "Active metric CRS: **{crs_label}**",
+        "axis_e_utm_dyn": "Easting E [m]  ({crs_label})",
+        "axis_n_utm_dyn": "Northing N [m]  ({crs_label})",
+        "gnss_station_banner_crs": "GNSS Station — **{crs_label}:** `E = {e:,.1f} m`, `N = {n:,.1f} m` · **WGS84:** `φ = {lat:.5f}°`, `λ = {lon:.5f}°`",
+        "idx_NDSI_label": "NDSI — Snow & Glaciers (B03, B11)",
+        "idx_NDSI_desc": "Normalized Difference Snow Index: separates snow and glacier ice from clouds, rock, and bare ground.",
+        "snow_presets_header": "❄️ Snow & Glaciers (NDSI) — Quick Case Studies (1 Click)",
+        "snow_presets_hint": "Pick an Alpine or glacier preset (automatically sets AOI, local UTM CRS, and NDSI — also great for 40-year Landsat glacier retreat):",
+        "snow_preset_triglav": "🏔️ Triglav / Kanin (SLO)",
+        "snow_preset_pasterze": "🧊 Pasterze Glacier — Grossglockner (AT)",
+        "snow_preset_aletsch": "❄️ Aletsch Glacier (CH)",
+        "snow_ndsi_thr_label": "Snow/Ice Mask Threshold (NDSI ≥):",
+        "snow_ndsi_thr_help": "Standard ESA/NASA rule: NDSI ≥ 0.40 and NIR (B08) > 0.11 (cleanly rejects dark water bodies).",
+        "snow_use_dem_label": "Estimate Snowline Elevation (Copernicus DEM 30 m)",
+        "snow_use_dem_help": "Computes 10th-percentile elevation of snow pixels (snowline altitude), median, and max snow elevation [m a.s.l.].",
+        "snow_kpi_area": "Snow / Ice Area",
+        "snow_kpi_share": "AOI Snow Cover Share",
+        "snow_kpi_snowline": "Estimated Snowline Altitude (P10)",
+        "snow_kpi_snowline_na": "No DEM / no snow",
+        "snow_kpi_elev_range": "Median / Max Snow Elevation",
+        "snow_depth_scientific_note": (
+            "ℹ️ **Scientific Note:** Optical satellites (Sentinel-2 / Landsat) accurately measure "
+            "**snow & glacier extent [km² / ha]** and (combined with Copernicus DEM 30 m) **snowline altitude [m a.s.l.]**, "
+            "whereas physical **snow depth [cm]** requires ground stations, LiDAR, or microwave observations."
+        ),
+        "snow_mask_layer_name": "❄️ Snow / Ice Mask (NDSI ≥ {thr:.2f})",
+        "snow_mask_legend_snow": "Snow / Ice / Glacier",
+        "snow_mask_legend_free": "Snow-Free / Land / Water",
+        "btn_download_snow_tif": "💾 Download Snow/Ice Mask as GeoTIFF (.tif)",
+        "carto_layer_tab2_snow": "Tab 2 · Snow/Ice Mask NDSI ≥ {thr:.2f} ({date})",
     },
 }
 
