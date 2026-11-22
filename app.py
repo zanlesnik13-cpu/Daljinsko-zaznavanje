@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from typing import Any, Callable, Sequence
 
 import folium
-from folium.plugins import Draw
+from folium.plugins import Draw, MeasureControl
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -49,6 +49,7 @@ _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "stac_loader",
     "analize",
     "casovne_vrste",
+    "relief",
     "nesrece",
     "ai_pomocnik",
     "gnss_plan",
@@ -166,6 +167,13 @@ from stac_loader import (
     load_copernicus_dem,
     load_scene,
     search_scenes,
+)
+from relief import (
+    TERRAIN_LAYER_SPECS,
+    build_preset_transect_endpoints,
+    compute_terrain_derivatives,
+    extract_transect_profile,
+    load_copernicus_dem as load_relief_dem,
 )
 
 for _m_name in _LOCAL_MODULES_ORDER:
@@ -687,6 +695,36 @@ SNOW_MASK_DISCRETE_RGBA: dict[int, tuple[int, int, int, int]] = {
     255: (0, 0, 0, 0),         # NoData transparent
 }
 
+RELIEF_LAYER_KEYS: list[str] = ["elevation", "slope_deg", "aspect", "hillshade"]
+RELIEF_LAYER_I18N: dict[str, str] = {
+    "elevation": "relief_layer_elevation",
+    "slope_deg": "relief_layer_slope_deg",
+    "aspect": "relief_layer_aspect",
+    "hillshade": "relief_layer_hillshade",
+}
+PROFILE_PRESET_KEYS: list[str] = ["w_e", "s_n", "sw_ne", "custom"]
+PROFILE_PRESET_I18N: dict[str, str] = {
+    "w_e": "profile_preset_we",
+    "s_n": "profile_preset_sn",
+    "sw_ne": "profile_preset_swne",
+    "custom": "profile_preset_custom",
+}
+
+
+def _get_optical_index_keys(sensor: str) -> list[str]:
+    """Return optical index keys, including thermal LST [°C] whenever Landsat C2 L2 is active."""
+    if sensor == SENSOR_LANDSAT:
+        return [*INDEX_KEYS, "LST"]
+    return list(INDEX_KEYS)
+
+
+def _fmt_index_pill(code: str, lang: str) -> str:
+    if code == "LST":
+        return t("idx_LST_pill", lang=lang)
+    if code == "VV_VH":
+        return t("sar_VV_VH_pill", lang=lang)
+    return code
+
 INTERVAL_KEYS: list[str] = list(TEMPORAL_INTERVAL_KEYS)
 INTERVAL_I18N: dict[str, str] = {
     INTERVAL_ALL: "interval_all",
@@ -808,6 +846,8 @@ def _init_session_state() -> None:
         "tab2_snow_stats": None,
         "tab2_snow_tif_bytes": None,
         "tab2_snow_tif_filename": None,
+        "tab2_relief_data": None,
+        "tab2_relief_sent_to_carto": False,
         "sidebar_crs_mode": "auto",
         "tab2_comp_obj": None,
         "tab2_comp_meta": None,
@@ -882,6 +922,7 @@ def _clear_loaded_products() -> None:
         "tab2_snow_stats",
         "tab2_snow_tif_bytes",
         "tab2_snow_tif_filename",
+        "tab2_relief_data",
         "tab2_comp_obj",
         "tab2_comp_meta",
         "tab2_comp_tif_bytes",
@@ -1012,7 +1053,7 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                 "vmax": float(spec["vmax"]),
                 "discrete_items": None,
                 "legend_title": f"{idx_key} ({spec['formula']})",
-                "legend_units": "",
+                "legend_units": str(spec.get("units", "")),
                 "stats_summary": stats_rows,
                 "default_title": f"{idx_key} — {idx_meta.get('sensor_name', 'Satellite')}",
                 "default_subtitle": f"{idx_meta.get('date_str', '')} | {idx_meta.get('mgrs_tile', '')}",
@@ -1066,6 +1107,57 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                 "tif_bytes": st.session_state.get("tab2_snow_tif_bytes"),
                 "tif_filename": st.session_state.get("tab2_snow_tif_filename") or "snow_mask.tif",
                 "file_stem": f"SnowMask_NDSI_{idx_meta.get('date_str', 'map')}",
+            }
+        )
+
+    # 2c. Tab 2: Copernicus DEM 30 m Terrain Layer (Elevation / Slope / Aspect / Hillshade)
+    relief_data = st.session_state.get("tab2_relief_data")
+    if isinstance(relief_data, dict) and relief_data.get("elevation") is not None:
+        r_layer_key = str(st.session_state.get("tab2_relief_layer_sel", "elevation"))
+        if r_layer_key not in RELIEF_LAYER_KEYS:
+            r_layer_key = "elevation"
+        r_da = relief_data[r_layer_key]
+        r_stats = relief_data.get("stats", {})
+        r_spec = TERRAIN_LAYER_SPECS[r_layer_key]
+        r_crs = str(relief_data.get("crs", CRS_D96TM))
+        r_lbl = t(RELIEF_LAYER_I18N[r_layer_key], lang=lang)
+        if r_spec.get("auto_range"):
+            r_vmin = float(r_stats.get("min_h", 0.0))
+            r_vmax = max(r_vmin + 1.0, float(r_stats.get("max_h", 2500.0)))
+        else:
+            r_vmin = float(r_spec["vmin"])
+            r_vmax = float(r_spec["vmax"])
+        r_rows: list[tuple[str, str]] = [
+            ("Min / Max [m]", f"{r_stats.get('min_h', 0.0):,.0f} – {r_stats.get('max_h', 0.0):,.0f} m"),
+            ("ΔH", f"{r_stats.get('relief_diff_m', 0.0):,.0f} m"),
+            (t("relief_kpi_slope", lang=lang), f"{r_stats.get('mean_slope_deg', 0.0):.1f}° / {r_stats.get('max_slope_deg', 0.0):.1f}°"),
+            (t("relief_kpi_steep20", lang=lang), f"{r_stats.get('steep_20_ha', 0.0):,.1f} ha ({r_stats.get('steep_20_pct', 0.0):.1f}%)"),
+        ]
+        sources.append(
+            {
+                "id": "tab2_relief",
+                "label": t("carto_layer_tab2_relief", lang=lang, layer=r_lbl, crs=format_crs_label(r_crs, short=True)),
+                "raster": r_da,
+                "crs": r_crs,
+                "is_rgb": False,
+                "bands": None,
+                "use_percentile_stretch": False,
+                "gamma": 1.0,
+                "cmap_name": str(r_spec["cmap"]),
+                "vmin": r_vmin,
+                "vmax": r_vmax,
+                "discrete_items": None,
+                "legend_title": r_lbl,
+                "legend_units": str(r_spec.get("units", "")),
+                "stats_summary": r_rows,
+                "default_title": f"Copernicus DEM — {r_lbl}",
+                "default_subtitle": f"GLO-30 (30 m) | {format_crs_label(r_crs)}",
+                "sensor_label": "Copernicus DEM 30 m",
+                "date_label": "GLO-30",
+                "resolution_m": float(r_stats.get("resolution_m", 30.0)),
+                "tif_bytes": None,
+                "tif_filename": f"CopernicusDEM_{r_layer_key}_{r_crs.replace('EPSG:', 'EPSG')}_30m.tif",
+                "file_stem": f"CopernicusDEM_{r_layer_key}",
             }
         )
 
@@ -2440,6 +2532,14 @@ def _build_aoi_folium_map(
         tooltip=tooltip_txt,
     ).add_to(fmap)
 
+    MeasureControl(
+        position="topleft",
+        primary_length_unit="meters",
+        secondary_length_unit="kilometers",
+        primary_area_unit="hectares",
+        secondary_area_unit="sqkilometers",
+    ).add_to(fmap)
+
     return fmap
 
 
@@ -3747,6 +3847,374 @@ def _render_interactive_aoi_section(
 # ---------------------------------------------------------------------------
 # Glavni tok aplikacije
 # ---------------------------------------------------------------------------
+def _render_relief_and_profile_section(
+    *,
+    target_bbox: list[float] | None,
+    target_polygon: dict[str, Any] | None,
+    target_crs: str,
+    bbox_metric: list[float] | None,
+    center_lat: float,
+    center_lon: float,
+    aoi_valid: bool,
+    lang: str,
+    key_prefix: str = "tab2_rel",
+) -> None:
+    """Izriše modul ⛰️ Relief (Copernicus DEM 30 m) in Vzdolžni prerez (A → B) z opcijskim indeksom."""
+    st.subheader(t("relief_header"))
+    st.caption(t("relief_intro"))
+
+    can_load = (target_bbox is not None) and aoi_valid
+    load_dem_clicked = st.button(
+        t("relief_btn_load"),
+        type="primary",
+        width="stretch",
+        disabled=not can_load,
+        key=f"{key_prefix}_btn_load_dem",
+    )
+
+    if load_dem_clicked and target_bbox is not None:
+        with st.spinner(t("relief_spinner", crs=format_crs_label(target_crs))):
+            try:
+                st.session_state["tab2_relief_data"] = None
+                st.session_state["tab2_relief_sent_to_carto"] = False
+                gc.collect()
+
+                dem_da = load_relief_dem(
+                    bbox_4326=target_bbox,
+                    target_epsg=target_crs,
+                    resolution=30.0,
+                    aoi_polygon_4326=target_polygon,
+                )
+                derivs = compute_terrain_derivatives(dem_da)
+                derivs["crs"] = target_crs
+                derivs["bbox_4326"] = list(target_bbox)
+                derivs["bbox_metric"] = list(bbox_metric) if bbox_metric else None
+                derivs["polygon_4326"] = target_polygon
+                st.session_state["tab2_relief_data"] = derivs
+                gc.collect()
+            except Exception as exc:
+                st.error(t("relief_error", err=exc))
+
+    rel_data: dict[str, Any] | None = st.session_state.get("tab2_relief_data")
+    if not isinstance(rel_data, dict) or rel_data.get("elevation") is None:
+        return
+
+    r_stats: dict[str, Any] = rel_data["stats"]
+    r_crs = str(rel_data.get("crs", target_crs))
+    dem_elev_da: xr.DataArray = rel_data["elevation"]
+
+    # 1. KPI vrstica za relief
+    rk1, rk2, rk3, rk4, rk5 = st.columns(5)
+    rk1.metric(
+        t("relief_kpi_elev"),
+        f"{r_stats['mean_h']:,.0f} m",
+        delta=f"{r_stats['min_h']:,.0f} – {r_stats['max_h']:,.0f} m",
+        delta_color="off",
+    )
+    rk2.metric(t("relief_kpi_diff"), f"{r_stats['relief_diff_m']:,.0f} m")
+    rk3.metric(
+        t("relief_kpi_slope"),
+        f"{r_stats['mean_slope_deg']:.1f}°",
+        delta=f"max {r_stats['max_slope_deg']:.1f}°",
+        delta_color="off",
+    )
+    rk4.metric(
+        t("relief_kpi_steep20"),
+        f"{r_stats['steep_20_ha']:,.1f} ha",
+        delta=f"{r_stats['steep_20_pct']:.1f} %",
+        delta_color="off",
+    )
+    rk5.metric(
+        t("relief_kpi_steep30"),
+        f"{r_stats['steep_30_ha']:,.1f} ha",
+        delta=f"{r_stats['steep_30_pct']:.1f} %",
+        delta_color="off",
+    )
+
+    # 2. Izbor sloja reliefa (dotiku prijazni žetoni) + prosojnost
+    col_rl, col_rop = st.columns([1.6, 1.0], vertical_alignment="bottom")
+    with col_rl:
+        r_layer_key = _touch_selector(
+            t("relief_layer_label"),
+            options=RELIEF_LAYER_KEYS,
+            default="elevation",
+            format_func=lambda k, _lang=lang: t(RELIEF_LAYER_I18N[k], lang=_lang),
+            key="tab2_relief_layer_sel",
+            use_pills=True,
+        )
+    with col_rop:
+        r_opacity = st.slider(
+            t("relief_opacity_label"),
+            min_value=0,
+            max_value=100,
+            value=85,
+            step=5,
+            key=f"{key_prefix}_opacity",
+        )
+
+    # 3. Nastavitev profila A → B (da ga lahko takoj narišemo tudi na interaktivnem zemljevidu!)
+    st.divider()
+    st.markdown(f"#### {t('profile_header')}")
+    st.caption(t("profile_caption"))
+
+    pr_preset = _touch_selector(
+        t("profile_preset_label"),
+        options=PROFILE_PRESET_KEYS,
+        default="w_e",
+        format_func=lambda k, _lang=lang: t(PROFILE_PRESET_I18N[k], lang=_lang),
+        key=f"{key_prefix}_profile_preset",
+        use_pills=True,
+    )
+
+    x_vals_d = np.asarray(dem_elev_da.coords["x"].values, dtype=np.float64)
+    y_vals_d = np.asarray(dem_elev_da.coords["y"].values, dtype=np.float64)
+    x_min_d, x_max_d = float(np.min(x_vals_d)), float(np.max(x_vals_d))
+    y_min_d, y_max_d = float(np.min(y_vals_d)), float(np.max(y_vals_d))
+
+    if pr_preset != "custom":
+        pt_a, pt_b = build_preset_transect_endpoints(dem_elev_da, preset=pr_preset)
+    else:
+        def_a, def_b = build_preset_transect_endpoints(dem_elev_da, preset="w_e")
+        pa1, pa2, pb1, pb2 = st.columns(4)
+        with pa1:
+            xa_in = st.number_input(
+                t("profile_pt_a_e"),
+                min_value=x_min_d,
+                max_value=x_max_d,
+                value=float(np.clip(def_a[0], x_min_d, x_max_d)),
+                step=100.0,
+                format="%.1f",
+                key=f"{key_prefix}_xa",
+            )
+        with pa2:
+            ya_in = st.number_input(
+                t("profile_pt_a_n"),
+                min_value=y_min_d,
+                max_value=y_max_d,
+                value=float(np.clip(def_a[1], y_min_d, y_max_d)),
+                step=100.0,
+                format="%.1f",
+                key=f"{key_prefix}_ya",
+            )
+        with pb1:
+            xb_in = st.number_input(
+                t("profile_pt_b_e"),
+                min_value=x_min_d,
+                max_value=x_max_d,
+                value=float(np.clip(def_b[0], x_min_d, x_max_d)),
+                step=100.0,
+                format="%.1f",
+                key=f"{key_prefix}_xb",
+            )
+        with pb2:
+            yb_in = st.number_input(
+                t("profile_pt_b_n"),
+                min_value=y_min_d,
+                max_value=y_max_d,
+                value=float(np.clip(def_b[1], y_min_d, y_max_d)),
+                step=100.0,
+                format="%.1f",
+                key=f"{key_prefix}_yb",
+            )
+        pt_a = (float(xa_in), float(ya_in))
+        pt_b = (float(xb_in), float(yb_in))
+
+    # Pretvori A in B v WGS84 za prikaz oranžne linije A → B na interaktivnem Slippy zemljevidu
+    transect_ll = None
+    try:
+        lon_a, lat_a = transform_coords(pt_a[0], pt_a[1], r_crs, EPSG_WGS84)
+        lon_b, lat_b = transform_coords(pt_b[0], pt_b[1], r_crs, EPSG_WGS84)
+        transect_ll = ((lat_a, lon_a), (lat_b, lon_b))
+    except Exception:
+        transect_ll = None
+
+    # 4. Interaktivni Slippy zemljevid reliefa + barvna lestvica + GeoTIFF / Kartografija
+    active_r_da: xr.DataArray = rel_data[r_layer_key]
+    r_spec = TERRAIN_LAYER_SPECS[r_layer_key]
+    r_lbl = t(RELIEF_LAYER_I18N[r_layer_key], lang=lang)
+    if r_spec.get("auto_range"):
+        r_vmin = float(r_stats.get("min_h", 0.0))
+        r_vmax = max(r_vmin + 1.0, float(r_stats.get("max_h", 2500.0)))
+    else:
+        r_vmin = float(r_spec["vmin"])
+        r_vmax = float(r_spec["vmax"])
+
+    st.markdown(
+        build_horizontal_colorbar_html(
+            cmap_name=str(r_spec["cmap"]),
+            vmin=r_vmin,
+            vmax=r_vmax,
+            label=f"Copernicus DEM 30 m — {r_lbl}",
+            units=str(r_spec.get("units", "")),
+        ),
+        unsafe_allow_html=True,
+    )
+
+    r_uri, r_bnds = raster_to_map_overlay_png(
+        active_r_da,
+        src_epsg=r_crs,
+        is_rgb=False,
+        cmap_name=str(r_spec["cmap"]),
+        vmin=r_vmin,
+        vmax=r_vmax,
+    )
+    r_bbox_4326 = rel_data.get("bbox_4326") or target_bbox
+    c_lat_r = 0.5 * (r_bbox_4326[1] + r_bbox_4326[3]) if r_bbox_4326 else center_lat
+    c_lon_r = 0.5 * (r_bbox_4326[0] + r_bbox_4326[2]) if r_bbox_4326 else center_lon
+    slippy_rel = build_satellite_slippy_map(
+        center_lat=c_lat_r,
+        center_lon=c_lon_r,
+        zoom=None,
+        basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+        overlay_layers=[
+            {
+                "name": f"⛰️ {r_lbl}",
+                "image": r_uri,
+                "bounds": r_bnds,
+                "opacity": float(r_opacity) / 100.0,
+                "show": True,
+                "zindex": 18,
+            }
+        ],
+        aoi_bbox_4326=r_bbox_4326,
+        aoi_polygon_geojson=rel_data.get("polygon_4326"),
+        aoi_bbox_3794=rel_data.get("bbox_metric"),
+        aoi_outline_label=t("slippy_aoi_outline"),
+        transect_latlon=transect_ll,
+        lang=lang,
+    )
+    st_folium(
+        slippy_rel,
+        height=540,
+        use_container_width=True,
+        returned_objects=[],
+        key=f"{key_prefix}_slippy_{r_layer_key}_{r_opacity}_{pr_preset}_{st.session_state.get('map_basemap', 'satellite')}",
+    )
+
+    # GeoTIFF + Pošlji v Izdelavo karte
+    r_tif_bytes = export_to_geotiff_bytes(active_r_da, target_epsg=r_crs)
+    r_epsg_tag = r_crs.replace("EPSG:", "EPSG")
+    r_dl1, r_dl2 = st.columns(2)
+    with r_dl1:
+        st.download_button(
+            label=t("relief_btn_dl_tif"),
+            data=r_tif_bytes,
+            file_name=f"CopernicusDEM_{r_layer_key}_{r_epsg_tag}_30m.tif",
+            mime="image/tiff",
+            width="stretch",
+            key=f"{key_prefix}_dl_tif_{r_layer_key}",
+        )
+    with r_dl2:
+        if st.button(
+            t("relief_btn_send_carto"),
+            width="stretch",
+            key=f"{key_prefix}_send_carto",
+        ):
+            st.session_state["tab4_pending_source_select"] = "tab2_relief"
+            st.session_state["tab2_relief_sent_to_carto"] = True
+            st.rerun()
+
+    if st.session_state.get("tab2_relief_sent_to_carto"):
+        st.success(t("relief_sent_carto_ok"))
+
+    # 5. Dual-axis Plotly vzdolžni prerez (Elevation + opcijski aktivni indeks iz Zavihka 2)
+    ov_da = st.session_state.get("tab2_index_da")
+    ov_meta = st.session_state.get("tab2_index_meta")
+    ov_available = (ov_da is not None) and isinstance(ov_meta, dict)
+    use_ov = False
+    ov_label = ""
+    if ov_available:
+        ov_k = str(ov_meta.get("index_key", "Index"))
+        ov_unit = " [°C]" if ov_k == "LST" else ""
+        ov_label = f"{ov_k}{ov_unit} ({ov_meta.get('date_str', '')})"
+        use_ov = st.checkbox(
+            t("profile_overlay_chk", name=ov_label),
+            value=True,
+            key=f"{key_prefix}_use_overlay",
+        )
+
+    if np.hypot(pt_b[0] - pt_a[0], pt_b[1] - pt_a[1]) <= 1.0:
+        st.warning(t("profile_same_pts_warn"))
+    else:
+        prof_df, prof_sum = extract_transect_profile(
+            dem_elev_da,
+            pt_a,
+            pt_b,
+            n_samples=150,
+            overlay_da=(ov_da if use_ov else None),
+            overlay_name=(ov_label if use_ov else None),
+        )
+        pk1, pk2, pk3, pk4 = st.columns(4)
+        pk1.metric(
+            t("profile_kpi_len"),
+            f"{prof_sum['total_length_km']:.2f} km",
+            delta=f"{prof_sum['total_length_m']:,.0f} m",
+            delta_color="off",
+        )
+        pk2.metric(t("profile_kpi_ascent"), f"+{prof_sum['total_ascent_m']:,.0f} m")
+        pk3.metric(t("profile_kpi_descent"), f"−{prof_sum['total_descent_m']:,.0f} m")
+        pk4.metric(t("profile_kpi_slope"), f"{prof_sum['mean_slope_pct']:.1f} %")
+
+        fig_prof = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_prof.add_trace(
+            go.Scatter(
+                x=prof_df["distance_m"],
+                y=prof_df["elevation_m"],
+                mode="lines",
+                name=t("profile_yaxis_elev"),
+                line=dict(color="#0F766E", width=2.4),
+                fill="tozeroy",
+                fillcolor="rgba(15, 118, 110, 0.18)",
+                hovertemplate="d = %{x:,.0f} m<br>H = %{y:,.1f} m<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        if prof_sum.get("has_overlay") and "overlay_value" in prof_df.columns:
+            fig_prof.add_trace(
+                go.Scatter(
+                    x=prof_df["distance_m"],
+                    y=prof_df["overlay_value"],
+                    mode="lines",
+                    name=str(prof_sum["overlay_name"]),
+                    line=dict(color="#EA580C", width=2.2),
+                    hovertemplate="d = %{x:,.0f} m<br>" + str(prof_sum["overlay_name"]) + " = %{y:.3f}<extra></extra>",
+                ),
+                secondary_y=True,
+            )
+            fig_prof.update_yaxes(
+                title_text=str(prof_sum["overlay_name"]),
+                secondary_y=True,
+                showgrid=False,
+                color="#EA580C",
+            )
+        fig_prof.update_xaxes(title_text=t("profile_xaxis"), gridcolor="#E2E8F0")
+        fig_prof.update_yaxes(
+            title_text=t("profile_yaxis_elev"),
+            secondary_y=False,
+            gridcolor="#E2E8F0",
+            color="#0F766E",
+        )
+        fig_prof.update_layout(
+            title=t("profile_chart_title", crs=format_crs_label(r_crs, short=True)),
+            height=410,
+            plot_bgcolor="#FFFFFF",
+            paper_bgcolor="#FFFFFF",
+            font=dict(color="#0F172A"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+            margin=dict(l=55, r=55, t=55, b=45),
+        )
+        st.plotly_chart(fig_prof, width="stretch", key=f"{key_prefix}_profile_plotly")
+
+        st.download_button(
+            label=t("profile_btn_dl_csv"),
+            data=prof_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"profile_A_to_B_{r_epsg_tag}.csv",
+            mime="text/csv",
+            width="stretch",
+            key=f"{key_prefix}_profile_dl_csv",
+        )
+
+
 def main() -> None:
     _init_session_state()
     pending_mode = st.session_state.pop("pending_aoi_mode", None)
@@ -4704,6 +5172,18 @@ def main() -> None:
                             on_click=_apply_snow_glacier_preset,
                             args=(sp_key,),
                         )
+            st.divider()
+            _render_relief_and_profile_section(
+                target_bbox=bbox_4326,
+                target_polygon=aoi_polygon_4326,
+                target_crs=target_crs,
+                bbox_metric=bbox_3794,
+                center_lat=center_lat,
+                center_lon=center_lon,
+                aoi_valid=aoi_valid,
+                lang=lang,
+                key_prefix="tab2_empty_rel",
+            )
 
         # --- Način 2A: Sentinel-1 SAR Water / Flood Mask ---
         elif active_sensor == SENSOR_S1:
@@ -4952,16 +5432,22 @@ def main() -> None:
                         width="stretch",
                     )
 
-        # --- Način 2B: Optični spektralni indeksi, Brezoblačni mozaik & Orodja ---
+        # --- Način 2B: Optični spektralni indeksi (vklj. LST °C), Brezoblačni mozaik, Relief & Orodja ---
         else:
-            t2_sub_idx, t2_sub_comp, t2_sub_tools = st.tabs(
-                [t("t2_subtab_index"), t("t2_subtab_composite"), t("t2_subtab_tools")]
+            t2_sub_idx, t2_sub_comp, t2_sub_relief, t2_sub_tools = st.tabs(
+                [
+                    t("t2_subtab_index"),
+                    t("t2_subtab_composite"),
+                    t("t2_subtab_relief"),
+                    t("t2_subtab_tools"),
+                ]
             )
 
             # ---------------------------------------------------------------
-            # PODZAVIHEK 2.1: SPEKTRALNI INDEKSI (POSAMEZEN DATUM)
+            # PODZAVIHEK 2.1: SPEKTRALNI INDEKSI & LST °C (POSAMEZEN DATUM)
             # ---------------------------------------------------------------
             with t2_sub_idx:
+                t2_opt_indices = _get_optical_index_keys(active_sensor)
                 with st.container(border=True):
                     col_s2, col_i2 = st.columns([1.35, 0.9])
                     with col_s2:
@@ -4977,9 +5463,9 @@ def main() -> None:
                     with col_i2:
                         t2_index_key = _touch_selector(
                             t("index_select_label"),
-                            options=INDEX_KEYS,
-                            default=INDEX_KEYS[0],
-                            format_func=lambda k: k,
+                            options=t2_opt_indices,
+                            default=t2_opt_indices[0],
+                            format_func=lambda k, _l=lang: _fmt_index_pill(k, _l),
                             key="tab2_index_select",
                             use_pills=True,
                         )
@@ -5245,12 +5731,21 @@ def main() -> None:
                                 sk4.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.1f} ha")
                             st.caption(t("snow_depth_scientific_note"))
 
-                        k1, k2, k3, k4, k5 = st.columns(5)
-                        k1.metric(t("m_mean"), f"{idx_stats['mean']:.3f}")
-                        k2.metric(t("m_median"), f"{idx_stats['median']:.3f}")
-                        k3.metric(t("m_std"), f"{idx_stats['std']:.3f}")
-                        k4.metric(t("m_valid_pct"), f"{idx_stats['valid_pct']:.1f} %")
-                        k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
+                        if idx_meta.get("index_key") == "LST":
+                            lst_range = float(idx_stats["max"]) - float(idx_stats["min"])
+                            k1, k2, k3, k4, k5 = st.columns(5)
+                            k1.metric(t("lst_kpi_min"), f"{idx_stats['min']:.1f} °C")
+                            k2.metric(t("lst_kpi_mean"), f"{idx_stats['mean']:.1f} °C")
+                            k3.metric(t("lst_kpi_max"), f"{idx_stats['max']:.1f} °C")
+                            k4.metric(t("lst_kpi_range"), f"{lst_range:.1f} °C")
+                            k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
+                        else:
+                            k1, k2, k3, k4, k5 = st.columns(5)
+                            k1.metric(t("m_mean"), f"{idx_stats['mean']:.3f}")
+                            k2.metric(t("m_median"), f"{idx_stats['median']:.3f}")
+                            k3.metric(t("m_std"), f"{idx_stats['std']:.3f}")
+                            k4.metric(t("m_valid_pct"), f"{idx_stats['valid_pct']:.1f} %")
+                            k5.metric(t("m_valid_ha"), f"{idx_stats['valid_area_ha']:,.2f} ha")
 
                         col_vm2, col_op2 = st.columns([1.65, 1.0], vertical_alignment="bottom")
                         with col_vm2:
@@ -5282,6 +5777,7 @@ def main() -> None:
                                     vmin=float(idx_spec["vmin"]),
                                     vmax=float(idx_spec["vmax"]),
                                     label=f"{idx_meta['sensor_name']} — {idx_key_s} ({idx_meta['date_str']})",
+                                    units=str(idx_spec.get("units", "")),
                                 ),
                                 unsafe_allow_html=True,
                             )
@@ -5857,6 +6353,22 @@ def main() -> None:
             # ---------------------------------------------------------------
             # PODZAVIHEK 2.3: SPEKTRALNI PODPIS TOČKE IN RABA TAL [HA]
             # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # PODZAVIHEK 2.3: RELIEF (COPERNICUS DEM 30 m) & VZDOLŽNI PREREZ A→B
+            # ---------------------------------------------------------------
+            with t2_sub_relief:
+                _render_relief_and_profile_section(
+                    target_bbox=active_bbox or bbox_4326,
+                    target_polygon=active_polygon,
+                    target_crs=target_crs,
+                    bbox_metric=st.session_state.get("search_bbox_3794") or bbox_3794,
+                    center_lat=center_lat,
+                    center_lon=center_lon,
+                    aoi_valid=aoi_valid or (active_bbox is not None),
+                    lang=lang,
+                    key_prefix="tab2_opt_rel",
+                )
+
             with t2_sub_tools:
                 # 1) Spektralni podpis točke (Spectral Signature Profiler)
                 with st.container(border=True):
@@ -6286,15 +6798,14 @@ def main() -> None:
         else:
             is_sar_t3 = active_sensor == SENSOR_S1
             min_swath_guard = 85.0 if bool(st.session_state.get("exclude_partial_swaths", True)) else 0.0
-            metric_options = SAR_METRIC_KEYS if is_sar_t3 else INDEX_KEYS
+            t3_opt_indices = _get_optical_index_keys(active_sensor)
+            metric_options = SAR_METRIC_KEYS if is_sar_t3 else t3_opt_indices
             metric_label_title = (
                 t("sar_metric_select_label") if is_sar_t3 else t("index_select_label")
             )
 
             def _fmt_metric_pill(code: str, _lang: str = lang) -> str:
-                if is_sar_t3 and code == "VV_VH":
-                    return t("sar_VV_VH_pill", lang=_lang)
-                return code
+                return _fmt_index_pill(code, _lang)
 
             sub_ts, sub_change, sub_tl = st.tabs(
                 [t("t3_subtab_ts"), t("t3_subtab_change"), t("t3_subtab_tl")]
@@ -6433,7 +6944,11 @@ def main() -> None:
                     if ts_df_show.empty:
                         st.warning(t("ts_empty_warn"))
                     else:
-                        ts_unit = " dB" if is_sar_t3 else ""
+                        ts_unit = (
+                            " dB"
+                            if is_sar_t3
+                            else (" °C" if ts_meta.get("index_key") == "LST" else "")
+                        )
                         ts_fig = _build_time_series_chart(
                             ts_df=ts_df_show,
                             metric_label=ts_meta["index_key"],
@@ -6466,13 +6981,11 @@ def main() -> None:
                     st.info(t("t3_need_two_scenes"))
                 else:
                     comp_layer_options = (
-                        list(SAR_METRIC_KEYS) if is_sar_t3 else ["RGB", "NIR", *INDEX_KEYS]
+                        list(SAR_METRIC_KEYS) if is_sar_t3 else ["RGB", "NIR", *t3_opt_indices]
                     )
 
                     def _fmt_comp_layer_pill(code: str, _lang: str = lang) -> str:
-                        if code == "VV_VH":
-                            return t("sar_VV_VH_pill", lang=_lang)
-                        return code
+                        return _fmt_index_pill(code, _lang)
 
                     with st.container(border=True):
                         col_c_idx, col_c_thr, col_c_scl = st.columns(
@@ -6488,6 +7001,7 @@ def main() -> None:
                                 use_pills=True,
                             )
                         is_comp_rgb = (not is_sar_t3) and comp_layer_key in ("RGB", "NIR")
+                        is_comp_lst = (not is_sar_t3) and comp_layer_key == "LST"
                         with col_c_thr:
                             if is_sar_t3:
                                 ch_threshold = st.slider(
@@ -6497,6 +7011,15 @@ def main() -> None:
                                     value=2.0,
                                     step=0.25,
                                     key="tab3_ch_threshold_sar",
+                                )
+                            elif is_comp_lst:
+                                ch_threshold = st.slider(
+                                    f"{t('t3_threshold_label')} [°C]",
+                                    min_value=0.5,
+                                    max_value=12.0,
+                                    value=2.0,
+                                    step=0.5,
+                                    key="tab3_ch_threshold_lst",
                                 )
                             else:
                                 ch_threshold = st.slider(
@@ -6621,7 +7144,8 @@ def main() -> None:
                         c_strips: list[bytes] = list(comp_show["strip_pngs"])
                         c_layer = str(comp_show["layer_mode"])
                         c_is_sar = comp_show.get("sensor") == SENSOR_S1
-                        unit_b = " [dB]" if c_is_sar else ""
+                        c_is_lst = (not c_is_sar) and c_layer == "LST"
+                        unit_b = " [dB]" if c_is_sar else (" [°C]" if c_is_lst else "")
                         idx_lbl = f"{c_layer}{unit_b}"
 
                         # 1. Interaktivna zavesa (2 datuma: t1 ↔ t2; 3 datumi: 2-stopenjska zavesa)
@@ -6679,7 +7203,11 @@ def main() -> None:
                                 mean_str = (
                                     f"{summary['mean']:+.2f} dB"
                                     if c_is_sar
-                                    else f"{summary['mean']:+.3f}"
+                                    else (
+                                        f"{summary['mean']:+.2f} °C"
+                                        if c_is_lst
+                                        else f"{summary['mean']:+.3f}"
+                                    )
                                 )
                                 c1, c2, c3, c4, c5 = st.columns(5)
                                 c1.metric(t("change_m_mean"), mean_str)
@@ -6764,12 +7292,10 @@ def main() -> None:
                     if is_sar_t3:
                         tl_layer_options = ["VV", "VH", "VV_VH"]
                     else:
-                        tl_layer_options = ["RGB", "NIR", *INDEX_KEYS]
+                        tl_layer_options = ["RGB", "NIR", *t3_opt_indices]
 
                     def _fmt_tl_layer_pill(code: str, _lang: str = lang) -> str:
-                        if code == "VV_VH":
-                            return t("sar_VV_VH_pill", lang=_lang)
-                        return code
+                        return _fmt_index_pill(code, _lang)
 
                     with st.container(border=True):
                         col_tl_layer, col_tl_n, col_tl_spd = st.columns(

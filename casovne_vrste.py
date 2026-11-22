@@ -449,6 +449,9 @@ def compute_change_detection(
     if sensor == SENSOR_S1:
         np.clip(diff_vals, np.float32(-30.0), np.float32(30.0), out=diff_vals)
         units = "dB"
+    elif idx_key == "LST":
+        np.clip(diff_vals, np.float32(-60.0), np.float32(60.0), out=diff_vals)
+        units = "°C"
     else:
         np.clip(diff_vals, np.float32(-2.0), np.float32(2.0), out=diff_vals)
         units = "dimensionless"

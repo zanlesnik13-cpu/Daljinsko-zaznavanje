@@ -91,6 +91,16 @@ SPECTRAL_INDICES: dict[str, dict[str, Any]] = {
         "vmax": 0.9,
         "diff_cmap": "RdBu",
     },
+    "LST": {
+        "bands": ("LST",),
+        "formula": "DN × 0.00341802 + 149.0 − 273.15 [°C]",
+        "cmap": "inferno",
+        "vmin": -5.0,
+        "vmax": 45.0,
+        "diff_cmap": "RdBu_r",
+        "units": "°C",
+        "landsat_only": True,
+    },
 }
 
 SAR_METRICS: dict[str, dict[str, Any]] = {
@@ -372,9 +382,10 @@ def apply_cloud_mask(
 
 
 def compute_index(ds: xr.Dataset, index_name: str) -> xr.DataArray:
-    """Compute a normalized-difference spectral index clipped to ``[-1.0, 1.0]``.
+    """Compute a normalized-difference spectral index ``[-1, 1]`` or Land Surface Temperature ``LST [°C]``.
 
-    Works identically for both Sentinel-2 L2A and harmonized Landsat C2 L2 Datasets.
+    Works identically for Sentinel-2 L2A and harmonized Landsat C2 L2 Datasets (with ``LST``
+    supported on Landsat C2 L2 thermal band ``lwir11`` / ``ST_B10`` / ``ST_B6``).
     """
     key = index_name.strip().upper()
     if key not in SPECTRAL_INDICES:
@@ -384,6 +395,53 @@ def compute_index(ds: xr.Dataset, index_name: str) -> xr.DataArray:
         )
 
     spec = SPECTRAL_INDICES[key]
+
+    # Single-band thermal Land Surface Temperature (LST in °C from Landsat C2 L2 lwir11 / ST_B10)
+    if key == "LST":
+        var_found = next((v for v in ("LST", "lwir11", "ST_B10", "lwir", "ST_B6") if v in ds.data_vars), None)
+        if var_found is None:
+            raise KeyError(
+                f"Dataset is missing thermal band 'LST' / 'lwir11'. Available: {list(ds.data_vars)}."
+            )
+        src_da = ds[var_found]
+        vals = src_da.values.astype(np.float32, copy=True)
+        # If raw DN (> 1000) was passed directly instead of pre-calibrated °C, apply USGS C2 L2 formula
+        fin_vals = vals[np.isfinite(vals)]
+        if var_found != "LST" or (fin_vals.size > 0 and float(np.nanmedian(fin_vals)) > 200.0):
+            valid_dn = np.isfinite(vals) & (vals > 0.0) & (vals < 65535.0)
+            out_c = np.full(vals.shape, np.nan, dtype=np.float32)
+            if np.any(valid_dn):
+                scaled = vals[valid_dn].astype(np.float64) * 0.00341802 + 149.0 - 273.15
+                out_c[valid_dn] = np.clip(scaled, -50.0, 80.0).astype(np.float32)
+            vals = out_c
+        else:
+            valid_c = np.isfinite(vals)
+            vals = np.where(valid_c, np.clip(vals, np.float32(-50.0), np.float32(80.0)), np.nan).astype(np.float32)
+
+        lst_da = xr.DataArray(
+            vals,
+            dims=src_da.dims,
+            coords=src_da.coords,
+            name="LST",
+            attrs={
+                "index_name": "LST",
+                "formula": spec["formula"],
+                "bands": "lwir11 (ST_B10)",
+                "units": "°C",
+                "long_name": "Land Surface Temperature [°C]",
+                "sensor": ds.attrs.get("sensor", "landsat-c2-l2"),
+                "scene_id": ds.attrs.get("scene_id", ""),
+                "datetime": ds.attrs.get("datetime", ""),
+                "mgrs_tile": ds.attrs.get("mgrs_tile", ""),
+                "resolution_m": ds.attrs.get("resolution_m", 30.0),
+            },
+        )
+        crs = ds.rio.crs or src_da.rio.crs
+        if crs is not None:
+            lst_da = lst_da.rio.write_crs(crs, inplace=False)
+        lst_da = lst_da.rio.write_nodata(np.nan, inplace=False)
+        return lst_da
+
     b1, b2 = spec["bands"]
     if b1 not in ds.data_vars or b2 not in ds.data_vars:
         raise KeyError(

@@ -20,7 +20,7 @@ import math
 from typing import Any, Sequence
 
 import folium
-from folium.plugins import MousePosition
+from folium.plugins import MeasureControl, MousePosition
 import matplotlib
 import numpy as np
 from PIL import Image
@@ -428,6 +428,7 @@ def build_satellite_slippy_map(
     aoi_bbox_3794: Sequence[float] | None = None,
     aoi_metric_crs: int | str | None = None,
     aoi_outline_label: str = "AOI (meja analize)",
+    transect_latlon: tuple[tuple[float, float], tuple[float, float]] | None = None,
     lang: str = "sl",
 ) -> folium.Map:
     """Build a full-width interactive Folium slippy map with satellite/index overlays & QGIS LayerControl.
@@ -531,6 +532,29 @@ def build_satellite_slippy_map(
             ).add_to(aoi_fg)
         aoi_fg.add_to(fmap)
 
+    if transect_latlon is not None and len(transect_latlon) == 2:
+        (lat_a, lon_a), (lat_b, lon_b) = transect_latlon
+        tr_fg = folium.FeatureGroup(name="📐 Profil A → B" if lang == "sl" else "📐 Profile A → B", show=True)
+        folium.PolyLine(
+            locations=[[float(lat_a), float(lon_a)], [float(lat_b), float(lon_b)]],
+            color="#EA580C",
+            weight=3.2,
+            opacity=0.95,
+            tooltip="A → B",
+        ).add_to(tr_fg)
+        for lbl_pt, (p_lat, p_lon) in (("A", (lat_a, lon_a)), ("B", (lat_b, lon_b))):
+            folium.CircleMarker(
+                location=[float(p_lat), float(p_lon)],
+                radius=6,
+                color="#0F172A",
+                weight=2,
+                fill=True,
+                fill_color="#EA580C",
+                fill_opacity=1.0,
+                tooltip=f"{'Točka' if lang == 'sl' else 'Point'} {lbl_pt}",
+            ).add_to(tr_fg)
+        tr_fg.add_to(fmap)
+
     # Live cursor coordinate readout (WGS84 lat, lon)
     MousePosition(
         position="bottomleft",
@@ -539,6 +563,15 @@ def build_satellite_slippy_map(
         lng_first=False,
         num_digits=5,
         prefix="WGS84 (φ, λ):",
+    ).add_to(fmap)
+
+    # Interactive distance (m / km) & area (ha / km²) measurement tool
+    MeasureControl(
+        position="topleft",
+        primary_length_unit="meters",
+        secondary_length_unit="kilometers",
+        primary_area_unit="hectares",
+        secondary_area_unit="sqkilometers",
     ).add_to(fmap)
 
     # QGIS-style always-visible layer control

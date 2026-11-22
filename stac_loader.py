@@ -82,9 +82,12 @@ PB04_START_UTC: datetime = datetime(2022, 1, 25, 0, 0, 0, tzinfo=timezone.utc)
 REFLECTANCE_SCALE: float = 10000.0
 PB04_RADIOMETRIC_OFFSET: float = 1000.0
 
-# USGS Landsat Collection 2 Level-2 optical reflectance calibration constants
+# USGS Landsat Collection 2 Level-2 optical reflectance & thermal LST calibration constants
 LANDSAT_SR_SCALE: float = 0.0000275
 LANDSAT_SR_OFFSET: float = -0.2
+LANDSAT_ST_SCALE: float = 0.00341802
+LANDSAT_ST_OFFSET: float = 149.0
+KELVIN_TO_CELSIUS: float = 273.15
 LANDSAT7_SLC_OFF_UTC: datetime = datetime(2003, 5, 31, 0, 0, 0, tzinfo=timezone.utc)
 
 # Sentinel-1 SAR dB floor
@@ -116,6 +119,9 @@ LOGICAL_TO_LANDSAT_ASSET: dict[str, str] = {
     "B08": "nir08",
     "B11": "swir16",
     "B12": "swir22",
+    "LST": "lwir11",
+    "ST_B10": "lwir11",
+    "ST_B6": "lwir11",
     "QA_PIXEL": "qa_pixel",
     "SCL": "qa_pixel",
     # Direct PC names also accepted
@@ -125,6 +131,8 @@ LOGICAL_TO_LANDSAT_ASSET: dict[str, str] = {
     "nir08": "nir08",
     "swir16": "swir16",
     "swir22": "swir22",
+    "lwir11": "lwir11",
+    "lwir": "lwir11",
     "qa_pixel": "qa_pixel",
 }
 LANDSAT_ASSET_TO_LOGICAL: dict[str, str] = {
@@ -134,6 +142,8 @@ LANDSAT_ASSET_TO_LOGICAL: dict[str, str] = {
     "nir08": "B08",
     "swir16": "B11",
     "swir22": "B12",
+    "lwir11": "LST",
+    "lwir": "LST",
     "qa_pixel": "QA_PIXEL",
 }
 
@@ -373,6 +383,19 @@ def _build_stac_date_windows(
         cur_start = cur_end + timedelta(days=1)
 
     return windows
+
+
+def get_stac_catalog(sign: bool = True) -> Client:
+    """Open the Microsoft Planetary Computer STAC catalog (optionally with inplace SAS signing)."""
+    from pystac_client.stac_api_io import StacApiIO
+
+    if sign:
+        return Client.open(
+            STAC_API_URL,
+            modifier=planetary_computer.sign_inplace,
+            stac_io=StacApiIO(timeout=25),
+        )
+    return Client.open(STAC_API_URL, stac_io=StacApiIO(timeout=25))
 
 
 def _fetch_stac_items_full(
@@ -1052,6 +1075,32 @@ def calibrate_landsat_optical_dn(
     return refl
 
 
+def calibrate_landsat_thermal_dn(
+    raw_vals: np.ndarray,
+    qa_vals: np.ndarray | None = None,
+) -> np.ndarray:
+    """Calibrate raw Landsat C2 L2 thermal DN (``ST_B10`` / ``ST_B6`` / ``lwir11``) to LST [°C].
+
+    Applies the official USGS Collection 2 Level-2 Surface Temperature formula:
+    ``LST_Kelvin = DN * 0.00341802 + 149.0``, ``LST_Celsius = LST_Kelvin - 273.15``.
+    Masks raw fill (``DN == 0``), saturated (``DN >= 65535``), and ``qa_pixel`` bit 0 (Fill)
+    to ``np.nan`` before scaling, and clips physically plausible values to ``[-50.0, 80.0] °C``.
+    """
+    arr = np.asarray(raw_vals)
+    valid_mask = np.isfinite(arr) & (arr > 0) & (arr < 65535)
+    if qa_vals is not None:
+        qa_u16 = np.asarray(qa_vals, dtype=np.uint16)
+        valid_mask &= (qa_u16 & np.uint16(1)) == 0
+
+    lst_c = np.full(arr.shape, np.nan, dtype=np.float32)
+    if np.any(valid_mask):
+        lst_k = arr[valid_mask].astype(np.float64) * LANDSAT_ST_SCALE + LANDSAT_ST_OFFSET
+        scaled_c = (lst_k - KELVIN_TO_CELSIUS).astype(np.float32)
+        np.clip(scaled_c, np.float32(-50.0), np.float32(80.0), out=scaled_c)
+        lst_c[valid_mask] = scaled_c
+    return lst_c
+
+
 def load_landsat_scene(
     item: StacItemOrGroup,
     bbox_4326: Sequence[float],
@@ -1062,19 +1111,25 @@ def load_landsat_scene(
 ) -> xr.Dataset:
     """Load a clipped Landsat C2 L2 scene (or same-day mosaic) with harmonized band names.
 
-    Applies official USGS Collection 2 Level-2 surface reflectance scaling:
-    ``reflectance = DN * 0.0000275 - 0.2``, clipped to ``[0.0, 1.0]`` (``float32``),
-    masking fill (``DN == 0``), saturated (``DN >= 65455``), and ``qa_pixel`` Fill bit 0
-    pixels to ``NaN`` before scaling.
-    Quality band ``qa_pixel`` is loaded with nearest-neighbor resampling as ``uint16``
-    under the variable name ``QA_PIXEL``.
+    Applies official USGS Collection 2 Level-2 surface reflectance scaling
+    (``DN * 0.0000275 - 0.2``) for optical bands and official thermal Surface Temperature
+    scaling (``DN * 0.00341802 + 149.0 - 273.15`` [°C]) for ``lwir11`` / ``lwir`` (``LST``).
+    Masks fill (``DN == 0``), saturated, and ``qa_pixel`` Fill bit 0 pixels to ``NaN``.
     """
     if not bands:
         raise ValueError("bands must contain at least one band name.")
     if resolution <= 0:
         raise ValueError(f"resolution must be positive, got {resolution}.")
 
-    # Translate requested logical bands (e.g., B04, B08, SCL/QA_PIXEL) to PC Landsat assets
+    item_list = _normalize_item_group(item)
+    crs_str = _normalize_crs_str(target_epsg)
+    signed_items = [planetary_computer.sign(it) for it in item_list]
+
+    # Detect actual thermal asset name on these Landsat items: L8/L9 use 'lwir11', L4/5/7 use 'lwir'
+    item_asset_keys = set().union(*(set(it.assets.keys()) for it in signed_items if it.assets))
+    thermal_asset_name = "lwir11" if ("lwir11" in item_asset_keys or "lwir" not in item_asset_keys) else "lwir"
+
+    # Translate requested logical bands (e.g., B04, B08, LST, QA_PIXEL) to PC Landsat assets
     asset_list: list[str] = []
     for b in bands:
         key = str(b).strip()
@@ -1082,21 +1137,19 @@ def load_landsat_scene(
         if pc_asset is None:
             raise KeyError(
                 f"Band {key!r} is not mapped for Landsat C2 L2. "
-                f"Supported bands: B02, B03, B04, B08, B11, B12, QA_PIXEL."
+                f"Supported bands: B02, B03, B04, B08, B11, B12, LST (lwir11), QA_PIXEL."
             )
+        if pc_asset in ("lwir11", "lwir"):
+            pc_asset = thermal_asset_name
         if pc_asset not in asset_list:
             asset_list.append(pc_asset)
 
-    # Always stream qa_pixel internally when loading optical bands so bit-0 Fill speckles are masked
+    # Always stream qa_pixel internally when loading optical/thermal bands so bit-0 Fill pixels are masked
     user_requested_qa = "qa_pixel" in asset_list
-    has_optical = any(a != "qa_pixel" for a in asset_list)
+    has_data_band = any(a != "qa_pixel" for a in asset_list)
     load_assets = list(asset_list)
-    if has_optical and "qa_pixel" not in load_assets:
+    if has_data_band and "qa_pixel" not in load_assets:
         load_assets.append("qa_pixel")
-
-    item_list = _normalize_item_group(item)
-    crs_str = _normalize_crs_str(target_epsg)
-    signed_items = [planetary_computer.sign(it) for it in item_list]
 
     if all(a == "qa_pixel" for a in load_assets):
         resampling_cfg: str | dict[str, str] = "nearest"
@@ -1118,7 +1171,7 @@ def load_landsat_scene(
     )
     raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_LANDSAT)
 
-    # Prepare qa_pixel array first so optical bands can mask Fill bit 0 cleanly
+    # Prepare qa_pixel array first so optical/thermal bands can mask Fill bit 0 cleanly
     qa_vals_u16: np.ndarray | None = None
     if "qa_pixel" in raw_ds.data_vars:
         qa_raw = raw_ds["qa_pixel"].values
@@ -1151,6 +1204,24 @@ def load_landsat_scene(
             qa_da = qa_da.rio.write_crs(crs_str, inplace=False)
             qa_da = qa_da.rio.write_nodata(0, inplace=False)
             calibrated_vars["QA_PIXEL"] = qa_da
+        elif asset_name in ("lwir11", "lwir"):
+            raw_vals = raw_da.values
+            lst_c = calibrate_landsat_thermal_dn(raw_vals, qa_vals=qa_vals_u16)
+            cal_da = xr.DataArray(
+                lst_c,
+                dims=raw_da.dims,
+                coords=raw_da.coords,
+                name="LST",
+                attrs={
+                    "units": "°C",
+                    "long_name": f"Landsat C2 L2 Land Surface Temperature ({asset_name}) [°C]",
+                    "source_asset": asset_name,
+                },
+            )
+            cal_da = cal_da.rio.write_crs(crs_str, inplace=False)
+            cal_da = cal_da.rio.write_nodata(np.nan, inplace=False)
+            calibrated_vars["LST"] = cal_da
+            del raw_vals, lst_c
         else:
             raw_vals = raw_da.values
             refl = calibrate_landsat_optical_dn(raw_vals, qa_vals=qa_vals_u16)
