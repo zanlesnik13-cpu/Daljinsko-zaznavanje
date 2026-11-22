@@ -645,6 +645,9 @@ def filter_by_temporal_interval(
         ordered_df.attrs["items_by_date"] = _NoDeepCopyDict(
             {str(r["date_str"]): items_by_date[str(r["date_str"])] for r in valid_recs}
         )
+        ordered_df.attrs["candidates_by_bucket"] = _NoDeepCopyDict(
+            {str(r["date_str"]): [items_by_date[str(r["date_str"])]] for r in valid_recs}
+        )
         ordered_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
         ordered_df.attrs["filtered_partial_dates"] = base_partial
         ordered_df.attrs["total_dates_found"] = base_total
@@ -673,6 +676,7 @@ def filter_by_temporal_interval(
         buckets.setdefault(bucket_key, []).append(rec_copy)
 
     selected_rows: list[dict[str, Any]] = []
+    candidates_by_bucket: dict[str, list[list[pystac.Item]]] = {}
     for bucket_key in sorted(buckets.keys(), reverse=True):
         cands = buckets[bucket_key]
 
@@ -689,9 +693,17 @@ def filter_by_temporal_interval(
                 return (-round(cov, 0), summer_pen, cld, abs(month - 7), str(r["date_str"]))
             return (-round(cov, 1), 0, cld, 0, str(r["date_str"]))
 
-        best = min(cands, key=_cand_rank)
+        ranked_cands = sorted(cands, key=_cand_rank)
+        best = dict(ranked_cands[0])
         best.pop("_month", None)
+        best_date = str(best["date_str"])
         selected_rows.append(best)
+        # Keep top 4 clearest candidate dates per time bucket for AOI-level cloud fallback
+        candidates_by_bucket[best_date] = [
+            items_by_date[str(c["date_str"])]
+            for c in ranked_cands[:4]
+            if str(c["date_str"]) in items_by_date
+        ]
 
     selected_rows.sort(key=lambda r: str(r["date_str"]), reverse=True)
     filtered_df = pd.DataFrame(selected_rows, columns=SUMMARY_COLUMNS)
@@ -701,6 +713,7 @@ def filter_by_temporal_interval(
     )
 
     filtered_df.attrs["items_by_date"] = filtered_items_by_date
+    filtered_df.attrs["candidates_by_bucket"] = _NoDeepCopyDict(candidates_by_bucket)
     filtered_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
     filtered_df.attrs["filtered_partial_dates"] = base_partial
     filtered_df.attrs["total_dates_found"] = base_total
@@ -978,7 +991,7 @@ def search_landsat(
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
     limit: int | None = None,
-    exclude_l7_slc_off: bool = False,
+    exclude_l7_slc_off: bool = True,
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,
@@ -1015,6 +1028,30 @@ def search_landsat(
     )
 
 
+def calibrate_landsat_optical_dn(
+    raw_vals: np.ndarray,
+    qa_vals: np.ndarray | None = None,
+) -> np.ndarray:
+    """Calibrate raw Landsat C2 L2 optical DN values to clean surface reflectance in ``[0.0, 1.0]``.
+
+    Masks raw fill (``DN == 0``), radiometrically saturated/corrupt pixels (``DN >= 65455``),
+    and ``qa_pixel`` bit 0 (Fill) to ``np.nan`` BEFORE applying ``DN * 0.0000275 - 0.2``,
+    eliminating bright red/green/blue sensor noise speckles on 1980s Landsat 4/5 scenes.
+    """
+    arr = np.asarray(raw_vals)
+    valid_mask = np.isfinite(arr) & (arr > 0) & (arr < 65455)
+    if qa_vals is not None:
+        qa_u16 = np.asarray(qa_vals, dtype=np.uint16)
+        valid_mask &= (qa_u16 & np.uint16(1)) == 0
+
+    refl = np.full(arr.shape, np.nan, dtype=np.float32)
+    if np.any(valid_mask):
+        scaled = arr[valid_mask].astype(np.float32) * np.float32(LANDSAT_SR_SCALE) + np.float32(LANDSAT_SR_OFFSET)
+        np.clip(scaled, np.float32(0.0), np.float32(1.0), out=scaled)
+        refl[valid_mask] = scaled
+    return refl
+
+
 def load_landsat_scene(
     item: StacItemOrGroup,
     bbox_4326: Sequence[float],
@@ -1027,7 +1064,8 @@ def load_landsat_scene(
 
     Applies official USGS Collection 2 Level-2 surface reflectance scaling:
     ``reflectance = DN * 0.0000275 - 0.2``, clipped to ``[0.0, 1.0]`` (``float32``),
-    with fill pixels (``DN == 0``) masked to ``NaN``.
+    masking fill (``DN == 0``), saturated (``DN >= 65455``), and ``qa_pixel`` Fill bit 0
+    pixels to ``NaN`` before scaling.
     Quality band ``qa_pixel`` is loaded with nearest-neighbor resampling as ``uint16``
     under the variable name ``QA_PIXEL``.
     """
@@ -1049,13 +1087,20 @@ def load_landsat_scene(
         if pc_asset not in asset_list:
             asset_list.append(pc_asset)
 
+    # Always stream qa_pixel internally when loading optical bands so bit-0 Fill speckles are masked
+    user_requested_qa = "qa_pixel" in asset_list
+    has_optical = any(a != "qa_pixel" for a in asset_list)
+    load_assets = list(asset_list)
+    if has_optical and "qa_pixel" not in load_assets:
+        load_assets.append("qa_pixel")
+
     item_list = _normalize_item_group(item)
     crs_str = _normalize_crs_str(target_epsg)
     signed_items = [planetary_computer.sign(it) for it in item_list]
 
-    if all(a == "qa_pixel" for a in asset_list):
+    if all(a == "qa_pixel" for a in load_assets):
         resampling_cfg: str | dict[str, str] = "nearest"
-    elif "qa_pixel" in asset_list:
+    elif "qa_pixel" in load_assets:
         resampling_cfg = {"qa_pixel": "nearest", "*": "bilinear"}
     else:
         resampling_cfg = "bilinear"
@@ -1064,7 +1109,7 @@ def load_landsat_scene(
 
     raw_ds = odc.stac.load(
         signed_items,
-        bands=asset_list,
+        bands=load_assets,
         bbox=[float(v) for v in bbox_4326],
         crs=crs_str,
         resolution=float(resolution),
@@ -1072,6 +1117,12 @@ def load_landsat_scene(
         groupby="solar_day",
     )
     raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_LANDSAT)
+
+    # Prepare qa_pixel array first so optical bands can mask Fill bit 0 cleanly
+    qa_vals_u16: np.ndarray | None = None
+    if "qa_pixel" in raw_ds.data_vars:
+        qa_raw = raw_ds["qa_pixel"].values
+        qa_vals_u16 = np.where(np.isfinite(qa_raw), qa_raw, 1).astype(np.uint16)
 
     calibrated_vars: dict[str, xr.DataArray] = {}
     for asset_name in asset_list:
@@ -1084,8 +1135,9 @@ def load_landsat_scene(
         raw_da = raw_ds[asset_name]
 
         if asset_name == "qa_pixel":
-            qa_raw = raw_da.values
-            qa_vals = np.where(np.isfinite(qa_raw), qa_raw, 1).astype(np.uint16)
+            if not user_requested_qa:
+                continue
+            qa_vals = qa_vals_u16 if qa_vals_u16 is not None else np.ones(raw_da.shape, dtype=np.uint16)
             qa_da = xr.DataArray(
                 qa_vals,
                 dims=raw_da.dims,
@@ -1101,13 +1153,7 @@ def load_landsat_scene(
             calibrated_vars["QA_PIXEL"] = qa_da
         else:
             raw_vals = raw_da.values
-            valid_mask = np.isfinite(raw_vals) & (raw_vals != 0)
-
-            refl = raw_vals.astype(np.float32, copy=True)
-            refl *= np.float32(LANDSAT_SR_SCALE)
-            refl += np.float32(LANDSAT_SR_OFFSET)
-            np.clip(refl, np.float32(0.0), np.float32(1.0), out=refl)
-            refl[~valid_mask] = np.nan
+            refl = calibrate_landsat_optical_dn(raw_vals, qa_vals=qa_vals_u16)
 
             cal_da = xr.DataArray(
                 refl,
@@ -1123,7 +1169,7 @@ def load_landsat_scene(
             cal_da = cal_da.rio.write_crs(crs_str, inplace=False)
             cal_da = cal_da.rio.write_nodata(np.nan, inplace=False)
             calibrated_vars[logical_name] = cal_da
-            del raw_vals, valid_mask, refl
+            del raw_vals, refl
 
     meta = _merge_group_metadata(signed_items, sensor=SENSOR_LANDSAT)
     ds = xr.Dataset(
@@ -1308,7 +1354,7 @@ def search_scenes(
     end_date: str | date | datetime,
     max_cloud_cover: float = 20,
     limit: int | None = None,
-    exclude_l7_slc_off: bool = False,
+    exclude_l7_slc_off: bool = True,
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,

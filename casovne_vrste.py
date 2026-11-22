@@ -178,6 +178,34 @@ def _compute_raw_swath_coverage_pct(
     return round(float(np.clip(100.0 * finite_px / denom_px, 0.0, 100.0)), 1)
 
 
+def _resolve_bucket_candidates(
+    primary_group: list[pystac.Item],
+    sensor: str,
+    candidates_by_date: dict[str, list[list[pystac.Item]]] | None,
+) -> list[list[pystac.Item]]:
+    """Return up to 4 deduplicated candidate date groups for a temporal bucket."""
+    _, prim_date, _, _, _ = _group_metadata(primary_group, sensor=sensor)
+    raw_cands: list[list[pystac.Item]] = [primary_group]
+    if candidates_by_date and prim_date in candidates_by_date:
+        for alt_group in candidates_by_date[prim_date]:
+            if isinstance(alt_group, list) and alt_group:
+                raw_cands.append(alt_group)
+
+    dedup: list[list[pystac.Item]] = []
+    seen_dates: set[str] = set()
+    for grp in raw_cands:
+        try:
+            _, d_str, _, _, _ = _group_metadata(grp, sensor=sensor)
+        except Exception:
+            continue
+        if d_str not in seen_dates:
+            seen_dates.add(d_str)
+            dedup.append(grp)
+        if len(dedup) >= 4:
+            break
+    return dedup or [primary_group]
+
+
 def extract_time_series(
     items: Sequence[StacItemOrGroup],
     bbox_4326: Sequence[float],
@@ -185,21 +213,20 @@ def extract_time_series(
     target_epsg: int | str = "EPSG:3794",
     resolution: float = 10,
     mask_clouds: bool = True,
-    min_valid_pct: float = 10.0,
+    min_valid_pct: float = 75.0,
     progress_callback: Callable[[int, int, str], None] | None = None,
     sensor: str = SENSOR_S2,
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_swath_coverage_pct: float = 85.0,
+    candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
 ) -> pd.DataFrame:
-    """Extract a multi-temporal index or SAR backscatter time series (1 mosaicked date in RAM).
+    """Extract a multi-temporal index or SAR backscatter time series with smart AOI cloud fallback.
 
-    Streams only the minimal bands needed for ``sensor`` and ``index_name``,
-    mosaics all same-day tiles seamlessly onto the target CRS grid, clips to
-    ``aoi_polygon_4326`` if provided, skips partial-swath dates with less than
-    ``min_swath_coverage_pct`` non-NoData pixels before cloud masking, applies
-    sensor-appropriate cloud masking (Sentinel-2 SCL or Landsat QA_PIXEL;
-    skipped for all-weather SAR), records statistics, and immediately releases
-    each raster via ``gc.collect()``.
+    For each temporal bucket, evaluates candidate #1's actual AOI cloud-free valid pixel %
+    (using Sentinel-2 ``SCL`` or Landsat ``QA_PIXEL``). If candidate #1 fails the
+    ``min_swath_coverage_pct`` (default 85%) or ``min_valid_pct`` (default 75%) check,
+    automatically tries candidates #2, #3, and #4 from the same time bucket until a
+    genuinely cloud-free observation over the AOI is found.
     """
     idx_key = index_name.strip().upper()
     use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
@@ -209,68 +236,67 @@ def extract_time_series(
     total = len(epoch_groups)
     rows: list[dict[str, Any]] = []
     skipped_epochs: list[dict[str, Any]] = []
+    replaced_epochs: list[dict[str, Any]] = []
 
-    for step, day_items in enumerate(epoch_groups):
-        dt_utc, date_str, scene_id, platform, cloud_cover = _group_metadata(day_items, sensor=sensor)
-
+    for step, primary_items in enumerate(epoch_groups):
+        _, prim_date_str, prim_scene_id, _, _ = _group_metadata(primary_items, sensor=sensor)
         if progress_callback is not None:
-            progress_callback(step, total, date_str)
+            progress_callback(step, total, prim_date_str)
 
-        ds: xr.Dataset | None = None
-        masked_ds: xr.Dataset | None = None
-        layer_da: xr.DataArray | None = None
-        try:
-            ds = load_scene(
-                sensor=sensor,
-                item=day_items,
-                bbox_4326=bbox_4326,
-                bands=req_bands,
-                target_epsg=target_epsg,
-                resolution=float(resolution),
-                aoi_polygon_4326=aoi_polygon_4326,
-            )
-            swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
-            if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
-                logger.info(
-                    "Skipped %s (%s): partial swath coverage %.1f%% < %.0f%%.",
-                    date_str,
-                    scene_id,
-                    swath_pct,
-                    min_swath_coverage_pct,
-                )
-                skipped_epochs.append(
-                    {
-                        "date_str": date_str,
-                        "scene_id": str(ds.attrs.get("scene_id", scene_id)),
-                        "valid_pct": swath_pct,
-                        "reason": f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)",
-                    }
-                )
-                continue
+        bucket_cands = _resolve_bucket_candidates(primary_items, sensor, candidates_by_date)
+        accepted = False
+        first_fail_reason = "low_valid_pixels"
+        first_fail_pct = 0.0
 
-            masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=use_cloud_mask)
-            layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=idx_key)
-            stats = compute_index_stats(layer_da, resolution_m=float(resolution))
+        for cand_idx, day_items in enumerate(bucket_cands):
+            dt_utc, date_str, scene_id, platform, cloud_cover = _group_metadata(day_items, sensor=sensor)
+            ds: xr.Dataset | None = None
+            masked_ds: xr.Dataset | None = None
+            layer_da: xr.DataArray | None = None
+            try:
+                ds = load_scene(
+                    sensor=sensor,
+                    item=day_items,
+                    bbox_4326=bbox_4326,
+                    bands=req_bands,
+                    target_epsg=target_epsg,
+                    resolution=float(resolution),
+                    aoi_polygon_4326=aoi_polygon_4326,
+                )
+                swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
+                if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
+                    if cand_idx == 0:
+                        first_fail_pct = swath_pct
+                        first_fail_reason = f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)"
+                    logger.info(
+                        "Bucket %s candidate #%d (%s) rejected: partial swath %.1f%% < %.0f%%.",
+                        prim_date_str,
+                        cand_idx + 1,
+                        date_str,
+                        swath_pct,
+                        min_swath_coverage_pct,
+                    )
+                    continue
 
-            valid_pct = float(stats["valid_pct"])
-            if valid_pct < float(min_valid_pct):
-                logger.info(
-                    "Skipped %s (%s): %.1f%% valid pixels (clear: %.1f%%, min: %.0f%%).",
-                    date_str,
-                    scene_id,
-                    valid_pct,
-                    clear_pct,
-                    min_valid_pct,
-                )
-                skipped_epochs.append(
-                    {
-                        "date_str": date_str,
-                        "scene_id": scene_id,
-                        "valid_pct": valid_pct,
-                        "reason": "low_valid_pixels",
-                    }
-                )
-            else:
+                masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
+                layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=idx_key)
+                stats = compute_index_stats(layer_da, resolution_m=float(resolution))
+
+                valid_pct = float(stats["valid_pct"])
+                if valid_pct < float(min_valid_pct):
+                    if cand_idx == 0:
+                        first_fail_pct = valid_pct
+                        first_fail_reason = f"aoi_clouds ({valid_pct:.1f}% < {min_valid_pct:.0f}%)"
+                    logger.info(
+                        "Bucket %s candidate #%d (%s) rejected: %.1f%% AOI clear < %.0f%%.",
+                        prim_date_str,
+                        cand_idx + 1,
+                        date_str,
+                        valid_pct,
+                        min_valid_pct,
+                    )
+                    continue
+
                 rows.append(
                     {
                         "date": pd.Timestamp(dt_utc),
@@ -291,19 +317,43 @@ def extract_time_series(
                         "valid_area_ha": stats["valid_area_ha"],
                     }
                 )
-        except Exception as exc:
-            logger.warning("Failed to process epoch %s (%s): %s", date_str, scene_id, exc)
+                if cand_idx > 0:
+                    replaced_epochs.append(
+                        {
+                            "orig_date": prim_date_str,
+                            "used_date": date_str,
+                            "orig_valid_pct": round(first_fail_pct, 1),
+                            "used_valid_pct": round(valid_pct, 1),
+                            "candidate_rank": cand_idx + 1,
+                        }
+                    )
+                    logger.info(
+                        "Replaced cloudy epoch %s (%.1f%%) with clear candidate #%d: %s (%.1f%% clear).",
+                        prim_date_str,
+                        first_fail_pct,
+                        cand_idx + 1,
+                        date_str,
+                        valid_pct,
+                    )
+                accepted = True
+                break
+            except Exception as exc:
+                if cand_idx == 0:
+                    first_fail_reason = str(exc)
+                logger.warning("Failed candidate #%d %s (%s): %s", cand_idx + 1, date_str, scene_id, exc)
+            finally:
+                del ds, masked_ds, layer_da
+                gc.collect()
+
+        if not accepted:
             skipped_epochs.append(
                 {
-                    "date_str": date_str,
-                    "scene_id": scene_id,
-                    "valid_pct": 0.0,
-                    "reason": str(exc),
+                    "date_str": prim_date_str,
+                    "scene_id": prim_scene_id,
+                    "valid_pct": round(first_fail_pct, 1),
+                    "reason": first_fail_reason,
                 }
             )
-        finally:
-            del ds, masked_ds, layer_da
-            gc.collect()
 
     if progress_callback is not None:
         progress_callback(total, total, "done")
@@ -316,6 +366,7 @@ def extract_time_series(
     df.attrs["sensor"] = sensor
     df.attrs["index_name"] = idx_key
     df.attrs["skipped_epochs"] = skipped_epochs
+    df.attrs["replaced_epochs"] = replaced_epochs
     df.attrs["total_requested"] = total
     return df
 
@@ -744,19 +795,213 @@ def generate_timelapse_frames(
     sensor: str = SENSOR_S2,
     aoi_polygon_4326: dict[str, Any] | None = None,
     mask_clouds: bool = True,
-    min_valid_pct: float = 10.0,
+    min_valid_pct: float = 75.0,
     duration_ms: int = 800,
     max_width: int = 700,
     progress_callback: Callable[[int, int, str], None] | None = None,
     min_swath_coverage_pct: float = 85.0,
+    candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
 ) -> dict[str, Any]:
-    """Generate a memory-safe visual timelapse (compact PNG frames + animated GIF).
+    """Generate a memory-safe visual timelapse with AOI-level cloud checking and 4-candidate fallback.
 
-    Loads strictly one mosaicked acquisition date at a time, skips partial-swath
-    frames (< ``min_swath_coverage_pct`` non-NoData pixels before cloud masking),
-    aligns frames onto a consistent pixel grid, stamps each frame with
-    ``YYYY-MM-DD | Platform``, frees raster memory via ``gc.collect()`` after
-    every frame, and compiles a looping GIF.
+    Evaluates actual cloud-free pixel % inside the AOI (even for RGB / NIR frames via
+    Sentinel-2 ``SCL`` or Landsat ``QA_PIXEL``). If candidate #1 has ``< min_valid_pct``
+    (default 75%) cloud-free pixels over the AOI, automatically tries candidates #2–#4
+    from the same time bucket so cloudy frames and empty gaps are eliminated.
+    """
+    mode = layer_mode.strip().upper()
+    is_sar = sensor == SENSOR_S1
+    is_rgb_composite = mode in ("RGB", "NIR") and not is_sar
+    mask_band = "QA_PIXEL" if sensor == SENSOR_LANDSAT else "SCL"
+
+    if is_sar:
+        if mode not in SAR_METRICS:
+            mode = "VV"
+        req_bands = list(SAR_METRICS[mode]["pols"])
+        render_bands = list(req_bands)
+        use_cloud_mask = False
+    elif mode == "RGB":
+        render_bands = ["B04", "B03", "B02"]
+        use_cloud_mask = bool(mask_clouds)
+        req_bands = render_bands + ([mask_band] if use_cloud_mask else [])
+    elif mode == "NIR":
+        render_bands = ["B08", "B04", "B03"]
+        use_cloud_mask = bool(mask_clouds)
+        req_bands = render_bands + ([mask_band] if use_cloud_mask else [])
+    else:
+        use_cloud_mask = bool(mask_clouds)
+        req_bands = get_required_bands_for_sensor(sensor, mode, include_cloud_mask=use_cloud_mask)
+        render_bands = list(req_bands)
+
+    epoch_groups = _normalize_epoch_groups(items)
+    total = len(epoch_groups)
+
+    frames: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    replaced: list[dict[str, Any]] = []
+    target_pil_size: tuple[int, int] | None = None
+
+    for step, primary_items in enumerate(epoch_groups):
+        _, prim_date_str, prim_scene_id, _, _ = _group_metadata(primary_items, sensor=sensor)
+        if progress_callback is not None:
+            progress_callback(step, total, prim_date_str)
+
+        bucket_cands = _resolve_bucket_candidates(primary_items, sensor, candidates_by_date)
+        accepted = False
+        first_fail_reason = "low_valid_pixels"
+        first_fail_pct = 0.0
+
+        for cand_idx, day_items in enumerate(bucket_cands):
+            _, date_str, scene_id, platform_raw, _ = _group_metadata(day_items, sensor=sensor)
+            ds: xr.Dataset | None = None
+            masked_ds: xr.Dataset | None = None
+            layer_da: xr.DataArray | None = None
+            img: Image.Image | None = None
+
+            try:
+                ds = load_scene(
+                    sensor=sensor,
+                    item=day_items,
+                    bbox_4326=bbox_4326,
+                    bands=req_bands,
+                    target_epsg=target_epsg,
+                    resolution=float(resolution),
+                    aoi_polygon_4326=aoi_polygon_4326,
+                )
+
+                platform_lbl = _format_platform_stamp(str(ds.attrs.get("platform", platform_raw)), sensor)
+                stamp = f"{date_str} | {platform_lbl} | {mode}"
+                merged_scene_id = str(ds.attrs.get("scene_id", scene_id))
+
+                swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
+                if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
+                    if cand_idx == 0:
+                        first_fail_pct = swath_pct
+                        first_fail_reason = f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)"
+                    continue
+
+                if is_rgb_composite:
+                    if use_cloud_mask:
+                        _, clear_pct = apply_cloud_mask(ds, mask_clouds=True, sensor=sensor)
+                        valid_pct = float(clear_pct)
+                    else:
+                        valid = np.ones(ds[render_bands[0]].shape, dtype=bool)
+                        for b in render_bands:
+                            valid &= np.isfinite(ds[b].values)
+                        valid_pct = float(100.0 * np.count_nonzero(valid) / max(valid.size, 1))
+
+                    if valid_pct < float(min_valid_pct):
+                        if cand_idx == 0:
+                            first_fail_pct = valid_pct
+                            first_fail_reason = f"aoi_clouds ({valid_pct:.1f}% < {min_valid_pct:.0f}%)"
+                        continue
+
+                    y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64)
+                    rgb_u8 = _stretch_rgb_for_pil(ds, render_bands, y_coords)
+                    img = Image.fromarray(rgb_u8, mode="RGB")
+                    img = _resize_pil_frame(img, max_width=max_width, target_size=target_pil_size)
+                    if target_pil_size is None:
+                        target_pil_size = img.size
+                    img = _stamp_banner_on_pil(img, stamp)
+                else:
+                    masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
+                    layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=mode)
+                    stats = compute_index_stats(layer_da, resolution_m=float(resolution))
+                    valid_pct = float(stats["valid_pct"])
+                    if valid_pct < float(min_valid_pct):
+                        if cand_idx == 0:
+                            first_fail_pct = valid_pct
+                            first_fail_reason = f"aoi_clouds ({valid_pct:.1f}% < {min_valid_pct:.0f}%)"
+                        continue
+
+                    spec = SAR_METRICS[mode] if is_sar else SPECTRAL_INDICES[mode]
+                    img = render_dataarray_to_pil(
+                        layer_da,
+                        cmap_name=str(spec["cmap"]),
+                        vmin=float(spec["vmin"]),
+                        vmax=float(spec["vmax"]),
+                        stamp_text=stamp,
+                        max_width=max_width,
+                        target_size=target_pil_size,
+                    )
+                    if target_pil_size is None:
+                        target_pil_size = img.size
+
+                frames.append(
+                    {
+                        "date_str": date_str,
+                        "platform": platform_lbl,
+                        "scene_id": merged_scene_id,
+                        "valid_pct": round(valid_pct, 1),
+                        "png_bytes": pil_to_png_bytes(img),
+                    }
+                )
+                if cand_idx > 0:
+                    replaced.append(
+                        {
+                            "orig_date": prim_date_str,
+                            "used_date": date_str,
+                            "orig_valid_pct": round(first_fail_pct, 1),
+                            "used_valid_pct": round(valid_pct, 1),
+                            "candidate_rank": cand_idx + 1,
+                        }
+                    )
+                accepted = True
+                break
+            except Exception as exc:
+                if cand_idx == 0:
+                    first_fail_reason = str(exc)
+                logger.warning("Timelapse candidate #%d %s (%s) failed: %s", cand_idx + 1, date_str, scene_id, exc)
+            finally:
+                del ds, masked_ds, layer_da, img
+                gc.collect()
+
+        if not accepted:
+            skipped.append(
+                {
+                    "date_str": prim_date_str,
+                    "scene_id": prim_scene_id,
+                    "valid_pct": round(first_fail_pct, 1),
+                    "reason": first_fail_reason,
+                }
+            )
+
+    if progress_callback is not None:
+        progress_callback(total, total, "done")
+
+    gif_bytes = (
+        compile_timelapse_gif([f["png_bytes"] for f in frames], duration_ms=duration_ms)
+        if frames
+        else b""
+    )
+
+    return {
+        "frames": frames,
+        "gif_bytes": gif_bytes,
+        "skipped": skipped,
+        "replaced": replaced,
+        "layer_mode": mode,
+        "sensor": sensor,
+    }
+
+
+def render_multi_date_comparison(
+    item_groups: Sequence[StacItemOrGroup],
+    date_labels: Sequence[str],
+    bbox_4326: Sequence[float],
+    layer_mode: str = "RGB",
+    target_epsg: int | str = "EPSG:3794",
+    resolution: float = 10,
+    sensor: str = SENSOR_S2,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    mask_clouds: bool = True,
+    max_width: int = 720,
+) -> dict[str, Any]:
+    """Render 2 or 3 pixel-aligned dates (RGB, NIR, or Spectral Index / SAR) for multi-date comparison.
+
+    Returns identical-dimension ``swipe_pngs`` (unstamped, for clean curtain swipe),
+    ``strip_pngs`` (date-stamped, for 3-panel side-by-side strip), and when an index/SAR
+    metric is selected, ``da_first``, ``da_last``, and ``diff_da = da_last - da_first``.
     """
     mode = layer_mode.strip().upper()
     is_sar = sensor == SENSOR_S1
@@ -777,133 +1022,80 @@ def generate_timelapse_frames(
         use_cloud_mask = bool(mask_clouds)
         req_bands = get_required_bands_for_sensor(sensor, mode, include_cloud_mask=use_cloud_mask)
 
-    epoch_groups = _normalize_epoch_groups(items)
-    total = len(epoch_groups)
+    swipe_pngs: list[bytes] = []
+    strip_pngs: list[bytes] = []
+    target_size: tuple[int, int] | None = None
+    da_first: xr.DataArray | None = None
+    da_last: xr.DataArray | None = None
 
-    frames: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-    target_pil_size: tuple[int, int] | None = None
-
-    for step, day_items in enumerate(epoch_groups):
-        _, date_str, scene_id, platform_raw, _ = _group_metadata(day_items, sensor=sensor)
-        if progress_callback is not None:
-            progress_callback(step, total, date_str)
-
-        ds: xr.Dataset | None = None
-        masked_ds: xr.Dataset | None = None
-        layer_da: xr.DataArray | None = None
-        img: Image.Image | None = None
-
+    for idx, (grp, d_lbl) in enumerate(zip(item_groups, date_labels)):
+        ds = load_scene(
+            sensor=sensor,
+            item=grp,
+            bbox_4326=bbox_4326,
+            bands=req_bands,
+            target_epsg=target_epsg,
+            resolution=float(resolution),
+            aoi_polygon_4326=aoi_polygon_4326,
+        )
         try:
-            ds = load_scene(
-                sensor=sensor,
-                item=day_items,
-                bbox_4326=bbox_4326,
-                bands=req_bands,
-                target_epsg=target_epsg,
-                resolution=float(resolution),
-                aoi_polygon_4326=aoi_polygon_4326,
-            )
-
-            platform_lbl = _format_platform_stamp(str(ds.attrs.get("platform", platform_raw)), sensor)
-            stamp = f"{date_str} | {platform_lbl} | {mode}"
-            merged_scene_id = str(ds.attrs.get("scene_id", scene_id))
-
-            swath_pct = _compute_raw_swath_coverage_pct(ds, aoi_polygon_4326=aoi_polygon_4326)
-            if min_swath_coverage_pct > 0.0 and swath_pct < float(min_swath_coverage_pct):
-                logger.info(
-                    "Timelapse skipped %s (%s): partial swath coverage %.1f%% < %.0f%%.",
-                    date_str,
-                    merged_scene_id,
-                    swath_pct,
-                    min_swath_coverage_pct,
-                )
-                skipped.append(
-                    {
-                        "date_str": date_str,
-                        "scene_id": merged_scene_id,
-                        "valid_pct": swath_pct,
-                        "reason": f"partial_swath ({swath_pct:.1f}% < {min_swath_coverage_pct:.0f}%)",
-                    }
-                )
-                continue
-
             if is_rgb_composite:
-                # Check valid pixel coverage across the 3 composite bands
-                valid = np.ones(ds[req_bands[0]].shape, dtype=bool)
-                for b in req_bands:
-                    valid &= np.isfinite(ds[b].values)
-                valid_pct = float(100.0 * np.count_nonzero(valid) / max(valid.size, 1))
-                if valid_pct < float(min_valid_pct):
-                    skipped.append(
-                        {"date_str": date_str, "scene_id": merged_scene_id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
-                    )
-                    continue
-
                 y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64)
                 rgb_u8 = _stretch_rgb_for_pil(ds, req_bands, y_coords)
-                img = Image.fromarray(rgb_u8, mode="RGB")
-                img = _resize_pil_frame(img, max_width=max_width, target_size=target_pil_size)
-                if target_pil_size is None:
-                    target_pil_size = img.size
-                img = _stamp_banner_on_pil(img, stamp)
+                im = Image.fromarray(rgb_u8, mode="RGB")
+                im = _resize_pil_frame(im, max_width=max_width, target_size=target_size)
+                if target_size is None:
+                    target_size = im.size
+                swipe_pngs.append(pil_to_png_bytes(im))
+                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{d_lbl} | {mode}")))
             else:
-                masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask)
+                masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
                 layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=mode)
-                stats = compute_index_stats(layer_da, resolution_m=float(resolution))
-                valid_pct = float(stats["valid_pct"])
-                if valid_pct < float(min_valid_pct):
-                    skipped.append(
-                        {"date_str": date_str, "scene_id": merged_scene_id, "valid_pct": round(valid_pct, 1), "reason": "low_valid_pixels"}
-                    )
-                    continue
-
+                if idx == 0:
+                    da_first = layer_da
+                if idx == len(item_groups) - 1:
+                    da_last = layer_da
                 spec = SAR_METRICS[mode] if is_sar else SPECTRAL_INDICES[mode]
-                img = render_dataarray_to_pil(
+                im = render_dataarray_to_pil(
                     layer_da,
                     cmap_name=str(spec["cmap"]),
                     vmin=float(spec["vmin"]),
                     vmax=float(spec["vmax"]),
-                    stamp_text=stamp,
+                    stamp_text=None,
                     max_width=max_width,
-                    target_size=target_pil_size,
+                    target_size=target_size,
                 )
-                if target_pil_size is None:
-                    target_pil_size = img.size
-
-            frames.append(
-                {
-                    "date_str": date_str,
-                    "platform": platform_lbl,
-                    "scene_id": merged_scene_id,
-                    "valid_pct": round(valid_pct, 1),
-                    "png_bytes": pil_to_png_bytes(img),
-                }
-            )
-        except Exception as exc:
-            logger.warning("Timelapse skipped %s (%s): %s", date_str, scene_id, exc)
-            skipped.append(
-                {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)}
-            )
+                if target_size is None:
+                    target_size = im.size
+                swipe_pngs.append(pil_to_png_bytes(im))
+                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{d_lbl} | {mode}")))
         finally:
-            del ds, masked_ds, layer_da, img
+            del ds
             gc.collect()
 
-    if progress_callback is not None:
-        progress_callback(total, total, "done")
-
-    gif_bytes = (
-        compile_timelapse_gif([f["png_bytes"] for f in frames], duration_ms=duration_ms)
-        if frames
-        else b""
-    )
+    diff_da: xr.DataArray | None = None
+    if da_first is not None and da_last is not None:
+        if not _grids_match(da_first, da_last):
+            da_last = da_last.rio.reproject_match(da_first, resampling=Resampling.bilinear)
+        diff_vals = (da_last.values - da_first.values).astype(np.float32)
+        diff_da = xr.DataArray(
+            diff_vals,
+            dims=da_first.dims,
+            coords=da_first.coords,
+            name=f"Delta_{mode}",
+        )
+        if da_first.rio.crs is not None:
+            diff_da = diff_da.rio.write_crs(da_first.rio.crs, inplace=False)
+        diff_da = diff_da.rio.write_nodata(np.nan, inplace=False)
 
     return {
-        "frames": frames,
-        "gif_bytes": gif_bytes,
-        "skipped": skipped,
+        "dates": list(date_labels),
         "layer_mode": mode,
-        "sensor": sensor,
+        "swipe_pngs": swipe_pngs,
+        "strip_pngs": strip_pngs,
+        "da_first": da_first,
+        "da_last": da_last,
+        "diff_da": diff_da,
     }
 
 

@@ -106,6 +106,7 @@ from casovne_vrste import (
     extract_time_series,
     generate_timelapse_frames,
     render_change_swipe_pair,
+    render_multi_date_comparison,
 )
 from geodezija_crs import (
     CRS_D96TM,
@@ -713,7 +714,9 @@ def _init_session_state() -> None:
         "search_max_cloud": 20,
         "sidebar_max_cloud": 20,
         "tab3_max_cloud": 20,
-        "exclude_l7_slc_off": False,
+        "exclude_l7_slc_off": True,
+        "sidebar_l7_slc_exclude": True,
+        "tab3_l7_slc_exclude": True,
         "exclude_partial_swaths": True,
         "sidebar_exclude_partial": True,
         "tab3_exclude_partial": True,
@@ -785,6 +788,7 @@ def _init_session_state() -> None:
         "tab3_change_tif_filename": None,
         "tab3_swipe_png_t1": None,
         "tab3_swipe_png_t2": None,
+        "tab3_comp_result": None,
         "tab3_timelapse_data": None,
         # Tab 4 Cartography / Print Layout state
         "tab4_carto_result": None,
@@ -851,6 +855,7 @@ def _clear_loaded_products() -> None:
         "tab3_change_tif_filename",
         "tab3_swipe_png_t1",
         "tab3_swipe_png_t2",
+        "tab3_comp_result",
         "tab3_timelapse_data",
         "tab4_carto_result",
         "tab4_carto_meta",
@@ -1486,6 +1491,13 @@ def _sync_partial_filter_state(source_key: str) -> None:
     st.session_state["tab3_exclude_partial"] = val
 
 
+def _sync_l7_slc_state(source_key: str) -> None:
+    val = bool(st.session_state.get(source_key, True))
+    st.session_state["exclude_l7_slc_off"] = val
+    st.session_state["sidebar_l7_slc_exclude"] = val
+    st.session_state["tab3_l7_slc_exclude"] = val
+
+
 def _sync_interval_state(source_key: str | None = None, explicit_interval: str | None = None) -> None:
     """Sinhronizira časovni korak med stransko vrstico in Zavihkom 3 ter takoj prefiltrira obstoječe rezultate."""
     prev_int = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
@@ -1683,6 +1695,219 @@ def _touch_selector(
     if shadow_key is not None:
         st.session_state[shadow_key] = resolved
     return resolved
+
+
+def _scene_touch_picker(
+    label: str,
+    *,
+    num_scenes: int,
+    default_idx: int,
+    scene_labels: Sequence[str],
+    pill_labels: Sequence[str],
+    key: str,
+    lang: str,
+    page_size: int = 12,
+) -> int:
+    """100 % dotiku prijazen izbirnik posnetka (◀ Prejšnji / Naslednji ▶ + st.pills), brez virtualne tipkovnice."""
+    if num_scenes <= 0:
+        return 0
+
+    clamped_default = max(0, min(int(default_idx), num_scenes - 1))
+    cur_raw = st.session_state.get(key, clamped_default)
+    try:
+        cur_idx = int(cur_raw)
+    except (TypeError, ValueError):
+        cur_idx = clamped_default
+    if cur_idx < 0 or cur_idx >= num_scenes:
+        cur_idx = clamped_default
+    st.session_state[key] = cur_idx
+
+    page_key = f"__scene_page_{key}"
+    last_idx_key = f"__scene_last_idx_{key}"
+    pill_widget_key = f"__scene_pill_{key}"
+    num_pages = max(1, (num_scenes + page_size - 1) // page_size)
+    idx_page = cur_idx // page_size
+
+    if st.session_state.get(last_idx_key) != cur_idx or page_key not in st.session_state:
+        st.session_state[page_key] = idx_page
+        st.session_state[last_idx_key] = cur_idx
+        st.session_state[pill_widget_key] = cur_idx
+    else:
+        cur_pg = int(st.session_state.get(page_key, idx_page))
+        if cur_pg < 0 or cur_pg >= num_pages:
+            st.session_state[page_key] = idx_page
+
+    def _step_scene(delta: int) -> None:
+        nxt = max(0, min(num_scenes - 1, int(st.session_state.get(key, 0)) + delta))
+        st.session_state[key] = nxt
+        st.session_state[page_key] = nxt // page_size
+        st.session_state[last_idx_key] = nxt
+        st.session_state[pill_widget_key] = nxt
+
+    st.markdown(f"**{label}**")
+    c_prev, c_badge, c_next = st.columns([0.95, 2.2, 0.95], vertical_alignment="center")
+    with c_prev:
+        st.button(
+            t("btn_prev_scene", lang=lang),
+            width="stretch",
+            disabled=(cur_idx <= 0),
+            key=f"__btn_prev_{key}",
+            on_click=_step_scene,
+            args=(-1,),
+        )
+    with c_badge:
+        st.markdown(
+            f'<div style="background:#F0FDFA;border:1px solid #99F6E4;border-radius:8px;'
+            f'padding:6px 10px;text-align:center;color:#0F172A;font-size:0.86rem;">'
+            f'<span style="color:#0F766E;font-weight:700;">{cur_idx + 1}/{num_scenes}</span> · '
+            f'{scene_labels[cur_idx]}</div>',
+            unsafe_allow_html=True,
+        )
+    with c_next:
+        st.button(
+            t("btn_next_scene", lang=lang),
+            width="stretch",
+            disabled=(cur_idx >= num_scenes - 1),
+            key=f"__btn_next_{key}",
+            on_click=_step_scene,
+            args=(1,),
+        )
+
+    active_page = int(st.session_state.get(page_key, idx_page))
+    if num_pages > 1:
+        page_opts = list(range(num_pages))
+
+        def _fmt_pg(p: int) -> str:
+            s_i = p * page_size + 1
+            e_i = min(num_scenes, (p + 1) * page_size)
+            return f"{s_i}–{e_i}"
+
+        active_page = int(
+            _touch_selector(
+                t("scene_page_label", lang=lang),
+                options=page_opts,
+                default=active_page,
+                format_func=_fmt_pg,
+                key=f"__pg_sel_{key}",
+                label_visibility="collapsed",
+                use_pills=True,
+            )
+        )
+        st.session_state[page_key] = active_page
+
+    start_i = active_page * page_size
+    end_i = min(num_scenes, start_i + page_size)
+    page_indices = list(range(start_i, end_i))
+
+    if hasattr(st, "pills"):
+        def _on_pill_pick() -> None:
+            picked = st.session_state.get(pill_widget_key)
+            if picked in page_indices:
+                st.session_state[key] = int(picked)
+                st.session_state[last_idx_key] = int(picked)
+
+        if st.session_state.get(pill_widget_key) not in page_indices:
+            st.session_state[pill_widget_key] = cur_idx if cur_idx in page_indices else None
+
+        st.pills(
+            label,
+            options=page_indices,
+            selection_mode="single",
+            format_func=lambda idx: pill_labels[idx],
+            key=pill_widget_key,
+            label_visibility="collapsed",
+            on_change=_on_pill_pick,
+        )
+    else:
+        picked = st.radio(
+            label,
+            options=page_indices,
+            index=page_indices.index(cur_idx) if cur_idx in page_indices else 0,
+            format_func=lambda idx: pill_labels[idx],
+            horizontal=True,
+            key=f"__radio_{key}",
+            label_visibility="collapsed",
+        )
+        if picked in page_indices:
+            st.session_state[key] = int(picked)
+            st.session_state[last_idx_key] = int(picked)
+
+    return int(st.session_state[key])
+
+
+def _multi_date_touch_picker(
+    label: str,
+    *,
+    num_scenes: int,
+    pill_labels: Sequence[str],
+    key: str,
+    lang: str,
+    page_size: int = 24,
+) -> list[int]:
+    """100 % dotiku prijazen več-izbirni izbirnik 2 ali 3 datumov (st.pills multi), brez virtualne tipkovnice."""
+    if num_scenes <= 0:
+        return []
+
+    default_sel = [num_scenes - 1, 0] if num_scenes >= 2 else [0]
+    raw_sel = st.session_state.get(key)
+    if not isinstance(raw_sel, list):
+        cur_sel = list(default_sel)
+    else:
+        cur_sel = [int(i) for i in raw_sel if isinstance(i, (int, np.integer)) and 0 <= int(i) < num_scenes]
+        if not cur_sel and num_scenes >= 2:
+            cur_sel = list(default_sel)
+    st.session_state[key] = cur_sel
+
+    num_pages = max(1, (num_scenes + page_size - 1) // page_size)
+    active_page = 0
+    if num_pages > 1:
+        page_opts = list(range(num_pages))
+        active_page = int(
+            _touch_selector(
+                t("scene_page_label", lang=lang),
+                options=page_opts,
+                default=0,
+                format_func=lambda p: f"{p * page_size + 1}–{min(num_scenes, (p + 1) * page_size)}",
+                key=f"__multi_pg_{key}",
+                label_visibility="collapsed",
+                use_pills=True,
+            )
+        )
+
+    start_i = active_page * page_size
+    end_i = min(num_scenes, start_i + page_size)
+    page_indices = list(range(start_i, end_i))
+    page_set = set(page_indices)
+    in_page_sel = [i for i in cur_sel if i in page_set]
+    off_page_sel = [i for i in cur_sel if i not in page_set]
+
+    widget_key = f"__multi_pills_{key}_p{active_page}"
+    if hasattr(st, "pills"):
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = in_page_sel
+        picked_page = st.pills(
+            label,
+            options=page_indices,
+            selection_mode="multi",
+            format_func=lambda idx: pill_labels[idx],
+            key=widget_key,
+        )
+        picked_page_list = [int(i) for i in (picked_page or []) if i in page_set]
+    else:
+        picked_page_list = [
+            int(i)
+            for i in st.multiselect(
+                label,
+                options=page_indices,
+                default=in_page_sel,
+                format_func=lambda idx: pill_labels[idx],
+                key=widget_key,
+            )
+        ]
+
+    merged = list(dict.fromkeys([*off_page_sel, *picked_page_list]))
+    st.session_state[key] = merged
+    return merged
 
 
 def _render_html_iframe(html_str: str, height: int = 1) -> None:
@@ -3404,12 +3629,20 @@ def main() -> None:
     if st.session_state.pop("pending_reset_scene_widgets", False):
         reset_prefixes = (
             "tab1_scene_select_",
+            "tab1_scene_table_",
             "tab2_scene_select_",
             "tab2_comp_n_",
             "tab3_max_epochs_",
             "tab3_t1_select_",
             "tab3_t2_select_",
+            "tab3_comp_dates_",
             "tab3_tl_frames_",
+            "__scene_page_",
+            "__scene_last_idx_",
+            "__scene_pill_",
+            "__pg_sel_",
+            "__multi_pg_",
+            "__multi_pills_",
         )
         for k in list(st.session_state.keys()):
             if k == "tab2_sar_scene_select" or k.startswith(reset_prefixes):
@@ -3447,15 +3680,16 @@ def main() -> None:
         sensor = str(st.session_state["selected_sensor"])
         sensor_cfg = SENSOR_META[sensor]
 
-        exclude_l7_slc_off = False
+        exclude_l7_slc_off = bool(st.session_state.get("exclude_l7_slc_off", True))
         if sensor == SENSOR_LANDSAT:
             exclude_l7_slc_off = st.checkbox(
                 t("l7_exclude_label"),
-                value=bool(st.session_state.get("exclude_l7_slc_off", False)),
                 help=t("l7_exclude_help"),
                 key="sidebar_l7_slc_exclude",
+                on_change=_sync_l7_slc_state,
+                args=("sidebar_l7_slc_exclude",),
             )
-            st.session_state["exclude_l7_slc_off"] = exclude_l7_slc_off
+            st.session_state["exclude_l7_slc_off"] = bool(exclude_l7_slc_off)
         elif sensor == SENSOR_S1:
             st.caption(f"📡 {t('sar_allweather_note')}")
 
@@ -3580,10 +3814,13 @@ def main() -> None:
 
         # --- Način 4: Prednastavljene lokacije v Sloveniji ---
         elif aoi_mode_key == "preset":
-            preset_name = st.selectbox(
+            preset_opts = list(SLOVENIA_PRESETS.keys())
+            preset_name = _touch_selector(
                 t("preset_select_label"),
-                options=list(SLOVENIA_PRESETS.keys()),
-                index=0,
+                options=preset_opts,
+                default=preset_opts[0],
+                key="sidebar_preset_select",
+                use_pills=True,
             )
             preset = SLOVENIA_PRESETS[preset_name]
             st.caption(t(preset["desc_key"]))
@@ -3871,25 +4108,30 @@ def main() -> None:
         st.session_state["search_polygon_4326"] if search_performed else aoi_polygon_4326
     )
 
-    # Pripravi oznake posnetkov za vse 3 zavihke
+    # Pripravi oznake posnetkov za vse 3 zavihke (polne + kompaktne za žetone)
     scene_labels: list[str] = []
+    scene_pill_labels: list[str] = []
     default_scene_idx: int = 0
     if not summary_df.empty:
         for _, row in summary_df.iterrows():
             tile_lbl = _format_tile_label(str(row["mgrs_tile"]), sensor=active_sensor)
+            d_str = str(row["date_str"])
             if active_sensor == SENSOR_S1 or pd.isna(row["cloud_cover"]):
                 scene_labels.append(
-                    t("scene_option_sar_fmt", date=row["date_str"], tile=tile_lbl)
+                    t("scene_option_sar_fmt", date=d_str, tile=tile_lbl)
                 )
+                scene_pill_labels.append(f"{d_str} · SAR")
             else:
+                cld_v = float(row["cloud_cover"])
                 scene_labels.append(
                     t(
                         "scene_option_fmt",
-                        date=row["date_str"],
-                        cloud=float(row["cloud_cover"]),
+                        date=d_str,
+                        cloud=cld_v,
                         tile=tile_lbl,
                     )
                 )
+                scene_pill_labels.append(f"{d_str} · {cld_v:.0f}%")
         if active_sensor != SENSOR_S1 and summary_df["cloud_cover"].notna().any():
             cand_idx = int(summary_df["cloud_cover"].reset_index(drop=True).idxmin())
             if 0 <= cand_idx < len(items):
@@ -3960,12 +4202,29 @@ def main() -> None:
                         t("col_id"): summary_df["id"],
                     }
                 )
-                st.dataframe(
+                st.caption(t("scene_table_tap_hint"))
+                tbl_event = st.dataframe(
                     display_df,
                     width="stretch",
                     hide_index=True,
                     height=min(310, 42 + 35 * len(display_df)),
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key=f"tab1_scene_table_{active_sensor}",
                 )
+                sel_tbl_rows = (
+                    list(tbl_event.selection.rows)
+                    if (tbl_event is not None and hasattr(tbl_event, "selection") and tbl_event.selection)
+                    else []
+                )
+                tbl_sync_key = f"__tab1_tbl_last_row_{active_sensor}"
+                if sel_tbl_rows:
+                    row_idx = int(sel_tbl_rows[0])
+                    if 0 <= row_idx < len(items) and st.session_state.get(tbl_sync_key) != row_idx:
+                        st.session_state[f"tab1_scene_select_{active_sensor}"] = row_idx
+                        st.session_state[tbl_sync_key] = row_idx
+                elif tbl_sync_key in st.session_state:
+                    st.session_state[tbl_sync_key] = None
 
                 st.subheader(t("t1_vis_header"))
 
@@ -3973,14 +4232,16 @@ def main() -> None:
                 vis_specs = SAR_VIS_SPECS if is_sar_active else OPTICAL_COMPOSITE_SPECS
 
                 with st.container(border=True):
-                    col_sel, col_vis = st.columns([1.15, 1.0])
+                    col_sel, col_vis = st.columns([1.35, 0.9])
                     with col_sel:
-                        selected_idx = st.selectbox(
+                        selected_idx = _scene_touch_picker(
                             t("scene_select_label"),
-                            options=list(range(len(items))),
-                            index=default_scene_idx,
-                            format_func=lambda idx: scene_labels[idx],
+                            num_scenes=len(items),
+                            default_idx=default_scene_idx,
+                            scene_labels=scene_labels,
+                            pill_labels=scene_pill_labels,
                             key=f"tab1_scene_select_{active_sensor}",
+                            lang=lang,
                         )
                     with col_vis:
                         vis_code = _touch_selector(
@@ -4302,14 +4563,16 @@ def main() -> None:
             st.subheader(t("t2_sar_header"))
             st.caption(t("t2_sar_caption"))
 
-            col_s1_sc, col_s1_thr = st.columns([1.2, 1.0])
+            col_s1_sc, col_s1_thr = st.columns([1.35, 0.9])
             with col_s1_sc:
-                t2_sar_idx = st.selectbox(
+                t2_sar_idx = _scene_touch_picker(
                     t("scene_select_label"),
-                    options=list(range(len(items))),
-                    index=default_scene_idx,
-                    format_func=lambda idx: scene_labels[idx],
+                    num_scenes=len(items),
+                    default_idx=default_scene_idx,
+                    scene_labels=scene_labels,
+                    pill_labels=scene_pill_labels,
                     key="tab2_sar_scene_select",
+                    lang=lang,
                 )
             with col_s1_thr:
                 sar_thr_db = st.slider(
@@ -4553,14 +4816,16 @@ def main() -> None:
             # ---------------------------------------------------------------
             with t2_sub_idx:
                 with st.container(border=True):
-                    col_s2, col_i2 = st.columns([1.15, 1.0])
+                    col_s2, col_i2 = st.columns([1.35, 0.9])
                     with col_s2:
-                        t2_scene_idx = st.selectbox(
+                        t2_scene_idx = _scene_touch_picker(
                             t("scene_select_label"),
-                            options=list(range(len(items))),
-                            index=default_scene_idx,
-                            format_func=lambda idx: scene_labels[idx],
+                            num_scenes=len(items),
+                            default_idx=default_scene_idx,
+                            scene_labels=scene_labels,
+                            pill_labels=scene_pill_labels,
                             key=f"tab2_scene_select_{active_sensor}",
+                            lang=lang,
                         )
                     with col_i2:
                         t2_index_key = _touch_selector(
@@ -5601,6 +5866,14 @@ def main() -> None:
                     on_change=_sync_partial_filter_state,
                     args=("tab3_exclude_partial",),
                 )
+                if t3_sensor_cur == SENSOR_LANDSAT:
+                    st.checkbox(
+                        t("l7_exclude_label"),
+                        help=t("l7_exclude_help"),
+                        key="tab3_l7_slc_exclude",
+                        on_change=_sync_l7_slc_state,
+                        args=("tab3_l7_slc_exclude",),
+                    )
             t3_interval_cur = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
 
             t3_dates_ok = t3_start <= t3_end
@@ -5649,7 +5922,7 @@ def main() -> None:
                         start_date=t3_start,
                         end_date=t3_end,
                         max_cloud_cover=float(t3_max_cloud),
-                        exclude_l7_slc_off=bool(st.session_state.get("exclude_l7_slc_off", False)),
+                        exclude_l7_slc_off=bool(st.session_state.get("exclude_l7_slc_off", True)),
                         exclude_partial_swaths=bool(t3_exclude_partial),
                         interval_mode=t3_interval_cur,
                         limit=None,
@@ -5719,6 +5992,7 @@ def main() -> None:
                     with col_ts_scl:
                         if is_sar_t3:
                             ts_mask_clouds = False
+                            ts_clear_thr = 10
                             st.caption(t("sar_allweather_note"))
                         else:
                             ts_mask_clouds = st.checkbox(
@@ -5726,6 +6000,15 @@ def main() -> None:
                                 value=True,
                                 help=t("scl_toggle_help"),
                                 key="tab3_ts_scl",
+                            )
+                            ts_clear_thr = st.slider(
+                                t("aoi_clear_thr_label"),
+                                min_value=20,
+                                max_value=95,
+                                value=75,
+                                step=5,
+                                help=t("aoi_clear_thr_help"),
+                                key=f"tab3_ts_clear_thr_{active_sensor}",
                             )
 
                     ts_clicked = st.button(
@@ -5754,11 +6037,12 @@ def main() -> None:
                             target_epsg=target_crs,
                             resolution=float(selected_resolution),
                             mask_clouds=ts_mask_clouds,
-                            min_valid_pct=10.0,
+                            min_valid_pct=float(ts_clear_thr),
                             progress_callback=_on_progress,
                             sensor=active_sensor,
                             aoi_polygon_4326=active_polygon,
                             min_swath_coverage_pct=min_swath_guard,
+                            candidates_by_date=summary_df.attrs.get("candidates_by_bucket"),
                         )
                         prog_bar.empty()
                         status_slot.empty()
@@ -5770,6 +6054,8 @@ def main() -> None:
                             "index_key": ts_metric_key,
                             "crs": target_crs,
                             "resolution_m": int(selected_resolution),
+                            "min_valid_pct": int(ts_clear_thr),
+                            "replaced": ts_df.attrs.get("replaced_epochs", []),
                             "skipped": ts_df.attrs.get("skipped_epochs", []),
                         }
                         gc.collect()
@@ -5782,9 +6068,15 @@ def main() -> None:
                 ts_meta: dict[str, Any] | None = st.session_state["tab3_ts_meta"]
 
                 if ts_df_show is not None and ts_meta is not None and ts_meta.get("sensor") == active_sensor:
+                    replaced_ts = ts_meta.get("replaced", [])
                     skipped = ts_meta.get("skipped", [])
+                    thr_used = int(ts_meta.get("min_valid_pct", 75))
+                    if replaced_ts:
+                        st.success(t("ts_replaced_info", n=len(replaced_ts)))
+                        with st.expander(t("ts_replaced_expander"), expanded=False):
+                            st.dataframe(pd.DataFrame(replaced_ts), width="stretch", hide_index=True)
                     if skipped:
-                        st.info(t("ts_skipped_info", n=len(skipped)))
+                        st.info(t("ts_skipped_info_thr", n=len(skipped), thr=thr_used))
                         with st.expander(t("ts_skipped_expander"), expanded=False):
                             st.dataframe(pd.DataFrame(skipped), width="stretch", hide_index=True)
 
@@ -5814,27 +6106,38 @@ def main() -> None:
                         )
 
             # ---------------------------------------------------------------
-            # PODZAVIHEK 3.2: ZAZNAVA SPREMEMB (Δ = t2 - t1 & PREJ / POTEM)
+            # PODZAVIHEK 3.2: PRIMERJAVA 2 ALI 3 DATUMOV (ZAVESA & Δ SPREMEMBE)
             # ---------------------------------------------------------------
             with sub_change:
-                st.caption(t("t3_sec_b_caption"))
+                st.markdown(f"#### {t('comp3_header')}")
+                st.caption(t("comp3_caption"))
 
                 if len(items) < 2:
                     st.info(t("t3_need_two_scenes"))
                 else:
+                    comp_layer_options = (
+                        list(SAR_METRIC_KEYS) if is_sar_t3 else ["RGB", "NIR", *INDEX_KEYS]
+                    )
+
+                    def _fmt_comp_layer_pill(code: str, _lang: str = lang) -> str:
+                        if code == "VV_VH":
+                            return t("sar_VV_VH_pill", lang=_lang)
+                        return code
+
                     with st.container(border=True):
                         col_c_idx, col_c_thr, col_c_scl = st.columns(
-                            [1.35, 0.95, 0.8], vertical_alignment="bottom"
+                            [1.5, 0.9, 0.8], vertical_alignment="bottom"
                         )
                         with col_c_idx:
-                            ch_metric_key = _touch_selector(
-                                metric_label_title,
-                                options=metric_options,
-                                default=metric_options[0],
-                                format_func=_fmt_metric_pill,
+                            comp_layer_key = _touch_selector(
+                                t("comp3_layer_label"),
+                                options=comp_layer_options,
+                                default=comp_layer_options[0],
+                                format_func=_fmt_comp_layer_pill,
                                 key=f"tab3_ch_metric_{active_sensor}",
                                 use_pills=True,
                             )
+                        is_comp_rgb = (not is_sar_t3) and comp_layer_key in ("RGB", "NIR")
                         with col_c_thr:
                             if is_sar_t3:
                                 ch_threshold = st.slider(
@@ -5852,6 +6155,7 @@ def main() -> None:
                                     max_value=0.40,
                                     value=0.10,
                                     step=0.01,
+                                    disabled=is_comp_rgb,
                                     key="tab3_ch_threshold_opt",
                                 )
                         with col_c_scl:
@@ -5863,207 +6167,240 @@ def main() -> None:
                                     t("scl_toggle_label"),
                                     value=True,
                                     help=t("scl_toggle_help"),
+                                    disabled=is_comp_rgb,
                                     key="tab3_ch_scl",
                                 )
 
-                        col_t1, col_t2 = st.columns(2)
-                        with col_t1:
-                            t1_idx = st.selectbox(
-                                t("t3_select_t1"),
-                                options=list(range(len(items))),
-                                index=len(items) - 1,
-                                format_func=lambda idx: scene_labels[idx],
-                                key=f"tab3_t1_select_{active_sensor}",
-                            )
-                        with col_t2:
-                            t2_idx = st.selectbox(
-                                t("t3_select_t2"),
-                                options=list(range(len(items))),
-                                index=0,
-                                format_func=lambda idx: scene_labels[idx],
-                                key=f"tab3_t2_select_{active_sensor}",
-                            )
-
-                        if t1_idx == t2_idx:
-                            st.warning(t("t3_same_scene_warn"))
+                        picked_raw = _multi_date_touch_picker(
+                            t("comp3_dates_label"),
+                            num_scenes=len(items),
+                            pill_labels=scene_pill_labels,
+                            key=f"tab3_comp_dates_{active_sensor}",
+                            lang=lang,
+                        )
+                        # Kronološka razvrstitev izbranih datumov (najstarejši -> najnovejši)
+                        picked_sorted = sorted(
+                            set(picked_raw),
+                            key=lambda i: str(summary_df.iloc[i]["date_str"]),
+                        )
+                        valid_pick_count = len(picked_sorted) in (2, 3)
+                        if not valid_pick_count:
+                            st.warning(t("comp3_need_2_3_warn", n=len(picked_sorted)))
 
                         ch_clicked = st.button(
-                            t("btn_compute_change"),
+                            t("comp3_btn_run", n=len(picked_sorted)),
                             type="primary",
                             width="stretch",
-                            disabled=(t1_idx == t2_idx),
+                            disabled=(not valid_pick_count),
                             key="tab3_ch_btn",
                         )
 
-                    if ch_clicked and active_bbox is not None and t1_idx != t2_idx:
-                        row_t1 = summary_df.iloc[t1_idx]
-                        row_t2 = summary_df.iloc[t2_idx]
+                    if ch_clicked and active_bbox is not None and valid_pick_count:
+                        chosen_groups = [items[i] for i in picked_sorted]
+                        chosen_dates = [str(summary_df.iloc[i]["date_str"]) for i in picked_sorted]
                         with st.spinner(
-                            t("spinner_change", idx=ch_metric_key, d1=row_t1["date_str"], d2=row_t2["date_str"])
+                            t("comp3_spinner", n=len(chosen_dates), layer=comp_layer_key)
                         ):
                             try:
+                                st.session_state["tab3_comp_result"] = None
                                 st.session_state["tab3_change_t1"] = None
                                 st.session_state["tab3_change_t2"] = None
                                 st.session_state["tab3_change_diff"] = None
                                 st.session_state["tab3_change_tif_bytes"] = None
                                 gc.collect()
 
-                                da_t1, da_t2, da_diff = compute_change_detection(
-                                    item_t1=items[t1_idx],
-                                    item_t2=items[t2_idx],
+                                comp_res = render_multi_date_comparison(
+                                    item_groups=chosen_groups,
+                                    date_labels=chosen_dates,
                                     bbox_4326=active_bbox,
-                                    index_name=ch_metric_key,
+                                    layer_mode=comp_layer_key,
                                     target_epsg=target_crs,
                                     resolution=float(selected_resolution),
-                                    mask_clouds=ch_mask_clouds,
                                     sensor=active_sensor,
                                     aoi_polygon_4326=active_polygon,
+                                    mask_clouds=ch_mask_clouds,
                                 )
-                                diff_tif = export_to_geotiff_bytes(da_diff, target_epsg=target_crs)
-                                swipe_t1_png, swipe_t2_png = render_change_swipe_pair(
-                                    da_t1=da_t1,
-                                    da_t2=da_t2,
-                                    index_key=ch_metric_key,
-                                    is_sar=is_sar_t3,
-                                )
-                                epsg_num = target_crs.replace("EPSG:", "")
-                                prefix = active_sensor_cfg["file_prefix"]
-                                diff_fname = (
-                                    f"{prefix}_delta_{ch_metric_key}_{row_t1['date_str']}_to_{row_t2['date_str']}_"
-                                    f"EPSG{epsg_num}_{selected_resolution}m.tif"
-                                )
+                                diff_da = comp_res.get("diff_da")
+                                da_first = comp_res.get("da_first")
+                                da_last = comp_res.get("da_last")
+                                diff_tif = None
+                                diff_fname = None
+                                if diff_da is not None and da_first is not None and da_last is not None:
+                                    diff_tif = export_to_geotiff_bytes(diff_da, target_epsg=target_crs)
+                                    epsg_num = target_crs.replace("EPSG:", "")
+                                    prefix = active_sensor_cfg["file_prefix"]
+                                    diff_fname = (
+                                        f"{prefix}_delta_{comp_layer_key}_{chosen_dates[0]}_to_{chosen_dates[-1]}_"
+                                        f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                                    )
+                                    # Sinhronizacija za Zavihek 4 (Kartografija)
+                                    st.session_state["tab3_change_t1"] = da_first
+                                    st.session_state["tab3_change_t2"] = da_last
+                                    st.session_state["tab3_change_diff"] = diff_da
+                                    st.session_state["tab3_change_meta"] = {
+                                        "sensor": active_sensor,
+                                        "index_key": comp_layer_key,
+                                        "date_t1": chosen_dates[0],
+                                        "date_t2": chosen_dates[-1],
+                                        "crs": target_crs,
+                                        "resolution_m": int(selected_resolution),
+                                    }
+                                    st.session_state["tab3_change_tif_bytes"] = diff_tif
+                                    st.session_state["tab3_change_tif_filename"] = diff_fname
 
-                                st.session_state["tab3_change_t1"] = da_t1
-                                st.session_state["tab3_change_t2"] = da_t2
-                                st.session_state["tab3_change_diff"] = da_diff
-                                st.session_state["tab3_change_meta"] = {
-                                    "sensor": active_sensor,
-                                    "index_key": ch_metric_key,
-                                    "date_t1": str(row_t1["date_str"]),
-                                    "date_t2": str(row_t2["date_str"]),
-                                    "crs": target_crs,
-                                    "resolution_m": int(selected_resolution),
-                                }
-                                st.session_state["tab3_change_tif_bytes"] = diff_tif
-                                st.session_state["tab3_change_tif_filename"] = diff_fname
-                                st.session_state["tab3_swipe_png_t1"] = swipe_t1_png
-                                st.session_state["tab3_swipe_png_t2"] = swipe_t2_png
+                                comp_res["sensor"] = active_sensor
+                                comp_res["crs"] = target_crs
+                                comp_res["resolution_m"] = int(selected_resolution)
+                                comp_res["tif_bytes"] = diff_tif
+                                comp_res["tif_filename"] = diff_fname
+                                st.session_state["tab3_comp_result"] = comp_res
+                                st.session_state["tab3_swipe_png_t1"] = comp_res["swipe_pngs"][0]
+                                st.session_state["tab3_swipe_png_t2"] = comp_res["swipe_pngs"][-1]
                                 gc.collect()
                             except Exception as exc:
                                 st.error(t("change_error", err=exc))
 
-                    da_t1_s: xr.DataArray | None = st.session_state["tab3_change_t1"]
-                    da_t2_s: xr.DataArray | None = st.session_state["tab3_change_t2"]
-                    da_diff_s: xr.DataArray | None = st.session_state["tab3_change_diff"]
-                    ch_meta: dict[str, Any] | None = st.session_state["tab3_change_meta"]
-
+                    comp_show: dict[str, Any] | None = st.session_state.get("tab3_comp_result")
                     if (
-                        da_t1_s is not None
-                        and da_t2_s is not None
-                        and da_diff_s is not None
-                        and ch_meta is not None
-                        and ch_meta.get("sensor") == active_sensor
+                        isinstance(comp_show, dict)
+                        and comp_show.get("sensor") == active_sensor
+                        and len(comp_show.get("swipe_pngs") or []) >= 2
                     ):
-                        summary = compute_change_summary(
-                            da_diff_s,
-                            resolution_m=float(ch_meta["resolution_m"]),
-                            threshold=float(ch_threshold),
+                        c_dates: list[str] = list(comp_show["dates"])
+                        c_swipes: list[bytes] = list(comp_show["swipe_pngs"])
+                        c_strips: list[bytes] = list(comp_show["strip_pngs"])
+                        c_layer = str(comp_show["layer_mode"])
+                        c_is_sar = comp_show.get("sensor") == SENSOR_S1
+                        unit_b = " [dB]" if c_is_sar else ""
+                        idx_lbl = f"{c_layer}{unit_b}"
+
+                        # 1. Interaktivna zavesa (2 datuma: t1 ↔ t2; 3 datumi: 2-stopenjska zavesa)
+                        st.markdown(f"#### {t('swipe_header')}")
+                        st.caption(t("swipe_hint"))
+                        if len(c_dates) == 3:
+                            pair_map = {"0_1": (0, 1), "1_2": (1, 2), "0_2": (0, 2)}
+                            pair_choice = _touch_selector(
+                                t("comp3_swipe_pair_label"),
+                                options=["0_1", "1_2", "0_2"],
+                                default="0_1",
+                                format_func=lambda pk: (
+                                    f"t{pair_map[pk][0] + 1} ({c_dates[pair_map[pk][0]]}) ↔ "
+                                    f"t{pair_map[pk][1] + 1} ({c_dates[pair_map[pk][1]]})"
+                                ),
+                                key=f"tab3_comp3_pair_{active_sensor}",
+                                use_pills=True,
+                            )
+                            i_a, i_b = pair_map[pair_choice]
+                        else:
+                            i_a, i_b = 0, 1
+
+                        _render_before_after_swipe_html(
+                            png_t1_bytes=c_swipes[i_a],
+                            png_t2_bytes=c_swipes[i_b],
+                            label_t1=f"t{i_a + 1}: {c_dates[i_a]} ({idx_lbl})",
+                            label_t2=f"t{i_b + 1}: {c_dates[i_b]} ({idx_lbl})",
+                            height=520,
                         )
 
-                        if summary["valid_pixels"] == 0:
-                            st.warning(t("t2_no_valid_pixels"))
-                        else:
-                            mean_str = (
-                                f"{summary['mean']:+.2f} dB"
-                                if is_sar_t3
-                                else f"{summary['mean']:+.3f}"
-                            )
-                            c1, c2, c3, c4, c5 = st.columns(5)
-                            c1.metric(t("change_m_mean"), mean_str)
-                            c2.metric(
-                                t("change_m_pos", thr=ch_threshold),
-                                f"{summary['pos_area_ha']:,.2f} ha",
-                                delta=f"{summary['pos_pct']:.1f} %",
-                            )
-                            c3.metric(
-                                t("change_m_neg", thr=ch_threshold),
-                                f"{summary['neg_area_ha']:,.2f} ha",
-                                delta=f"-{summary['neg_pct']:.1f} %",
-                                delta_color="inverse",
-                            )
-                            c4.metric(
-                                t("change_m_stable", thr=ch_threshold),
-                                f"{summary['stable_area_ha']:,.2f} ha",
-                                delta=f"{summary['stable_pct']:.1f} %",
-                                delta_color="off",
-                            )
-                            c5.metric(
-                                t("change_m_valid"),
-                                f"{summary['valid_area_ha']:,.2f} ha",
-                                delta=f"{summary['valid_pct']:.1f} %",
-                                delta_color="off",
-                            )
+                        # 2. Sinhroniziran vizualni pas (t1 | t2 ali t1 | t2 | t3) z datumi na slikah
+                        st.markdown(f"#### {t('comp3_strip_header', n=len(c_dates))}")
+                        strip_cols = st.columns(len(c_dates))
+                        for s_idx, col_st in enumerate(strip_cols):
+                            with col_st:
+                                st.image(c_strips[s_idx], width="stretch")
+                                st.caption(f"**t{s_idx + 1}:** `{c_dates[s_idx]}` · {idx_lbl}")
 
-                            unit_b = " [dB]" if is_sar_t3 else ""
-                            idx_lbl = f"{ch_meta['index_key']}{unit_b}"
-                            layer_labels = {
-                                "diff": t("change_panel_diff", idx=idx_lbl),
-                                "t1": t("change_panel_t1", idx=idx_lbl, d1=ch_meta["date_t1"]),
-                                "t2": t("change_panel_t2", idx=idx_lbl, d2=ch_meta["date_t2"]),
-                            }
-                            view_layer = st.radio(
-                                t("composite_select_label"),
-                                options=["diff", "t1", "t2"],
-                                index=0,
-                                horizontal=True,
-                                format_func=lambda k: layer_labels[k],
-                                label_visibility="collapsed",
-                                key="tab3_change_layer_radio",
+                        # 3. Kvantitativna analiza sprememb Δ (za spektralne indekse in SAR metrike)
+                        da_t1_s = comp_show.get("da_first")
+                        da_t2_s = comp_show.get("da_last")
+                        da_diff_s = comp_show.get("diff_da")
+                        if da_t1_s is not None and da_t2_s is not None and da_diff_s is not None:
+                            st.markdown(
+                                f"#### {t('comp3_delta_header', d_first=c_dates[0], d_last=c_dates[-1])}"
                             )
-
-                            st.caption(t("viewer_zoom_hint"))
-                            fig_ch = _build_change_plotly(
-                                da_t1=da_t1_s,
-                                da_t2=da_t2_s,
-                                da_diff=da_diff_s,
-                                index_key=ch_meta["index_key"],
-                                target_crs=ch_meta["crs"],
-                                date_t1=ch_meta["date_t1"],
-                                date_t2=ch_meta["date_t2"],
-                                resolution_m=float(ch_meta["resolution_m"]),
-                                is_sar=is_sar_t3,
-                                view_layer=view_layer,
+                            summary = compute_change_summary(
+                                da_diff_s,
+                                resolution_m=float(comp_show["resolution_m"]),
+                                threshold=float(ch_threshold),
                             )
-                            st.plotly_chart(
-                                fig_ch,
-                                width="stretch",
-                                config=PLOTLY_VIEWER_CONFIG,
-                                key="tab3_change_plotly_viewer",
-                            )
-
-                            # Interaktivna zavesa Prej / Potem (t₁ ↔ t₂)
-                            swipe_t1 = st.session_state.get("tab3_swipe_png_t1")
-                            swipe_t2 = st.session_state.get("tab3_swipe_png_t2")
-                            if swipe_t1 and swipe_t2:
-                                st.markdown(f"#### {t('swipe_header')}")
-                                st.caption(t("swipe_hint"))
-                                _render_before_after_swipe_html(
-                                    png_t1_bytes=swipe_t1,
-                                    png_t2_bytes=swipe_t2,
-                                    label_t1=f"t₁: {ch_meta['date_t1']} ({idx_lbl})",
-                                    label_t2=f"t₂: {ch_meta['date_t2']} ({idx_lbl})",
-                                    height=520,
+                            if summary["valid_pixels"] == 0:
+                                st.warning(t("t2_no_valid_pixels"))
+                            else:
+                                mean_str = (
+                                    f"{summary['mean']:+.2f} dB"
+                                    if c_is_sar
+                                    else f"{summary['mean']:+.3f}"
+                                )
+                                c1, c2, c3, c4, c5 = st.columns(5)
+                                c1.metric(t("change_m_mean"), mean_str)
+                                c2.metric(
+                                    t("change_m_pos", thr=ch_threshold),
+                                    f"{summary['pos_area_ha']:,.2f} ha",
+                                    delta=f"{summary['pos_pct']:.1f} %",
+                                )
+                                c3.metric(
+                                    t("change_m_neg", thr=ch_threshold),
+                                    f"{summary['neg_area_ha']:,.2f} ha",
+                                    delta=f"-{summary['neg_pct']:.1f} %",
+                                    delta_color="inverse",
+                                )
+                                c4.metric(
+                                    t("change_m_stable", thr=ch_threshold),
+                                    f"{summary['stable_area_ha']:,.2f} ha",
+                                    delta=f"{summary['stable_pct']:.1f} %",
+                                    delta_color="off",
+                                )
+                                c5.metric(
+                                    t("change_m_valid"),
+                                    f"{summary['valid_area_ha']:,.2f} ha",
+                                    delta=f"{summary['valid_pct']:.1f} %",
+                                    delta_color="off",
                                 )
 
-                            diff_bytes = st.session_state["tab3_change_tif_bytes"]
-                            if diff_bytes:
-                                st.download_button(
-                                    label=t("btn_download_change_tif"),
-                                    data=diff_bytes,
-                                    file_name=st.session_state["tab3_change_tif_filename"] or "change_map.tif",
-                                    mime="image/tiff",
+                                layer_labels = {
+                                    "diff": t("change_panel_diff", idx=idx_lbl),
+                                    "t1": t("change_panel_t1", idx=idx_lbl, d1=c_dates[0]),
+                                    "t2": t("change_panel_t2", idx=idx_lbl, d2=c_dates[-1]),
+                                }
+                                view_layer = st.radio(
+                                    t("composite_select_label"),
+                                    options=["diff", "t1", "t2"],
+                                    index=0,
+                                    horizontal=True,
+                                    format_func=lambda k: layer_labels[k],
+                                    label_visibility="collapsed",
+                                    key="tab3_change_layer_radio",
+                                )
+
+                                st.caption(t("viewer_zoom_hint"))
+                                fig_ch = _build_change_plotly(
+                                    da_t1=da_t1_s,
+                                    da_t2=da_t2_s,
+                                    da_diff=da_diff_s,
+                                    index_key=c_layer,
+                                    target_crs=str(comp_show["crs"]),
+                                    date_t1=c_dates[0],
+                                    date_t2=c_dates[-1],
+                                    resolution_m=float(comp_show["resolution_m"]),
+                                    is_sar=c_is_sar,
+                                    view_layer=view_layer,
+                                )
+                                st.plotly_chart(
+                                    fig_ch,
                                     width="stretch",
+                                    config=PLOTLY_VIEWER_CONFIG,
+                                    key="tab3_change_plotly_viewer",
                                 )
+
+                                diff_bytes = comp_show.get("tif_bytes")
+                                if diff_bytes:
+                                    st.download_button(
+                                        label=t("btn_download_change_tif"),
+                                        data=diff_bytes,
+                                        file_name=comp_show.get("tif_filename") or "change_map.tif",
+                                        mime="image/tiff",
+                                        width="stretch",
+                                    )
 
             # ---------------------------------------------------------------
             # PODZAVIHEK 3.3: VIZUALNI TIMELAPSE (GIF + DRSNIK DATUMOV)
@@ -6127,6 +6464,19 @@ def main() -> None:
                                 key="tab3_tl_speed",
                             )
 
+                        if is_sar_t3:
+                            tl_clear_thr = 10
+                        else:
+                            tl_clear_thr = st.slider(
+                                t("aoi_clear_thr_label"),
+                                min_value=20,
+                                max_value=95,
+                                value=75,
+                                step=5,
+                                help=t("aoi_clear_thr_help"),
+                                key=f"tab3_tl_clear_thr_{active_sensor}",
+                            )
+
                         tl_clicked = st.button(
                             t("btn_generate_tl"),
                             type="primary",
@@ -6158,11 +6508,12 @@ def main() -> None:
                                 sensor=active_sensor,
                                 aoi_polygon_4326=active_polygon,
                                 mask_clouds=(not is_sar_t3),
-                                min_valid_pct=10.0,
+                                min_valid_pct=float(tl_clear_thr),
                                 duration_ms=int(round(tl_speed_sec * 1000)),
                                 max_width=700,
                                 progress_callback=_on_tl_progress,
                                 min_swath_coverage_pct=min_swath_guard,
+                                candidates_by_date=summary_df.attrs.get("candidates_by_bucket"),
                             )
                             tl_prog.empty()
                             tl_status.empty()
@@ -6170,6 +6521,7 @@ def main() -> None:
                             tl_result["duration_ms"] = int(round(tl_speed_sec * 1000))
                             tl_result["prefix"] = active_sensor_cfg["file_prefix"]
                             tl_result["resolution_m"] = int(selected_resolution)
+                            tl_result["min_valid_pct"] = int(tl_clear_thr)
                             st.session_state["tab3_timelapse_data"] = tl_result
                             gc.collect()
                         except Exception as exc:
@@ -6180,10 +6532,18 @@ def main() -> None:
                     tl_data: dict[str, Any] | None = st.session_state["tab3_timelapse_data"]
                     if tl_data is not None and tl_data.get("sensor") == active_sensor:
                         tl_frames: list[dict[str, Any]] = tl_data.get("frames", [])
+                        tl_replaced = tl_data.get("replaced", [])
                         tl_skipped = tl_data.get("skipped", [])
+                        tl_thr_used = int(tl_data.get("min_valid_pct", 75))
 
+                        if tl_replaced:
+                            st.success(t("ts_replaced_info", n=len(tl_replaced)))
+                            with st.expander(t("ts_replaced_expander"), expanded=False):
+                                st.dataframe(pd.DataFrame(tl_replaced), width="stretch", hide_index=True)
                         if tl_skipped:
-                            st.info(t("ts_skipped_info", n=len(tl_skipped)))
+                            st.info(t("ts_skipped_info_thr", n=len(tl_skipped), thr=tl_thr_used))
+                            with st.expander(t("ts_skipped_expander"), expanded=False):
+                                st.dataframe(pd.DataFrame(tl_skipped), width="stretch", hide_index=True)
 
                         if not tl_frames:
                             st.warning(t("tl_empty_warn"))
@@ -6335,12 +6695,13 @@ def main() -> None:
                     if pending_src in src_ids:
                         st.session_state["tab4_source_select"] = pending_src
                         st.session_state["tab4_last_src_sig"] = None
-                    selected_src_id = st.selectbox(
+                    selected_src_id = _touch_selector(
                         t("carto_layer_label"),
                         options=src_ids,
-                        index=0,
+                        default=src_ids[0],
                         format_func=lambda sid: src_map[sid]["label"],
                         key="tab4_source_select",
+                        use_pills=True,
                     )
                     src = src_map[selected_src_id]
 
@@ -6928,11 +7289,13 @@ def main() -> None:
                         key="tab6_gemini_key",
                     )
                 with col_mod:
-                    selected_mod_choice = st.selectbox(
+                    selected_mod_choice = _touch_selector(
                         t("ai_model_select_label"),
                         options=mod_ids,
+                        default=mod_ids[0],
                         format_func=_fmt_gemini_model,
                         key="gemini_model",
+                        use_pills=True,
                     )
 
                 if selected_mod_choice == "custom":
@@ -7275,16 +7638,16 @@ def main() -> None:
                 gnss_date = st.date_input(
                     t("gnss_date_label"),
                     value=date.today(),
-                    min_value=date(2015, 1, 1),
+                    min_value=HISTORICAL_MIN_DATE,
                     max_value=date.today() + timedelta(days=365),
                     key="tab7_plan_date",
                 )
             with gc4:
-                gnss_tz = st.selectbox(
+                gnss_tz = _touch_selector(
                     t("gnss_tz_label"),
                     options=["Europe/Ljubljana", "UTC"],
-                    index=0,
-                    format_func=lambda z: "CET/CEST (Ljubljana)" if z == "Europe/Ljubljana" else "UTC",
+                    default="Europe/Ljubljana",
+                    format_func=lambda z: "CET/CEST" if z == "Europe/Ljubljana" else "UTC",
                     key="tab7_tz_select",
                 )
 

@@ -23,7 +23,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "sensor_s2_label": "Sentinel-2 L2A (10 m | 2015–danes)",
         "sensor_landsat_label": "Landsat C2 L2 (30 m | 1984–danes)",
         "sensor_s1_label": "Sentinel-1 SAR RTC (10 m | Radar — skozi oblake)",
-        "l7_exclude_label": "Izključi Landsat 7 SLC-off posnetke (po 2003)",
+        "l7_exclude_label": "Izključi Landsat 7 SLC-off (črtaste posnetke po maju 2003)",
         "l7_exclude_help": "Landsat 7 ETM+ po 31. 5. 2003 vsebuje diagonalne proge brez podatkov.",
         "sar_allweather_note": "Radar (C-band SAR) prodira skozi oblake — filter oblačnosti ni potreben.",
         # Sidebar AOI
@@ -593,6 +593,33 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "gnss_local_header": "🛰️ Lokalni pregled ovir (Sentinel-2 10 m + 50 m / 100 m krožnice)",
         "gnss_local_unavail": "Lokalni sloj Sentinel-2 za to stojišče trenutno ni bil naložen (ali je izklopljen).",
         "gnss_btn_dl_csv": "💾 Prenesi načrt GNSS izmere (.csv)",
+        # Quality & UX fixes: AOI cloud fallback, keyboard-free scene picker, 2-3 date comparator
+        "aoi_clear_thr_label": "Prag jasnih pikslov v AOI [%]:",
+        "aoi_clear_thr_help": (
+            "Epohe z nižjim deležem jasnih pikslov v AOI se samodejno zamenjajo z naslednjim "
+            "najjasnejšim nadomestnim posnetkom iz istega časovnega obdobja (do 4 kandidati)."
+        ),
+        "ts_replaced_info": "Samodejno zamenjanih oblačnih obdobij z jasnejšim nadomestnim posnetkom: **{n}**.",
+        "ts_replaced_expander": "Podrobnosti samodejno zamenjanih obdobij",
+        "ts_skipped_info_thr": "Preskočenih obdobij (tudi po preverjanju nadomestnih posnetkov < {thr} % jasnih pikslov): **{n}**.",
+        "btn_prev_scene": "◀ Prejšnji",
+        "btn_next_scene": "Naslednji ▶",
+        "scene_table_tap_hint": "💡 Tapnite vrstico v tabeli za neposredno izbiro posnetka (brez odpiranja tipkovnice).",
+        "scene_page_label": "Stran posnetkov:",
+        "scene_active_badge": "Izbrani posnetek ({cur}/{tot}):",
+        "comp3_header": "Primerjava 2 ali 3 datumov (Zavesni drsnik & Δ spremembe)",
+        "comp3_caption": (
+            "Tapnite 2 ali 3 datume spodaj (brez tipkovnice). Pri 2 datumih dobite zaveso t₁ ↔ t₂, "
+            "pri 3 datumih pa dvostopenjsko zaveso + sinhroniziran 3-panelni pas in karto sprememb Δ."
+        ),
+        "comp3_dates_label": "Izberite 2 ali 3 datume za primerjavo (tapnite žetone):",
+        "comp3_layer_label": "Sloj za primerjavo:",
+        "comp3_need_2_3_warn": "Izberite natančno 2 ali 3 datume (trenutno izbranih: {n}).",
+        "comp3_btn_run": "🔄 Primerjaj izbrane datume ({n})",
+        "comp3_spinner": "Nalagam in poravnavam {n} posnetke ({layer}) ...",
+        "comp3_swipe_pair_label": "Par datumov za zavesno primerjavo:",
+        "comp3_strip_header": "🎞️ Sinhroniziran vizualni pas ({n} datumi)",
+        "comp3_delta_header": "📊 Kvantitativna karta sprememb (Δ = {d_last} − {d_first})",
     },
     "en": {
         # App chrome & header
@@ -612,7 +639,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "sensor_s2_label": "Sentinel-2 L2A (10 m | 2015–present)",
         "sensor_landsat_label": "Landsat C2 L2 (30 m | 1984–present)",
         "sensor_s1_label": "Sentinel-1 SAR RTC (10 m | Radar — all-weather)",
-        "l7_exclude_label": "Exclude Landsat 7 SLC-off scenes (post-2003)",
+        "l7_exclude_label": "Exclude Landsat 7 SLC-off (striped scenes after May 2003)",
         "l7_exclude_help": "Landsat 7 ETM+ scenes after 2003-05-31 have diagonal scan-line data gaps.",
         "sar_allweather_note": "C-band SAR radar sees through clouds — optical cloud cover filter is bypassed.",
         # Sidebar AOI
@@ -1182,6 +1209,33 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "gnss_local_header": "🛰️ Local Obstruction Overview (Sentinel-2 10 m + 50 m / 100 m Rings)",
         "gnss_local_unavail": "Local Sentinel-2 imagery for this station was not loaded (or disabled).",
         "gnss_btn_dl_csv": "💾 Download GNSS Mission Plan (.csv)",
+        # Quality & UX fixes: AOI cloud fallback, keyboard-free scene picker, 2-3 date comparator
+        "aoi_clear_thr_label": "AOI Clear Pixel Threshold [%]:",
+        "aoi_clear_thr_help": (
+            "Epochs below this clear-pixel threshold inside the AOI are automatically replaced with "
+            "the next clearest backup scene from the same time bucket (up to 4 candidates)."
+        ),
+        "ts_replaced_info": "Cloudy buckets automatically replaced with a clearer backup scene: **{n}**.",
+        "ts_replaced_expander": "Auto-replaced cloudy bucket details",
+        "ts_skipped_info_thr": "Buckets skipped (even after backup candidates < {thr}% clear pixels): **{n}**.",
+        "btn_prev_scene": "◀ Previous",
+        "btn_next_scene": "Next ▶",
+        "scene_table_tap_hint": "💡 Tap any row in the table to select that scene directly (no keyboard popup).",
+        "scene_page_label": "Scene page:",
+        "scene_active_badge": "Selected scene ({cur}/{tot}):",
+        "comp3_header": "2- or 3-Date Comparison (Curtain Swipe & Δ Change)",
+        "comp3_caption": (
+            "Tap 2 or 3 dates below (keyboard-free). Pick 2 dates for a t₁ ↔ t₂ swipe, or 3 dates "
+            "for a 2-stage curtain swipe + synchronized 3-panel visual strip and Δ change map."
+        ),
+        "comp3_dates_label": "Select 2 or 3 dates to compare (tap pills):",
+        "comp3_layer_label": "Comparison layer:",
+        "comp3_need_2_3_warn": "Please select exactly 2 or 3 dates (currently selected: {n}).",
+        "comp3_btn_run": "🔄 Compare Selected Dates ({n})",
+        "comp3_spinner": "Loading and aligning {n} scenes ({layer}) ...",
+        "comp3_swipe_pair_label": "Date pair for curtain swipe:",
+        "comp3_strip_header": "🎞️ Synchronized Visual Strip ({n} Dates)",
+        "comp3_delta_header": "📊 Quantitative Change Map (Δ = {d_last} − {d_first})",
     },
 }
 
