@@ -35,7 +35,7 @@ from analize import (
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
-from geodezija_crs import clip_to_aoi_polygon
+from geodezija_crs import clip_to_aoi_polygon, get_parallel_workers
 from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
 
 logger = logging.getLogger(__name__)
@@ -351,9 +351,9 @@ def extract_time_series(
         return step, prim_date_str, None, None, skipped_entry
 
     if total > 0:
-        batch_size = 4
+        batch_size = get_parallel_workers()
         completed = 0
-        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+        with ThreadPoolExecutor(max_workers=min(batch_size, total)) as executor:
             for batch_start in range(0, total, batch_size):
                 batch = epoch_groups[batch_start : batch_start + batch_size]
                 future_map = {
@@ -996,9 +996,9 @@ def generate_timelapse_frames(
         return step, prim_date_str, None, None, skipped_entry
 
     if total > 0:
-        batch_size = 4
+        batch_size = get_parallel_workers()
         completed = 0
-        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+        with ThreadPoolExecutor(max_workers=min(batch_size, total)) as executor:
             for batch_start in range(0, total, batch_size):
                 batch = epoch_groups[batch_start : batch_start + batch_size]
                 future_map = {
@@ -1302,9 +1302,9 @@ def compute_cloud_free_composite(
             del ds, masked_ds
 
     if total > 0:
-        batch_size = 4
+        batch_size = get_parallel_workers()
         completed = 0
-        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+        with ThreadPoolExecutor(max_workers=min(batch_size, total)) as executor:
             for batch_start in range(0, total, batch_size):
                 batch = selected_groups[batch_start : batch_start + batch_size]
                 future_map = {

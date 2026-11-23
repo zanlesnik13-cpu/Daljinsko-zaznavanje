@@ -738,6 +738,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ws1_aoi_mode_geojson": "📂 GeoJSON",
         "ws2_comp_sar_info": "Brezoblačni optični mediani mozaik je na voljo za optična senzorja Sentinel-2 L2A in Landsat C2 L2 (Sentinel-1 SAR prodira skozi oblake).",
         "ws2_tools_divider": "Spektralni podpis & Raba tal (za izbrani posnetek)",
+        "sb_env_codespaces": "⚡ GitHub Codespaces (High RAM)",
+        "sb_env_hf_spaces": "🤗 Hugging Face Spaces (16 GB)",
+        "sb_env_streamlit_cloud": "☁️ Streamlit Cloud (1 GB)",
+        "sb_env_local": "☁️ Cloud / Lokalno",
     },
     "en": {
         # App chrome & header
@@ -1472,6 +1476,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ws1_aoi_mode_geojson": "📂 GeoJSON",
         "ws2_comp_sar_info": "Cloud-free optical median composite applies to optical sensors Sentinel-2 L2A and Landsat C2 L2 (Sentinel-1 SAR penetrates clouds).",
         "ws2_tools_divider": "Spectral Signature & Land Cover (for selected scene)",
+        "sb_env_codespaces": "⚡ GitHub Codespaces (High RAM)",
+        "sb_env_hf_spaces": "🤗 Hugging Face Spaces (16 GB)",
+        "sb_env_streamlit_cloud": "☁️ Streamlit Cloud (1 GB)",
+        "sb_env_local": "☁️ Cloud / Local",
     },
 }
 

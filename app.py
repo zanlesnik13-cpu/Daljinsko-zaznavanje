@@ -122,6 +122,8 @@ from geodezija_crs import (
     format_crs_label,
     get_auto_utm_epsg,
     get_best_metric_crs,
+    get_runtime_environment,
+    is_codespaces,
     is_in_slovenia,
     transform_coords,
     validate_aoi_geometry,
@@ -446,6 +448,23 @@ div[data-testid="stExpander"] {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+.sb-env-badge {
+    display: inline-block;
+    margin-top: 0.45rem;
+    padding: 0.16rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.70rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    background-color: var(--geo-surface-alt);
+    color: var(--geo-muted);
+    border: 1px solid var(--geo-border);
+}
+.sb-env-badge-hi {
+    background-color: var(--geo-teal-soft);
+    color: var(--geo-teal-dark);
+    border-color: #99F6E4;
 }
 /* Prepreči prikaz besedilnega kurzorja / virtualne tipkovnice v spustnih menijih na tablicah */
 [data-baseweb="select"] input {
@@ -5723,6 +5742,21 @@ def main() -> None:
         sel_res_pre = int(st.session_state.get("selected_resolution", sensor_cfg["default_res"]))
 
         # --- 1. Kompakten Aktivni kontekst (Status Card) ---
+        runtime_env = get_runtime_environment()
+        env_mode = str(runtime_env["mode"])
+        if is_codespaces():
+            env_badge_text = t("sb_env_codespaces")
+            env_badge_cls = "sb-env-badge sb-env-badge-hi"
+        elif env_mode == "hf_spaces":
+            env_badge_text = t("sb_env_hf_spaces")
+            env_badge_cls = "sb-env-badge sb-env-badge-hi"
+        elif env_mode == "streamlit_cloud":
+            env_badge_text = t("sb_env_streamlit_cloud")
+            env_badge_cls = "sb-env-badge"
+        else:
+            env_badge_text = t("sb_env_local")
+            env_badge_cls = "sb-env-badge"
+
         area_ha = area_km2 * 100.0
         area_ctx_str = f"{area_km2:,.1f} km² ({area_ha:,.0f} ha)" if bbox_4326 is not None else "—"
         safe_loc = str(loc_label).replace("<", "&lt;").replace(">", "&gt;")
@@ -5741,6 +5775,7 @@ def main() -> None:
             f'<span class="sb-status-key">{t("sb_ctx_res")}</span>'
             f'<span class="sb-status-val">{sel_res_pre} m</span>'
             f'</div>'
+            f'<div class="{env_badge_cls}">{env_badge_text}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -5757,7 +5792,7 @@ def main() -> None:
                     f'{t("ram_status_finer", sel=sel_res_pre, rec=rec_res, area=area_km2)}</div>',
                     unsafe_allow_html=True,
                 )
-            elif area_km2 > 1200.0:
+            elif area_km2 > float(runtime_env["res_10m_max_km2"]):
                 st.markdown(
                     f'<div class="ram-pill ram-pill-warn">'
                     f'{t("ram_status_warn", area=area_km2, rec=rec_res)}</div>',

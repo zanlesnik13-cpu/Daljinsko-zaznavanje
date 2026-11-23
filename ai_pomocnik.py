@@ -274,11 +274,11 @@ def _normalize_ascii(text: str) -> str:
 # API Key Discovery
 # ---------------------------------------------------------------------------
 def get_active_gemini_api_key(user_key: str | None = None) -> tuple[str | None, str]:
-    """Resolve Gemini API key from session input, env vars (HF Spaces Secrets), or Streamlit secrets.
+    """Resolve Gemini API key from session input, env vars (GitHub Codespaces / HF Spaces Secrets), or Streamlit secrets.
 
-    Checks ``os.environ.get("GEMINI_API_KEY")`` before ``st.secrets`` so Hugging Face Spaces
-    deployments work cleanly without touching ``.streamlit/secrets.toml``, and wraps
-    ``st.secrets`` access safely so ``StreamlitSecretNotFoundError`` is never raised.
+    Checks ``os.environ.get("GEMINI_API_KEY")`` before ``st.secrets`` so GitHub Codespaces
+    and Hugging Face Spaces deployments work cleanly without touching ``.streamlit/secrets.toml``,
+    and wraps ``st.secrets`` access safely so ``StreamlitSecretNotFoundError`` is never raised.
 
     Returns ``(api_key_or_none, source_tag)`` where ``source_tag`` is one of
     ``"session"``, ``"env"``, ``"secrets"``, or ``"none"``.

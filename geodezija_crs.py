@@ -63,10 +63,105 @@ SUPPORTED_CRS: dict[str, dict[str, object]] = {
     },
 }
 
-# RAM-safe resolution step-down thresholds (km^2) for 16 GB RAM Hugging Face Spaces profile
+# RAM-safe resolution step-down thresholds (km^2)
+# High-RAM profile (GitHub Codespaces 8-16 GB, Hugging Face Spaces 16 GB, Local PC):
 _RES_10M_MAX_KM2: float = 1200.0
 _RES_20M_MAX_KM2: float = 2500.0
 _RES_30M_MAX_KM2: float = 4000.0
+
+# Low-RAM safety profile (Streamlit Community Cloud 1 GB container):
+_CLOUD_1GB_RES_10M_MAX_KM2: float = 60.0
+_CLOUD_1GB_RES_20M_MAX_KM2: float = 300.0
+_CLOUD_1GB_RES_30M_MAX_KM2: float = 900.0
+
+
+def is_codespaces() -> bool:
+    """Return True when running inside a GitHub Codespaces container (8–16 GB RAM)."""
+    return str(os.environ.get("CODESPACES", "")).strip().lower() == "true"
+
+
+def _detect_cgroup_ram_gb() -> float | None:
+    """Read Linux cgroup v2/v1 container memory limit in GiB when available."""
+    for path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            if not os.path.exists(path):
+                continue
+            raw = open(path, "r", encoding="utf-8").read().strip()
+            if not raw or raw == "max":
+                continue
+            val = int(raw)
+            # Ignore huge/unbounded sentinel values (> 1 TiB)
+            if 128 * 1024 * 1024 <= val <= 1024 * 1024 * 1024 * 1024:
+                return val / (1024.0 ** 3)
+        except Exception:
+            continue
+    return None
+
+
+def is_low_ram_cloud() -> bool:
+    """Return True when running inside a constrained (~1 GB RAM) Streamlit Community Cloud container."""
+    if is_codespaces():
+        return False
+    if str(os.environ.get("SPACE_ID", "")).strip():
+        return False
+    if str(os.environ.get("STREAMLIT_SHARING_MODE", "")).strip():
+        return True
+    try:
+        if "/mount/src/" in os.getcwd().replace("\\", "/"):
+            return True
+    except Exception:
+        pass
+    cgroup_gb = _detect_cgroup_ram_gb()
+    if cgroup_gb is not None and cgroup_gb <= 2.5:
+        return True
+    return False
+
+
+def get_runtime_environment() -> dict[str, object]:
+    """Return active runtime profile (Codespaces / HF Spaces / Streamlit Cloud 1 GB / Local)."""
+    if is_codespaces():
+        return {
+            "mode": "codespaces",
+            "high_ram": True,
+            "max_workers": 4,
+            "max_area_km2": _RES_30M_MAX_KM2,
+            "res_10m_max_km2": _RES_10M_MAX_KM2,
+            "res_20m_max_km2": _RES_20M_MAX_KM2,
+        }
+    if str(os.environ.get("SPACE_ID", "")).strip():
+        return {
+            "mode": "hf_spaces",
+            "high_ram": True,
+            "max_workers": 4,
+            "max_area_km2": _RES_30M_MAX_KM2,
+            "res_10m_max_km2": _RES_10M_MAX_KM2,
+            "res_20m_max_km2": _RES_20M_MAX_KM2,
+        }
+    if is_low_ram_cloud():
+        return {
+            "mode": "streamlit_cloud",
+            "high_ram": False,
+            "max_workers": 2,
+            "max_area_km2": _CLOUD_1GB_RES_30M_MAX_KM2,
+            "res_10m_max_km2": _CLOUD_1GB_RES_10M_MAX_KM2,
+            "res_20m_max_km2": _CLOUD_1GB_RES_20M_MAX_KM2,
+        }
+    return {
+        "mode": "local",
+        "high_ram": True,
+        "max_workers": 4,
+        "max_area_km2": _RES_30M_MAX_KM2,
+        "res_10m_max_km2": _RES_10M_MAX_KM2,
+        "res_20m_max_km2": _RES_20M_MAX_KM2,
+    }
+
+
+def get_parallel_workers() -> int:
+    """Return optimal worker thread count (4 on Codespaces/HF/local, 2 on 1 GB Streamlit Cloud)."""
+    return int(get_runtime_environment()["max_workers"])
 
 
 def normalize_crs(epsg_or_crs: int | str | CRS) -> CRS:
@@ -308,29 +403,34 @@ def _recommended_resolution_for_area(
     area_km2: float,
     sensor: str | None = None,
 ) -> int:
-    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for AOI area (16 GB RAM)."""
+    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for the active runtime."""
+    env = get_runtime_environment()
+    max_10m = float(env["res_10m_max_km2"])
+    max_20m = float(env["res_20m_max_km2"])
+    max_30m = float(env["max_area_km2"])
     if sensor and str(sensor).strip().lower() == "landsat-c2-l2":
-        return 30 if area_km2 <= _RES_30M_MAX_KM2 else 60
-    if area_km2 <= _RES_10M_MAX_KM2:
+        return 30 if area_km2 <= max_30m else 60
+    if area_km2 <= max_10m:
         return 10
-    if area_km2 <= _RES_20M_MAX_KM2:
+    if area_km2 <= max_20m:
         return 20
-    if area_km2 <= _RES_30M_MAX_KM2:
+    if area_km2 <= max_30m:
         return 30
     return 60
 
 
 def validate_aoi_size(
     bbox_4326: Sequence[float],
-    max_area_km2: float = 4000.0,
+    max_area_km2: float | None = None,
     sensor: str | None = None,
 ) -> tuple[float, bool, int]:
     """Validate an EPSG:4326 AOI bounding box by computing exact metric area worldwide.
 
     Computes exact area in ``EPSG:3794`` inside Slovenia or in the exact local
     UTM zone (``EPSG:326xx`` / ``EPSG:327xx``) anywhere else on Earth, eliminating
-    global projection distortion. Defaults to 16 GB RAM limits (``max_area_km2=4000.0``
-    and full native ``10 m`` Sentinel resolution up to ``1200 km^2``).
+    global projection distortion. Automatically uses high-RAM limits (4000 km²,
+    full native 10 m Sentinel up to 1200 km²) on GitHub Codespaces, Hugging Face
+    Spaces, and local machines, while staying RAM-safe on 1 GB Streamlit Cloud.
     """
     if len(bbox_4326) != 4:
         raise ValueError(
@@ -343,6 +443,12 @@ def validate_aoi_size(
             f"Invalid bbox_4326 ordering: min must be strictly less than max, got {bbox_4326}."
         )
 
+    eff_max_area = (
+        float(max_area_km2)
+        if max_area_km2 is not None
+        else float(get_runtime_environment()["max_area_km2"])
+    )
+
     geom_4326 = box(min_lon, min_lat, max_lon, max_lat)
     max_seg = max((max_lon - min_lon) / 16.0, (max_lat - min_lat) / 16.0, 1e-4)
     geom_4326 = geom_4326.segmentize(max_segment_length=max_seg)
@@ -354,7 +460,7 @@ def validate_aoi_size(
     geom_metric = shapely_transform(transformer.transform, geom_4326)
     area_km2 = float(geom_metric.area / 1_000_000.0)
 
-    is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
+    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area)
     recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
@@ -362,13 +468,19 @@ def validate_aoi_size(
 
 def validate_aoi_geometry(
     geometry_4326: dict[str, object] | BaseGeometry,
-    max_area_km2: float = 4000.0,
+    max_area_km2: float | None = None,
     sensor: str | None = None,
 ) -> tuple[float, bool, int]:
     """Compute exact area in km^2 in the local metric CRS (D96/TM in SLO / local UTM globally)."""
     geom_4326 = geometry_4326 if isinstance(geometry_4326, BaseGeometry) else shape(geometry_4326)
     if geom_4326.is_empty:
         return (0.0, False, 30 if (sensor and str(sensor).strip().lower() == "landsat-c2-l2") else 10)
+
+    eff_max_area = (
+        float(max_area_km2)
+        if max_area_km2 is not None
+        else float(get_runtime_environment()["max_area_km2"])
+    )
 
     min_x, min_y, max_x, max_y = geom_4326.bounds
     max_seg = max((max_x - min_x) / 16.0, (max_y - min_y) / 16.0, 1e-4)
@@ -380,7 +492,7 @@ def validate_aoi_geometry(
     transformer = _get_transformer(CRS_WGS84, metric_crs)
     geom_metric = shapely_transform(transformer.transform, geom_dense)
     area_km2 = float(geom_metric.area / 1_000_000.0)
-    is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
+    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area)
     recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
