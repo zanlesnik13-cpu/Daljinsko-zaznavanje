@@ -59,12 +59,12 @@ SLIPPY_BASEMAP_SPECS: dict[str, dict[str, Any]] = {
 def expand_bbox_for_panning(
     bbox_4326: Sequence[float],
     buffer_factor: float = 0.35,
-    max_area_km2: float = 900.0,
+    max_area_km2: float = 4000.0,
 ) -> list[float]:
     """Expand an EPSG:4326 AOI bounding box on each side for smooth slippy-map panning.
 
     Caps the effective buffer automatically so the expanded download area never
-    exceeds ``max_area_km2`` (Streamlit Cloud 1 GB RAM safety guard).
+    exceeds ``max_area_km2`` (16 GB RAM safety guard).
     """
     if len(bbox_4326) != 4:
         raise ValueError(f"bbox_4326 must contain 4 values, got {len(bbox_4326)}.")
@@ -184,7 +184,7 @@ def _orient_north_up(arr: np.ndarray, y_coords: np.ndarray) -> np.ndarray:
 
 def _encode_rgba_to_data_uri(
     rgba: np.ndarray,
-    max_width: int = 1200,
+    max_width: int = 1800,
     discrete: bool = False,
 ) -> str:
     """Encode an ``(H, W, 4) uint8`` RGBA array to a compact PNG base64 data URI."""
@@ -213,7 +213,7 @@ def raster_to_map_overlay_png(
     use_percentile_stretch: bool = True,
     gamma: float = 1.0,
     fixed_ranges: Sequence[tuple[float, float]] | None = None,
-    max_width: int = 1200,
+    max_width: int = 1800,
     discrete_rgba_map: dict[int, tuple[int, int, int, int]] | None = None,
 ) -> tuple[str, list[list[float]]]:
     """Reproject a visualization copy of a geodetic raster to EPSG:4326 and encode as RGBA PNG.

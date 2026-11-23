@@ -87,11 +87,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "metric_area_km2": "Površina [km²]",
         "metric_area_ha": "Površina [ha]",
         "aoi_too_large": (
-            "Območje ({area:,.1f} km²) presega omejitev 900 km² "
-            "(zaščita 1 GB RAM na Streamlit Cloud). Zmanjšajte radij ali poligon."
+            "Območje ({area:,.1f} km²) presega omejitev 4000 km² "
+            "(zaščita 16 GB RAM na Hugging Face Spaces). Zmanjšajte radij ali poligon."
         ),
         "aoi_large_warn": (
-            "Večje območje ({area:,.1f} km²): za stabilno delovanje znotraj 1 GB RAM "
+            "Zelo veliko območje ({area:,.1f} km²): za hitro in stabilno delovanje znotraj 16 GB RAM "
             "priporočamo ločljivost **{res} m**."
         ),
         "bbox_expander": "Koordinatni okvir (D96/TM in WGS84)",
@@ -322,7 +322,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ram_status_ok": "🟢 RAM OK ({area:,.1f} km² · {res} m)",
         "ram_status_warn": "🟡 Veliko območje ({area:,.1f} km²) — priporočena ločljivost {rec} m",
         "ram_status_finer": "🟡 Izbrana {sel} m < priporočena {rec} m ({area:,.1f} km²)",
-        "ram_status_err": "🔴 Območje ({area:,.1f} km²) presega 900 km²",
+        "ram_status_err": "🔴 Območje ({area:,.1f} km²) presega 4000 km²",
         "sidebar_geo_details_expander": "⚙️ Podrobnosti CRS, okvira in RAM zaščite",
         "crs_short_d96": "D96/TM (3794)",
         "crs_short_utm": "UTM 33N (32633)",
@@ -332,7 +332,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "t2_subtab_tools": "🔍 Spektralni podpis & Raba tal",
         "comp_header": "☁️ Brezoblačni mediani mozaik obdobja (Cloud-Free Composite)",
         "comp_caption": (
-            "Sekvenčno (RAM-varno) združi do N najmanj oblačnih datumov, izloči oblake in sence "
+            "Vzporedno (4 niti, 16 GB RAM) združi do N najmanj oblačnih datumov, izloči oblake in sence "
             "(SCL / QA_PIXEL) ter izračuna pikselsko mediano vseh jasnih opazovanj."
         ),
         "comp_mode_label": "Sloj brezoblačnega mozaika:",
@@ -362,7 +362,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "t3_preset_1990": "1990–danes (Landsat)",
         "t3_btn_refresh": "🔍 Osveži posnetke za časovno analizo",
         "t3_loaded_status": "Aktivni katalog: **{sensor}** · **{n}** datumov ({d1} → {d2})",
-        "t3_no_aoi_warn": "Najprej določite veljavno območje zanimanja (AOI ≤ 900 km²) v stranski vrstici ali na zemljevidu.",
+        "t3_no_aoi_warn": "Najprej določite veljavno območje zanimanja (AOI ≤ 4000 km²) v stranski vrstici ali na zemljevidu.",
         "t3_subtab_ts": "📈 Časovna vrsta (Graf)",
         "t3_subtab_change": "🔄 Zaznava sprememb (Δ & Pred/Potem)",
         "t3_subtab_tl": "🎬 Vizualni Timelapse (GIF)",
@@ -790,11 +790,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "metric_area_km2": "Area [km²]",
         "metric_area_ha": "Area [ha]",
         "aoi_too_large": (
-            "AOI area ({area:,.1f} km²) exceeds the 900 km² limit "
-            "(Streamlit Cloud 1 GB RAM safeguard). Reduce the radius or polygon."
+            "AOI area ({area:,.1f} km²) exceeds the 4000 km² limit "
+            "(Hugging Face Spaces 16 GB RAM safeguard). Reduce the radius or polygon."
         ),
         "aoi_large_warn": (
-            "Large AOI ({area:,.1f} km²): to stay safely within 1 GB RAM, "
+            "Very large AOI ({area:,.1f} km²): for fast & stable processing within 16 GB RAM, "
             "recommended resolution is **{res} m**."
         ),
         "bbox_expander": "Bounding Box Coordinates (D96/TM & WGS84)",
@@ -1025,7 +1025,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ram_status_ok": "🟢 RAM OK ({area:,.1f} km² · {res} m)",
         "ram_status_warn": "🟡 Large AOI ({area:,.1f} km²) — recommended resolution {rec} m",
         "ram_status_finer": "🟡 Selected {sel} m < recommended {rec} m ({area:,.1f} km²)",
-        "ram_status_err": "🔴 AOI ({area:,.1f} km²) exceeds 900 km² limit",
+        "ram_status_err": "🔴 AOI ({area:,.1f} km²) exceeds 4000 km² limit",
         "sidebar_geo_details_expander": "⚙️ CRS, Bounding Box & RAM Guard Details",
         "crs_short_d96": "D96/TM (3794)",
         "crs_short_utm": "UTM 33N (32633)",
@@ -1035,7 +1035,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "t2_subtab_tools": "🔍 Spectral Signature & Land Cover",
         "comp_header": "☁️ Cloud-Free Temporal Median Composite",
         "comp_caption": (
-            "Sequentially streams (1 GB RAM safe) up to N least-cloudy dates, masks clouds & shadows "
+            "Streams up to N least-cloudy dates in parallel (4 threads, 16 GB RAM), masks clouds & shadows "
             "(SCL / QA_PIXEL), and computes the pixel-wise median across all clear observations."
         ),
         "comp_mode_label": "Cloud-free composite layer:",
@@ -1065,7 +1065,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "t3_preset_1990": "1990–Present (Landsat)",
         "t3_btn_refresh": "🔍 Refresh Scenes for Time-Series Analysis",
         "t3_loaded_status": "Active catalog: **{sensor}** · **{n}** dates ({d1} → {d2})",
-        "t3_no_aoi_warn": "Define a valid Area of Interest (AOI ≤ 900 km²) in the sidebar or on the map first.",
+        "t3_no_aoi_warn": "Define a valid Area of Interest (AOI ≤ 4000 km²) in the sidebar or on the map first.",
         "t3_subtab_ts": "📈 Time Series (Chart)",
         "t3_subtab_change": "🔄 Change Detection (Δ & Before/After)",
         "t3_subtab_tl": "🎬 Visual Timelapse (GIF)",

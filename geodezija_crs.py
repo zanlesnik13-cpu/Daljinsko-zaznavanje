@@ -63,10 +63,10 @@ SUPPORTED_CRS: dict[str, dict[str, object]] = {
     },
 }
 
-# RAM-safe resolution step-down thresholds (km^2) for 1 GB Streamlit Cloud limit
-_RES_10M_MAX_KM2: float = 100.0
-_RES_20M_MAX_KM2: float = 350.0
-_RES_30M_MAX_KM2: float = 750.0
+# RAM-safe resolution step-down thresholds (km^2) for 16 GB RAM Hugging Face Spaces profile
+_RES_10M_MAX_KM2: float = 1200.0
+_RES_20M_MAX_KM2: float = 2500.0
+_RES_30M_MAX_KM2: float = 4000.0
 
 
 def normalize_crs(epsg_or_crs: int | str | CRS) -> CRS:
@@ -304,8 +304,13 @@ def bbox_from_point_wgs84(
     return bbox_4326, bbox_metric
 
 
-def _recommended_resolution_for_area(area_km2: float) -> int:
-    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for AOI area."""
+def _recommended_resolution_for_area(
+    area_km2: float,
+    sensor: str | None = None,
+) -> int:
+    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for AOI area (16 GB RAM)."""
+    if sensor and str(sensor).strip().lower() == "landsat-c2-l2":
+        return 30 if area_km2 <= _RES_30M_MAX_KM2 else 60
     if area_km2 <= _RES_10M_MAX_KM2:
         return 10
     if area_km2 <= _RES_20M_MAX_KM2:
@@ -317,13 +322,15 @@ def _recommended_resolution_for_area(area_km2: float) -> int:
 
 def validate_aoi_size(
     bbox_4326: Sequence[float],
-    max_area_km2: float = 900.0,
+    max_area_km2: float = 4000.0,
+    sensor: str | None = None,
 ) -> tuple[float, bool, int]:
     """Validate an EPSG:4326 AOI bounding box by computing exact metric area worldwide.
 
     Computes exact area in ``EPSG:3794`` inside Slovenia or in the exact local
     UTM zone (``EPSG:326xx`` / ``EPSG:327xx``) anywhere else on Earth, eliminating
-    global projection distortion.
+    global projection distortion. Defaults to 16 GB RAM limits (``max_area_km2=4000.0``
+    and full native ``10 m`` Sentinel resolution up to ``1200 km^2``).
     """
     if len(bbox_4326) != 4:
         raise ValueError(
@@ -348,19 +355,20 @@ def validate_aoi_size(
     area_km2 = float(geom_metric.area / 1_000_000.0)
 
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
-    recommended_resolution_m = _recommended_resolution_for_area(area_km2)
+    recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
 
 
 def validate_aoi_geometry(
     geometry_4326: dict[str, object] | BaseGeometry,
-    max_area_km2: float = 900.0,
+    max_area_km2: float = 4000.0,
+    sensor: str | None = None,
 ) -> tuple[float, bool, int]:
     """Compute exact area in km^2 in the local metric CRS (D96/TM in SLO / local UTM globally)."""
     geom_4326 = geometry_4326 if isinstance(geometry_4326, BaseGeometry) else shape(geometry_4326)
     if geom_4326.is_empty:
-        return (0.0, False, 10)
+        return (0.0, False, 30 if (sensor and str(sensor).strip().lower() == "landsat-c2-l2") else 10)
 
     min_x, min_y, max_x, max_y = geom_4326.bounds
     max_seg = max((max_x - min_x) / 16.0, (max_y - min_y) / 16.0, 1e-4)
@@ -373,7 +381,7 @@ def validate_aoi_geometry(
     geom_metric = shapely_transform(transformer.transform, geom_dense)
     area_km2 = float(geom_metric.area / 1_000_000.0)
     is_valid = (area_km2 > 0.0) and (area_km2 <= float(max_area_km2))
-    recommended_resolution_m = _recommended_resolution_for_area(area_km2)
+    recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
 

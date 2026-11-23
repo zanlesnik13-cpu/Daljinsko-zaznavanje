@@ -2306,6 +2306,7 @@ def _geocode_local_slovenia(query: str) -> tuple[float, float, str] | None:
     return None
 
 
+@st.cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def geocode_place(
     query: str,
     lang: str = "sl",
@@ -4311,7 +4312,7 @@ def main() -> None:
             radius_m = st.slider(
                 t("radius_label"),
                 min_value=500,
-                max_value=15000,
+                max_value=30000,
                 value=int(st.session_state["map_radius_m"]),
                 step=250,
                 key="sidebar_map_radius_slider",
@@ -4360,7 +4361,7 @@ def main() -> None:
             radius_m = st.slider(
                 t("radius_label"),
                 min_value=500,
-                max_value=15000,
+                max_value=30000,
                 value=2000,
                 step=250,
                 key="manual_radius_slider",
@@ -4425,7 +4426,7 @@ def main() -> None:
             radius_m = st.slider(
                 t("radius_label"),
                 min_value=500,
-                max_value=15000,
+                max_value=30000,
                 value=int(preset["radius_m"]),
                 step=250,
                 key=f"preset_radius_{preset_name}",
@@ -4472,17 +4473,14 @@ def main() -> None:
 
         if bbox_4326 is not None and aoi_error is None:
             if aoi_polygon_4326 is not None:
-                area_km2, aoi_valid, base_rec_res = validate_aoi_geometry(aoi_polygon_4326)
-                _, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326)
+                area_km2, aoi_valid, base_rec_res = validate_aoi_geometry(aoi_polygon_4326, sensor=sensor)
+                _, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326, sensor=sensor)
                 aoi_valid = aoi_valid and bbox_ok
                 base_rec_res = max(base_rec_res, bbox_rec_res)
             else:
-                area_km2, aoi_valid, base_rec_res = validate_aoi_size(bbox_4326)
+                area_km2, aoi_valid, base_rec_res = validate_aoi_size(bbox_4326, sensor=sensor)
 
-            if sensor == SENSOR_LANDSAT:
-                rec_res = 60 if base_rec_res >= 60 else 30
-            else:
-                rec_res = base_rec_res
+            rec_res = base_rec_res
 
             area_ha = area_km2 * 100.0
             c_km, c_ha = st.columns(2)
@@ -4537,7 +4535,7 @@ def main() -> None:
                     f'{t("ram_status_finer", sel=selected_resolution, rec=rec_res, area=area_km2)}</div>',
                     unsafe_allow_html=True,
                 )
-            elif area_km2 > 100.0:
+            elif area_km2 > 1200.0:
                 st.markdown(
                     f'<div class="ram-pill ram-pill-warn">'
                     f'{t("ram_status_warn", area=area_km2, rec=rec_res)}</div>',
@@ -4556,7 +4554,7 @@ def main() -> None:
                     st.caption(t("aoi_too_large", area=area_km2))
                 elif selected_resolution < rec_res:
                     st.caption(t("res_finer_warn", sel=selected_resolution, rec=rec_res, area=area_km2))
-                elif area_km2 > 100.0:
+                elif area_km2 > 1200.0:
                     st.caption(t("aoi_large_warn", area=area_km2, res=rec_res))
                 if bbox_3794 is not None:
                     box_crs, _ = get_best_metric_crs(float(center_lat), float(center_lon), mode="auto")
@@ -4916,7 +4914,7 @@ def main() -> None:
                             use_pan_buf = bool(st.session_state.get("expand_pan_buffer", True))
                             if use_pan_buf:
                                 load_bbox = expand_bbox_for_panning(
-                                    active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                                    active_bbox, buffer_factor=0.35, max_area_km2=4000.0
                                 )
                                 ds_display = load_scene(
                                     sensor=active_sensor,
@@ -5233,7 +5231,7 @@ def main() -> None:
                         use_pan_buf_s1 = bool(st.session_state.get("expand_pan_buffer", True))
                         if use_pan_buf_s1:
                             s1_load_bbox = expand_bbox_for_panning(
-                                active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                                active_bbox, buffer_factor=0.35, max_area_km2=4000.0
                             )
                             ds_vv_disp = load_scene(
                                 sensor=SENSOR_S1,
@@ -5555,7 +5553,7 @@ def main() -> None:
                             use_pan_buf_t2 = bool(st.session_state.get("expand_pan_buffer", True))
                             if use_pan_buf_t2:
                                 t2_load_bbox = expand_bbox_for_panning(
-                                    active_bbox, buffer_factor=0.35, max_area_km2=900.0
+                                    active_bbox, buffer_factor=0.35, max_area_km2=4000.0
                                 )
                                 ds_raw = load_scene(
                                     sensor=active_sensor,

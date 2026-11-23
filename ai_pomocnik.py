@@ -274,26 +274,31 @@ def _normalize_ascii(text: str) -> str:
 # API Key Discovery
 # ---------------------------------------------------------------------------
 def get_active_gemini_api_key(user_key: str | None = None) -> tuple[str | None, str]:
-    """Resolve Gemini API key from session input, Streamlit secrets, or env vars.
+    """Resolve Gemini API key from session input, env vars (HF Spaces Secrets), or Streamlit secrets.
+
+    Checks ``os.environ.get("GEMINI_API_KEY")`` before ``st.secrets`` so Hugging Face Spaces
+    deployments work cleanly without touching ``.streamlit/secrets.toml``, and wraps
+    ``st.secrets`` access safely so ``StreamlitSecretNotFoundError`` is never raised.
 
     Returns ``(api_key_or_none, source_tag)`` where ``source_tag`` is one of
-    ``"session"``, ``"secrets"``, ``"env"``, or ``"none"``.
+    ``"session"``, ``"env"``, ``"secrets"``, or ``"none"``.
     """
     if user_key and str(user_key).strip():
         return str(user_key).strip(), "session"
 
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key and str(env_key).strip():
+        return str(env_key).strip(), "env"
+
     try:
         import streamlit as st
 
-        sec_key = st.secrets.get("GEMINI_API_KEY")
-        if sec_key and str(sec_key).strip():
-            return str(sec_key).strip(), "secrets"
+        if "GEMINI_API_KEY" in st.secrets:
+            sec_key = st.secrets.get("GEMINI_API_KEY")
+            if sec_key and str(sec_key).strip():
+                return str(sec_key).strip(), "secrets"
     except Exception:
         pass
-
-    env_key = os.environ.get("GEMINI_API_KEY")
-    if env_key and env_key.strip():
-        return env_key.strip(), "env"
 
     return None, "none"
 
@@ -376,17 +381,15 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
         else:
             interval = "Vsi posnetki"
 
-    # Normalize RAM-safe spatial resolution
+    # Normalize spatial resolution (16 GB RAM profile: native 10 m for Sentinel, 30 m for Landsat)
     try:
-        res_m = int(raw_plan.get("resolution_m", 20))
+        res_m = int(raw_plan.get("resolution_m", 30 if sensor == SENSOR_LANDSAT else 10))
     except Exception:
-        res_m = 20
+        res_m = 30 if sensor == SENSOR_LANDSAT else 10
     if res_m not in VALID_RESOLUTIONS:
         res_m = min(VALID_RESOLUTIONS, key=lambda r: abs(r - res_m))
     if sensor == SENSOR_LANDSAT and res_m < 30:
         res_m = 30
-    if radius_m >= 5000 and res_m < 20:
-        res_m = 20
 
     expl_sl = str(raw_plan.get("explanation_sl") or "").strip()
     expl_en = str(raw_plan.get("explanation_en") or "").strip()
@@ -966,7 +969,7 @@ def execute_ai_plan(
             bbox_4326=bbox_4326,
             event_date=ev_date,
             target_crs=target_epsg,
-            resolution=max(res_m, 20),
+            resolution=max(res_m, 30 if sensor == SENSOR_LANDSAT else 10),
             search_window_days=60,
             lang=lang,
             progress_cb=lambda f, m: _prog(0.15 + 0.80 * f, m),
@@ -1004,7 +1007,7 @@ def execute_ai_plan(
                 if lang == "sl"
                 else "No scenes found for the requested time series period and location."
             )
-        # Cap to 24 dates for crisp Streamlit Cloud responsiveness
+        # Cap to 24 dates for crisp responsiveness
         if len(items) > 24:
             pick_idx = np.linspace(0, len(items) - 1, 24, dtype=int)
             items = [items[i] for i in pick_idx]
@@ -1017,7 +1020,7 @@ def execute_ai_plan(
             bbox_4326=bbox_4326,
             index_name=plan["index_name"],
             target_epsg=target_epsg,
-            resolution=max(res_m, 30 if sensor == SENSOR_LANDSAT else 20),
+            resolution=max(res_m, 30 if sensor == SENSOR_LANDSAT else 10),
             mask_clouds=(sensor != SENSOR_S1),
             progress_callback=_ts_cb,
             sensor=sensor,

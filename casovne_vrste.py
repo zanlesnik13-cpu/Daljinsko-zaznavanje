@@ -1,8 +1,9 @@
 """Memory-safe multi-sensor time-series extraction and pixel-aligned change detection.
 
 Supports Sentinel-2 L2A, Landsat C2 L2 (1984–present), and Sentinel-1 SAR RTC,
-processing strictly one epoch in RAM at a time (Streamlit Cloud 1 GB RAM safe)
-and supporting exact polygon clipping (`rioxarray.rio.clip`).
+streaming up to 4 satellite epochs in parallel via ``ThreadPoolExecutor(max_workers=4)``
+with batch ``gc.collect()`` (16 GB RAM Hugging Face Spaces profile) and exact polygon
+clipping (``rioxarray.rio.clip``).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import io
 import logging
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
@@ -222,11 +224,12 @@ def extract_time_series(
 ) -> pd.DataFrame:
     """Extract a multi-temporal index or SAR backscatter time series with smart AOI cloud fallback.
 
-    For each temporal bucket, evaluates candidate #1's actual AOI cloud-free valid pixel %
-    (using Sentinel-2 ``SCL`` or Landsat ``QA_PIXEL``). If candidate #1 fails the
-    ``min_swath_coverage_pct`` (default 85%) or ``min_valid_pct`` (default 75%) check,
-    automatically tries candidates #2, #3, and #4 from the same time bucket until a
-    genuinely cloud-free observation over the AOI is found.
+    Streams up to 4 temporal buckets in parallel using ``ThreadPoolExecutor(max_workers=4)``
+    (with batch ``gc.collect()`` and chronological re-sorting). For each temporal bucket,
+    evaluates candidate #1's actual AOI cloud-free valid pixel % (using Sentinel-2 ``SCL``
+    or Landsat ``QA_PIXEL``). If candidate #1 fails ``min_swath_coverage_pct`` (default 85%)
+    or ``min_valid_pct`` (default 75%), automatically tries candidates #2–#4 from the same
+    time bucket until a genuinely cloud-free observation over the AOI is found.
     """
     idx_key = index_name.strip().upper()
     use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
@@ -238,13 +241,12 @@ def extract_time_series(
     skipped_epochs: list[dict[str, Any]] = []
     replaced_epochs: list[dict[str, Any]] = []
 
-    for step, primary_items in enumerate(epoch_groups):
+    def _process_epoch(
+        step: int,
+        primary_items: list[pystac.Item],
+    ) -> tuple[int, str, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
         _, prim_date_str, prim_scene_id, _, _ = _group_metadata(primary_items, sensor=sensor)
-        if progress_callback is not None:
-            progress_callback(step, total, prim_date_str)
-
         bucket_cands = _resolve_bucket_candidates(primary_items, sensor, candidates_by_date)
-        accepted = False
         first_fail_reason = "low_valid_pixels"
         first_fail_pct = 0.0
 
@@ -278,7 +280,7 @@ def extract_time_series(
                     )
                     continue
 
-                masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
+                masked_ds, _clear_pct = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
                 layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=idx_key)
                 stats = compute_index_stats(layer_da, resolution_m=float(resolution))
 
@@ -297,36 +299,33 @@ def extract_time_series(
                     )
                     continue
 
-                rows.append(
-                    {
-                        "date": pd.Timestamp(dt_utc),
-                        "date_str": date_str,
-                        "scene_id": str(ds.attrs.get("scene_id", scene_id)),
-                        "platform": str(ds.attrs.get("platform", platform)),
-                        "mgrs_tile": str(ds.attrs.get("mgrs_tile", "")),
-                        "cloud_cover": cloud_cover,
-                        "mean": stats["mean"],
-                        "median": stats["median"],
-                        "std": stats["std"],
-                        "p10": stats["p10"],
-                        "p90": stats["p90"],
-                        "min": stats["min"],
-                        "max": stats["max"],
-                        "valid_pct": valid_pct,
-                        "valid_pixels": stats["valid_pixels"],
-                        "valid_area_ha": stats["valid_area_ha"],
-                    }
-                )
+                row = {
+                    "date": pd.Timestamp(dt_utc),
+                    "date_str": date_str,
+                    "scene_id": str(ds.attrs.get("scene_id", scene_id)),
+                    "platform": str(ds.attrs.get("platform", platform)),
+                    "mgrs_tile": str(ds.attrs.get("mgrs_tile", "")),
+                    "cloud_cover": cloud_cover,
+                    "mean": stats["mean"],
+                    "median": stats["median"],
+                    "std": stats["std"],
+                    "p10": stats["p10"],
+                    "p90": stats["p90"],
+                    "min": stats["min"],
+                    "max": stats["max"],
+                    "valid_pct": valid_pct,
+                    "valid_pixels": stats["valid_pixels"],
+                    "valid_area_ha": stats["valid_area_ha"],
+                }
+                replaced_entry = None
                 if cand_idx > 0:
-                    replaced_epochs.append(
-                        {
-                            "orig_date": prim_date_str,
-                            "used_date": date_str,
-                            "orig_valid_pct": round(first_fail_pct, 1),
-                            "used_valid_pct": round(valid_pct, 1),
-                            "candidate_rank": cand_idx + 1,
-                        }
-                    )
+                    replaced_entry = {
+                        "orig_date": prim_date_str,
+                        "used_date": date_str,
+                        "orig_valid_pct": round(first_fail_pct, 1),
+                        "used_valid_pct": round(valid_pct, 1),
+                        "candidate_rank": cand_idx + 1,
+                    }
                     logger.info(
                         "Replaced cloudy epoch %s (%.1f%%) with clear candidate #%d: %s (%.1f%% clear).",
                         prim_date_str,
@@ -335,28 +334,65 @@ def extract_time_series(
                         date_str,
                         valid_pct,
                     )
-                accepted = True
-                break
+                return step, date_str, row, replaced_entry, None
             except Exception as exc:
                 if cand_idx == 0:
                     first_fail_reason = str(exc)
                 logger.warning("Failed candidate #%d %s (%s): %s", cand_idx + 1, date_str, scene_id, exc)
             finally:
                 del ds, masked_ds, layer_da
-                gc.collect()
 
-        if not accepted:
-            skipped_epochs.append(
-                {
-                    "date_str": prim_date_str,
-                    "scene_id": prim_scene_id,
-                    "valid_pct": round(first_fail_pct, 1),
-                    "reason": first_fail_reason,
+        skipped_entry = {
+            "date_str": prim_date_str,
+            "scene_id": prim_scene_id,
+            "valid_pct": round(first_fail_pct, 1),
+            "reason": first_fail_reason,
+        }
+        return step, prim_date_str, None, None, skipped_entry
+
+    if total > 0:
+        batch_size = 4
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+            for batch_start in range(0, total, batch_size):
+                batch = epoch_groups[batch_start : batch_start + batch_size]
+                future_map = {
+                    executor.submit(_process_epoch, batch_start + offset, grp): (batch_start + offset, grp)
+                    for offset, grp in enumerate(batch)
                 }
-            )
+                for fut in as_completed(future_map):
+                    step_idx, orig_grp = future_map[fut]
+                    completed += 1
+                    try:
+                        _step, done_date, row, rep_entry, skip_entry = fut.result()
+                        if row is not None:
+                            rows.append(row)
+                        if rep_entry is not None:
+                            replaced_epochs.append(rep_entry)
+                        if skip_entry is not None:
+                            skipped_epochs.append(skip_entry)
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, done_date)
+                    except Exception as exc:
+                        _, err_date, err_id, _, _ = _group_metadata(orig_grp, sensor=sensor)
+                        logger.warning("Time-series worker failed for %s (%s): %s", err_date, err_id, exc)
+                        skipped_epochs.append(
+                            {
+                                "date_str": err_date,
+                                "scene_id": err_id,
+                                "valid_pct": 0.0,
+                                "reason": str(exc),
+                            }
+                        )
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, err_date)
+                gc.collect()
 
     if progress_callback is not None:
         progress_callback(total, total, "done")
+
+    skipped_epochs.sort(key=lambda d: str(d.get("date_str", "")))
+    replaced_epochs.sort(key=lambda d: str(d.get("orig_date", "")))
 
     if rows:
         df = pd.DataFrame(rows, columns=TIME_SERIES_COLUMNS).sort_values("date").reset_index(drop=True)
@@ -368,6 +404,7 @@ def extract_time_series(
     df.attrs["skipped_epochs"] = skipped_epochs
     df.attrs["replaced_epochs"] = replaced_epochs
     df.attrs["total_requested"] = total
+    gc.collect()
     return df
 
 
@@ -805,8 +842,10 @@ def generate_timelapse_frames(
     min_swath_coverage_pct: float = 85.0,
     candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
 ) -> dict[str, Any]:
-    """Generate a memory-safe visual timelapse with AOI-level cloud checking and 4-candidate fallback.
+    """Generate a visual timelapse with 4-thread parallel streaming and 4-candidate AOI cloud fallback.
 
+    Streams up to 4 satellite dates in parallel via ``ThreadPoolExecutor(max_workers=4)``
+    with batch ``gc.collect()`` and chronological re-sorting before GIF compilation.
     Evaluates actual cloud-free pixel % inside the AOI (even for RGB / NIR frames via
     Sentinel-2 ``SCL`` or Landsat ``QA_PIXEL``). If candidate #1 has ``< min_valid_pct``
     (default 75%) cloud-free pixels over the AOI, automatically tries candidates #2–#4
@@ -842,15 +881,13 @@ def generate_timelapse_frames(
     frames: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     replaced: list[dict[str, Any]] = []
-    target_pil_size: tuple[int, int] | None = None
 
-    for step, primary_items in enumerate(epoch_groups):
+    def _process_tl_epoch(
+        step: int,
+        primary_items: list[pystac.Item],
+    ) -> tuple[int, str, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
         _, prim_date_str, prim_scene_id, _, _ = _group_metadata(primary_items, sensor=sensor)
-        if progress_callback is not None:
-            progress_callback(step, total, prim_date_str)
-
         bucket_cands = _resolve_bucket_candidates(primary_items, sensor, candidates_by_date)
-        accepted = False
         first_fail_reason = "low_valid_pixels"
         first_fail_pct = 0.0
 
@@ -902,9 +939,7 @@ def generate_timelapse_frames(
                     y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64)
                     rgb_u8 = _stretch_rgb_for_pil(ds, render_bands, y_coords)
                     img = Image.fromarray(rgb_u8, mode="RGB")
-                    img = _resize_pil_frame(img, max_width=max_width, target_size=target_pil_size)
-                    if target_pil_size is None:
-                        target_pil_size = img.size
+                    img = _resize_pil_frame(img, max_width=max_width, target_size=None)
                     img = _stamp_banner_on_pil(img, stamp)
                 else:
                     masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
@@ -925,58 +960,92 @@ def generate_timelapse_frames(
                         vmax=float(spec["vmax"]),
                         stamp_text=stamp,
                         max_width=max_width,
-                        target_size=target_pil_size,
+                        target_size=None,
                     )
-                    if target_pil_size is None:
-                        target_pil_size = img.size
 
-                frames.append(
-                    {
-                        "date_str": date_str,
-                        "platform": platform_lbl,
-                        "scene_id": merged_scene_id,
-                        "valid_pct": round(valid_pct, 1),
-                        "png_bytes": pil_to_png_bytes(img),
-                    }
-                )
+                frame_entry = {
+                    "date_str": date_str,
+                    "platform": platform_lbl,
+                    "scene_id": merged_scene_id,
+                    "valid_pct": round(valid_pct, 1),
+                    "png_bytes": pil_to_png_bytes(img),
+                }
+                replaced_entry = None
                 if cand_idx > 0:
-                    replaced.append(
-                        {
-                            "orig_date": prim_date_str,
-                            "used_date": date_str,
-                            "orig_valid_pct": round(first_fail_pct, 1),
-                            "used_valid_pct": round(valid_pct, 1),
-                            "candidate_rank": cand_idx + 1,
-                        }
-                    )
-                accepted = True
-                break
+                    replaced_entry = {
+                        "orig_date": prim_date_str,
+                        "used_date": date_str,
+                        "orig_valid_pct": round(first_fail_pct, 1),
+                        "used_valid_pct": round(valid_pct, 1),
+                        "candidate_rank": cand_idx + 1,
+                    }
+                return step, date_str, frame_entry, replaced_entry, None
             except Exception as exc:
                 if cand_idx == 0:
                     first_fail_reason = str(exc)
                 logger.warning("Timelapse candidate #%d %s (%s) failed: %s", cand_idx + 1, date_str, scene_id, exc)
             finally:
                 del ds, masked_ds, layer_da, img
-                gc.collect()
 
-        if not accepted:
-            skipped.append(
-                {
-                    "date_str": prim_date_str,
-                    "scene_id": prim_scene_id,
-                    "valid_pct": round(first_fail_pct, 1),
-                    "reason": first_fail_reason,
+        skipped_entry = {
+            "date_str": prim_date_str,
+            "scene_id": prim_scene_id,
+            "valid_pct": round(first_fail_pct, 1),
+            "reason": first_fail_reason,
+        }
+        return step, prim_date_str, None, None, skipped_entry
+
+    if total > 0:
+        batch_size = 4
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+            for batch_start in range(0, total, batch_size):
+                batch = epoch_groups[batch_start : batch_start + batch_size]
+                future_map = {
+                    executor.submit(_process_tl_epoch, batch_start + offset, grp): (batch_start + offset, grp)
+                    for offset, grp in enumerate(batch)
                 }
-            )
+                for fut in as_completed(future_map):
+                    _step_idx, orig_grp = future_map[fut]
+                    completed += 1
+                    try:
+                        _step, done_date, frame_entry, rep_entry, skip_entry = fut.result()
+                        if frame_entry is not None:
+                            frames.append(frame_entry)
+                        if rep_entry is not None:
+                            replaced.append(rep_entry)
+                        if skip_entry is not None:
+                            skipped.append(skip_entry)
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, done_date)
+                    except Exception as exc:
+                        _, err_date, err_id, _, _ = _group_metadata(orig_grp, sensor=sensor)
+                        logger.warning("Timelapse worker failed for %s (%s): %s", err_date, err_id, exc)
+                        skipped.append(
+                            {
+                                "date_str": err_date,
+                                "scene_id": err_id,
+                                "valid_pct": 0.0,
+                                "reason": str(exc),
+                            }
+                        )
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, err_date)
+                gc.collect()
 
     if progress_callback is not None:
         progress_callback(total, total, "done")
+
+    frames.sort(key=lambda f: str(f.get("date_str", "")))
+    skipped.sort(key=lambda d: str(d.get("date_str", "")))
+    replaced.sort(key=lambda d: str(d.get("orig_date", "")))
 
     gif_bytes = (
         compile_timelapse_gif([f["png_bytes"] for f in frames], duration_ms=duration_ms)
         if frames
         else b""
     )
+    gc.collect()
 
     return {
         "frames": frames,
@@ -1144,7 +1213,8 @@ def compute_cloud_free_composite(
 ) -> tuple[xr.Dataset | xr.DataArray | None, dict[str, Any]]:
     """Compute a pixel-wise cloud-free median composite across up to ``max_scenes`` clearest dates.
 
-    Streams strictly one same-day mosaicked acquisition at a time (1 GB RAM safe),
+    Streams up to 4 same-day mosaicked acquisitions in parallel via
+    ``ThreadPoolExecutor(max_workers=4)`` with batch ``gc.collect()`` (16 GB RAM safe),
     applies Sentinel-2 SCL or Landsat ``QA_PIXEL`` cloud/shadow masking, aligns
     every epoch to the reference pixel grid, and computes the per-pixel ``nanmedian``.
 
@@ -1181,14 +1251,13 @@ def compute_cloud_free_composite(
     dates_used: list[str] = []
     skipped_dates: list[dict[str, Any]] = []
 
-    for step, day_items in enumerate(selected_groups):
+    def _load_comp_epoch(
+        step: int,
+        day_items: list[pystac.Item],
+    ) -> tuple[int, str, str, xr.Dataset | xr.DataArray | None, dict[str, Any] | None]:
         _, date_str, scene_id, _, _ = _group_metadata(day_items, sensor=sensor)
-        if progress_callback is not None:
-            progress_callback(step, total, date_str)
-
         ds: xr.Dataset | None = None
         masked_ds: xr.Dataset | None = None
-        layer_da: xr.DataArray | None = None
         try:
             ds = load_scene(
                 sensor=sensor,
@@ -1199,43 +1268,120 @@ def compute_cloud_free_composite(
                 resolution=float(resolution),
                 aoi_polygon_4326=aoi_polygon_4326,
             )
-            masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=True)
+            masked_ds, clear_pct = apply_cloud_mask(ds, mask_clouds=True, sensor=sensor)
             if clear_pct < float(min_valid_pct):
-                skipped_dates.append(
-                    {"date_str": date_str, "scene_id": scene_id, "valid_pct": round(clear_pct, 1), "reason": "cloudy"}
+                return (
+                    step,
+                    date_str,
+                    scene_id,
+                    None,
+                    {
+                        "date_str": date_str,
+                        "scene_id": scene_id,
+                        "valid_pct": round(clear_pct, 1),
+                        "reason": "cloudy",
+                    },
                 )
-                continue
-
             if is_rgb_nir:
-                if ref_da is None:
-                    ref_da = masked_ds[COMPOSITE_RGB_NIR_BANDS[0]].copy()
-                    ref_crs = masked_ds.rio.crs or ref_da.rio.crs
-                for b in COMPOSITE_RGB_NIR_BANDS:
-                    da_b = masked_ds[b]
-                    if not _grids_match(ref_da, da_b):
-                        da_b = da_b.rio.reproject_match(ref_da, resampling=Resampling.bilinear, nodata=np.nan)
-                    band_stacks[b].append(da_b.values.astype(np.float32, copy=True))
-            else:
-                layer_da = compute_index(masked_ds, mode_key)
-                if ref_da is None:
-                    ref_da = layer_da.copy()
-                    ref_crs = layer_da.rio.crs or masked_ds.rio.crs
-                elif not _grids_match(ref_da, layer_da):
-                    layer_da = layer_da.rio.reproject_match(ref_da, resampling=Resampling.bilinear, nodata=np.nan)
-                band_stacks[mode_key].append(layer_da.values.astype(np.float32, copy=True))
-
-            dates_used.append(date_str)
+                keep_ds = masked_ds[list(COMPOSITE_RGB_NIR_BANDS)]
+                if masked_ds.rio.crs is not None:
+                    keep_ds = keep_ds.rio.write_crs(masked_ds.rio.crs, inplace=False)
+                return step, date_str, scene_id, keep_ds, None
+            layer_da = compute_index(masked_ds, mode_key)
+            return step, date_str, scene_id, layer_da, None
         except Exception as exc:
             logger.warning("Composite skipped %s (%s): %s", date_str, scene_id, exc)
-            skipped_dates.append(
-                {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)}
+            return (
+                step,
+                date_str,
+                scene_id,
+                None,
+                {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)},
             )
         finally:
-            del ds, masked_ds, layer_da
-            gc.collect()
+            del ds, masked_ds
+
+    if total > 0:
+        batch_size = 4
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+            for batch_start in range(0, total, batch_size):
+                batch = selected_groups[batch_start : batch_start + batch_size]
+                future_map = {
+                    executor.submit(_load_comp_epoch, batch_start + offset, grp): (batch_start + offset, grp)
+                    for offset, grp in enumerate(batch)
+                }
+                batch_results: list[
+                    tuple[int, str, str, xr.Dataset | xr.DataArray | None, dict[str, Any] | None]
+                ] = []
+                for fut in as_completed(future_map):
+                    step_idx, orig_grp = future_map[fut]
+                    completed += 1
+                    try:
+                        res = fut.result()
+                        batch_results.append(res)
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, res[1])
+                    except Exception as exc:
+                        _, err_date, err_id, _, _ = _group_metadata(orig_grp, sensor=sensor)
+                        logger.warning("Composite worker failed %s (%s): %s", err_date, err_id, exc)
+                        batch_results.append(
+                            (
+                                step_idx,
+                                err_date,
+                                err_id,
+                                None,
+                                {"date_str": err_date, "scene_id": err_id, "valid_pct": 0.0, "reason": str(exc)},
+                            )
+                        )
+                        if progress_callback is not None:
+                            progress_callback(min(completed, total), total, err_date)
+
+                # Process completed batch in chronological order so ref_da is deterministic
+                batch_results.sort(key=lambda item: item[0])
+                for _step, date_str, scene_id, payload, skip_entry in batch_results:
+                    if skip_entry is not None or payload is None:
+                        if skip_entry is not None:
+                            skipped_dates.append(skip_entry)
+                        continue
+                    try:
+                        if is_rgb_nir:
+                            assert isinstance(payload, xr.Dataset)
+                            if ref_da is None:
+                                ref_da = payload[COMPOSITE_RGB_NIR_BANDS[0]].copy()
+                                ref_crs = payload.rio.crs or ref_da.rio.crs
+                            for b in COMPOSITE_RGB_NIR_BANDS:
+                                da_b = payload[b]
+                                if not _grids_match(ref_da, da_b):
+                                    da_b = da_b.rio.reproject_match(
+                                        ref_da, resampling=Resampling.bilinear, nodata=np.nan
+                                    )
+                                band_stacks[b].append(da_b.values.astype(np.float32, copy=True))
+                        else:
+                            assert isinstance(payload, xr.DataArray)
+                            layer_da = payload
+                            if ref_da is None:
+                                ref_da = layer_da.copy()
+                                ref_crs = layer_da.rio.crs
+                            elif not _grids_match(ref_da, layer_da):
+                                layer_da = layer_da.rio.reproject_match(
+                                    ref_da, resampling=Resampling.bilinear, nodata=np.nan
+                                )
+                            band_stacks[mode_key].append(layer_da.values.astype(np.float32, copy=True))
+                        dates_used.append(date_str)
+                    except Exception as exc:
+                        logger.warning("Composite alignment skipped %s (%s): %s", date_str, scene_id, exc)
+                        skipped_dates.append(
+                            {"date_str": date_str, "scene_id": scene_id, "valid_pct": 0.0, "reason": str(exc)}
+                        )
+                del batch_results
+                gc.collect()
 
     if progress_callback is not None:
         progress_callback(total, total, "done")
+
+    dates_used.sort()
+    skipped_dates.sort(key=lambda d: str(d.get("date_str", "")))
 
     if not dates_used or ref_da is None:
         return None, {

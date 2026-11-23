@@ -17,8 +17,10 @@ EPSG:3794 (D96/TM) or EPSG:32633 (UTM 33N) grids with optional polygon clipping.
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import re
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence, Union
 
@@ -40,6 +42,23 @@ from shapely.geometry import shape as shapely_shape
 from shapely.ops import unary_union as shapely_unary_union
 
 from geodezija_crs import clip_to_aoi_polygon
+
+logger = logging.getLogger(__name__)
+
+try:
+    import streamlit as _st
+
+    _cache_data = _st.cache_data
+except Exception:  # pragma: no cover - fallback when streamlit is not installed
+
+    def _cache_data(**_kwargs: Any):  # type: ignore[misc]
+        def _decorator(fn: Any) -> Any:
+            return fn
+
+        return _decorator
+
+_ODC_RIO_LOCK = threading.Lock()
+_ODC_RIO_CONFIGURED: bool = False
 
 STAC_API_URL: str = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
@@ -182,23 +201,30 @@ def _normalize_crs_str(target_epsg: int | str) -> str:
 
 
 def _configure_odc_rio() -> None:
-    """Configure odc-stac GDAL/rasterio options for fast, RAM-safe COG streaming."""
-    gdal_env_opts: dict[str, object] = {
-        "GDAL_HTTP_MAX_RETRY": "5",
-        "GDAL_HTTP_RETRY_DELAY": "2",
-        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-        "GDAL_CACHEMAX": 64,
-    }
-    ca_bundle = (
-        os.environ.get("GDAL_CURL_CA_BUNDLE")
-        or os.environ.get("CURL_CA_BUNDLE")
-        or os.environ.get("SSL_CERT_FILE")
-    )
-    if ca_bundle and os.path.exists(ca_bundle):
-        os.environ.setdefault("GDAL_CURL_CA_BUNDLE", ca_bundle)
-        gdal_env_opts["GDAL_CURL_CA_BUNDLE"] = ca_bundle
+    """Configure odc-stac GDAL/rasterio options once (thread-safe) for fast COG streaming."""
+    global _ODC_RIO_CONFIGURED
+    if _ODC_RIO_CONFIGURED:
+        return
+    with _ODC_RIO_LOCK:
+        if _ODC_RIO_CONFIGURED:
+            return
+        gdal_env_opts: dict[str, object] = {
+            "GDAL_HTTP_MAX_RETRY": "5",
+            "GDAL_HTTP_RETRY_DELAY": "2",
+            "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+            "GDAL_CACHEMAX": 256,
+        }
+        ca_bundle = (
+            os.environ.get("GDAL_CURL_CA_BUNDLE")
+            or os.environ.get("CURL_CA_BUNDLE")
+            or os.environ.get("SSL_CERT_FILE")
+        )
+        if ca_bundle and os.path.exists(ca_bundle):
+            os.environ.setdefault("GDAL_CURL_CA_BUNDLE", ca_bundle)
+            gdal_env_opts["GDAL_CURL_CA_BUNDLE"] = ca_bundle
 
-    odc.stac.configure_rio(cloud_defaults=True, **gdal_env_opts)
+        odc.stac.configure_rio(cloud_defaults=True, **gdal_env_opts)
+        _ODC_RIO_CONFIGURED = True
 
 
 def _extract_item_datetime_utc(item: pystac.Item) -> datetime:
@@ -1418,6 +1444,7 @@ def load_sentinel1_scene(
 # ---------------------------------------------------------------------------
 # 4. UNIFIED MULTI-SENSOR DISPATCHERS
 # ---------------------------------------------------------------------------
+@_cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def search_scenes(
     sensor: str,
     bbox_4326: Sequence[float],
@@ -1507,6 +1534,7 @@ def load_scene(
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")
 
 
+@_cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def load_copernicus_dem(
     bbox_4326: Sequence[float],
     target_epsg: int | str = "EPSG:3794",

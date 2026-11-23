@@ -67,6 +67,20 @@ TERRAIN_LAYER_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+try:
+    import streamlit as _st
+
+    _cache_data = _st.cache_data
+except Exception:  # pragma: no cover - fallback when streamlit is not installed
+
+    def _cache_data(**_kwargs: Any):  # type: ignore[misc]
+        def _decorator(fn: Any) -> Any:
+            return fn
+
+        return _decorator
+
+
+@_cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def load_copernicus_dem(
     bbox_4326: Sequence[float],
     target_epsg: int | str = CRS_D96TM,
