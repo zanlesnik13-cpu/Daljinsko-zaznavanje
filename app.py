@@ -89,6 +89,7 @@ from ai_pomocnik import (
     parse_eo_request,
     resolve_gemini_model_id,
     route_user_message,
+    verify_gemini_api_connection,
 )
 from analize import (
     OPTICAL_SIGNATURE_BANDS,
@@ -221,6 +222,10 @@ st.markdown(
     --geo-surface: #FFFFFF;
     --geo-bg: #F8FAFC;
     --geo-radius: 8px;
+}
+
+html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"], section.main, [data-testid="stChatMessageContainer"] {
+    overflow-anchor: none !important;
 }
 
 .block-container {
@@ -993,6 +998,7 @@ def _init_session_state() -> None:
         "ai_chat_results": {},
         "ai_last_analysis_context": None,
         "ai_pending_chat_prompt": None,
+        "ai_api_verify_result": None,
         # Tab 7 GNSS Mission Planning state
         "tab7_gnss_result": None,
         # Resolution guard
@@ -1489,9 +1495,16 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
             }
         )
 
-    # 7. Tab 6: AI EO Assistant Raster Output (Disaster / Spectral Index / RGB Scene)
+    # 7. Tab 6: AI EO Assistant Raster Output (all spatial AI analyses)
     ai_res = st.session_state.get("tab6_ai_result")
-    if isinstance(ai_res, dict) and ai_res.get("kind") in ("disaster", "spectral_index", "scene_rgb"):
+    if isinstance(ai_res, dict) and ai_res.get("kind") in (
+        "disaster",
+        "spectral_index",
+        "scene_rgb",
+        "cloud_free_composite",
+        "change_comparison",
+        "terrain_dem",
+    ):
         ai_plan = ai_res["plan"]
         ai_place = str(ai_plan.get("place_name", "AOI"))
         ai_crs = str(ai_res.get("crs", CRS_D96TM))
@@ -1599,6 +1612,116 @@ def _collect_carto_sources(lang: str) -> list[dict[str, Any]]:
                     "tif_bytes": ai_res.get("tif_bytes"),
                     "tif_filename": ai_res.get("tif_filename") or f"AI_RGB_{ai_place}.tif",
                     "file_stem": f"AI_RGB_{ai_place}_{ai_res.get('date_str', '')}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
+        elif ai_kind == "cloud_free_composite":
+            cm = ai_res.get("composite_meta") or {}
+            d_span = f"{cm.get('date_start', '')} → {cm.get('date_end', '')}"
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"Composite RGB — {ai_place} ({d_span})"),
+                    "raster": ai_res["scene_ds"],
+                    "crs": ai_crs,
+                    "is_rgb": True,
+                    "bands": ai_res.get("bands", ["B04", "B03", "B02"]),
+                    "use_percentile_stretch": True,
+                    "gamma": 1.0,
+                    "cmap_name": "Greys_r",
+                    "vmin": 0.0,
+                    "vmax": 1.0,
+                    "discrete_items": None,
+                    "legend_title": "Cloud-Free Median RGB",
+                    "legend_units": "",
+                    "stats_summary": [
+                        ("Posnetki" if lang == "sl" else "Scenes", f"{cm.get('scenes_used', 0)}"),
+                        (t("m_valid_ha", lang=lang), f"{float(cm.get('valid_area_ha', 0.0)):,.1f} ha"),
+                    ],
+                    "default_title": f"Brezoblačni mozaik — {ai_place}" if lang == "sl" else f"Cloud-Free Composite — {ai_place}",
+                    "default_subtitle": f"{ai_sensor_cfg['short_name']} | {d_span}",
+                    "sensor_label": ai_sensor_cfg["short_name"],
+                    "date_label": d_span,
+                    "resolution_m": float(ai_plan.get("resolution_m", 10.0)),
+                    "tif_bytes": ai_res.get("tif_bytes"),
+                    "tif_filename": ai_res.get("tif_filename") or f"AI_Composite_{ai_place}.tif",
+                    "file_stem": f"AI_Composite_{ai_place}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
+        elif ai_kind == "change_comparison" and ai_res.get("index_da") is not None:
+            comp_r = ai_res.get("comparison_result") or {}
+            c_dates = comp_r.get("dates") or ["t1", "t2"]
+            d_span = f"{c_dates[0]} → {c_dates[-1]}"
+            idx_n = str(ai_plan.get("index_name", "NDVI"))
+            cs = ai_res.get("change_summary") or {}
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"Δ {idx_n} — {ai_place} ({d_span})"),
+                    "raster": ai_res["index_da"],
+                    "crs": ai_crs,
+                    "is_rgb": False,
+                    "bands": None,
+                    "use_percentile_stretch": False,
+                    "gamma": 1.0,
+                    "cmap_name": "RdBu",
+                    "vmin": -0.5 if idx_n != "LST" else -10.0,
+                    "vmax": 0.5 if idx_n != "LST" else 10.0,
+                    "discrete_items": None,
+                    "legend_title": f"Δ {idx_n}",
+                    "legend_units": "°C" if idx_n == "LST" else ("dB" if ai_plan.get("sensor") == SENSOR_S1 else ""),
+                    "stats_summary": [
+                        ("Δ Mean", f"{float(cs.get('mean', 0.0)):+.3f}"),
+                        ("+" if lang == "sl" else "Gain", f"{float(cs.get('pos_area_ha', 0.0)):,.1f} ha"),
+                        ("-" if lang == "sl" else "Loss", f"{float(cs.get('neg_area_ha', 0.0)):,.1f} ha"),
+                    ],
+                    "default_title": f"Δ {idx_n} — {ai_place}",
+                    "default_subtitle": f"{ai_sensor_cfg['short_name']} | {d_span}",
+                    "sensor_label": ai_sensor_cfg["short_name"],
+                    "date_label": d_span,
+                    "resolution_m": float(ai_plan.get("resolution_m", 10.0)),
+                    "tif_bytes": ai_res.get("tif_bytes"),
+                    "tif_filename": ai_res.get("tif_filename") or f"AI_Delta_{idx_n}_{ai_place}.tif",
+                    "file_stem": f"AI_Delta_{idx_n}_{ai_place}",
+                    "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                    "aoi_polygon_4326": None,
+                }
+            )
+        elif ai_kind == "terrain_dem" and ai_res.get("index_da") is not None:
+            ds_t = ai_res.get("dem_stats") or {}
+            min_h = float(ds_t.get("min_h", 0.0))
+            max_h = max(float(ds_t.get("max_h", 1000.0)), min_h + 10.0)
+            sources.append(
+                {
+                    "id": "tab6_ai",
+                    "label": t("carto_layer_tab6_ai", lang=lang, title=f"Copernicus DEM 30 m — {ai_place}"),
+                    "raster": ai_res["index_da"],
+                    "crs": ai_crs,
+                    "is_rgb": False,
+                    "bands": None,
+                    "use_percentile_stretch": False,
+                    "gamma": 1.0,
+                    "cmap_name": "terrain",
+                    "vmin": min_h,
+                    "vmax": max_h,
+                    "discrete_items": None,
+                    "legend_title": "Nadmorska višina" if lang == "sl" else "Elevation",
+                    "legend_units": "m",
+                    "stats_summary": [
+                        ("Min–Max", f"{min_h:,.0f}–{max_h:,.0f} m"),
+                        ("Naklon" if lang == "sl" else "Mean Slope", f"{float(ds_t.get('mean_slope_deg', 0.0)):.1f}°"),
+                    ],
+                    "default_title": f"Copernicus DEM 30 m — {ai_place}",
+                    "default_subtitle": "Copernicus GLO-30 | 30 m",
+                    "sensor_label": "Copernicus DEM 30 m",
+                    "date_label": "GLO-30",
+                    "resolution_m": 30.0,
+                    "tif_bytes": ai_res.get("tif_bytes"),
+                    "tif_filename": ai_res.get("tif_filename") or f"AI_DEM30m_{ai_place}.tif",
+                    "file_stem": f"AI_DEM30m_{ai_place}",
                     "aoi_bbox_4326": ai_res.get("bbox_4326"),
                     "aoi_polygon_4326": None,
                 }
@@ -5797,10 +5920,12 @@ def _render_ai_chat_analysis_fragment(
     target_crs: str,
     lang: str,
 ) -> None:
-    """Fragment za prikaz rezultatov satelitske analize znotraj klepetalnega mehurčka AI agenta.
+    """Fragment za prikaz rezultatov satelitske/geodetske analize znotraj klepetalnega mehurčka AI agenta.
 
-    Vključuje kompakten povzetek geodetskega načrta, KPI metrike, dvoslojni interaktivni zemljevid
-    (ločeno preklopljiv satelitski posnetek + sloj analize/sprememb), izvoz GeoTIFF/CSV ter prenos v Kartografijo.
+    Podpira vseh 10 zmožnosti aplikacije (poplave, požari, gozd, spektralni indeksi + NDSI snežna meja + LST,
+    RGB/SAR prizori, brezoblačni mozaik, časovne vrste, primerjava Prej/Potem s poteznico, Copernicus DEM 30 m
+    + višinski profil, načrtovanje GNSS izmere). Zemljevidi se izrišejo prek ``components.html`` brez
+    dvosmernega ``st_folium`` povratnega klica, da drsenje strani nikoli ne skače.
     """
     results_store: dict[str, Any] = st.session_state.get("ai_chat_results") or {}
     ai_res_show: dict[str, Any] | None = results_store.get(result_id)
@@ -5818,10 +5943,15 @@ def _render_ai_chat_analysis_fragment(
     fb_note = pl.get("fallback_note_en" if lang == "en" else "fallback_note_sl") or ""
     period_txt = (
         pl["event_date"]
-        if pl["task_type"].startswith("disaster_")
-        else f"{pl['start_date']} → {pl['end_date']}"
+        if pl["task_type"].startswith("disaster_") or pl["task_type"] == "gnss_plan"
+        else ("Copernicus GLO-30" if pl["task_type"] == "terrain_dem" else f"{pl['start_date']} → {pl['end_date']}")
     )
-    ai_sensor_short = SENSOR_META.get(pl["sensor"], SENSOR_META[SENSOR_S2])["short_name"]
+    if ai_kind_show == "terrain_dem":
+        ai_sensor_short = "Copernicus DEM 30 m"
+    elif ai_kind_show == "gnss_plan":
+        ai_sensor_short = "GPS + Galileo + GLONASS"
+    else:
+        ai_sensor_short = SENSOR_META.get(pl["sensor"], SENSOR_META[SENSOR_S2])["short_name"]
 
     # 1. Compact Geodetic Plan Pills (cartographic teal & slate, zero purple)
     plan_pills_html = (
@@ -5839,7 +5969,7 @@ def _render_ai_chat_analysis_fragment(
 
     basemap_now = str(st.session_state.get("map_basemap", "satellite"))
 
-    # 2. Task-specific KPI Row + Dual-Layer Interactive Slippy Map (or Time Series Chart)
+    # 2. Task-specific KPI Row + Static-HTML Interactive Leaflet Map (or Plotly Chart)
     if ai_kind_show == "disaster":
         d_obj = ai_res_show["disaster_result"]
         d_sum = d_obj["summary"]
@@ -5939,13 +6069,7 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        st_folium(
-            slippy_ai,
-            height=540,
-            use_container_width=True,
-            returned_objects=[],
-            key=f"ai_chat_dis_map_{result_id}_{ai_op_d}_{basemap_now}",
-        )
+        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
         st.caption(t("ai_layer_toggle_hint"))
 
     elif ai_kind_show == "spectral_index":
@@ -5957,11 +6081,33 @@ def _render_ai_chat_analysis_fragment(
             if is_sar_ai
             else SPECTRAL_INDICES.get(idx_n, SPECTRAL_INDICES["NDVI"])
         )
+        units_s = str(spec_ai.get("units") or "")
+        unit_suf = f" {units_s}" if units_s else ""
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(t("col_date"), str(ai_res_show["date_str"]))
-        m2.metric("Povprečje" if lang == "sl" else "Mean", f"{st_ai['mean']:.3f}")
+        m2.metric("Povprečje" if lang == "sl" else "Mean", f"{st_ai['mean']:.3f}{unit_suf}")
         m3.metric(t("m_valid_ha"), f"{st_ai['valid_area_ha']:,.2f} ha")
         m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+        # NDSI Snow / Glacier + DEM Snowline KPIs when available
+        snow_st = ai_res_show.get("snow_stats")
+        if isinstance(snow_st, dict):
+            s1, s2, s3 = st.columns(3)
+            s1.metric(
+                "❄️ Površina snega/ledu" if lang == "sl" else "❄️ Snow / Ice Area",
+                f"{float(snow_st.get('snow_area_ha', 0.0)):,.1f} ha",
+                delta=f"{float(snow_st.get('snow_area_km2', 0.0)):.2f} km²",
+                delta_color="off",
+            )
+            s2.metric(
+                "❄️ Delež AOI" if lang == "sl" else "❄️ Snow Cover %",
+                f"{float(snow_st.get('snow_pct', 0.0)):.1f} %",
+            )
+            sl_m = snow_st.get("snowline_p10_m")
+            s3.metric(
+                "⛰️ Snežna meja (p10 DEM)" if lang == "sl" else "⛰️ Snowline (p10 DEM)",
+                f"{float(sl_m):,.0f} m" if sl_m is not None else "—",
+            )
 
         ai_op_i = st.slider(
             t("opacity_index_label"),
@@ -5977,7 +6123,7 @@ def _render_ai_chat_analysis_fragment(
                 float(spec_ai["vmin"]),
                 float(spec_ai["vmax"]),
                 label=idx_n,
-                units=spec_ai.get("units", ""),
+                units=units_s,
             ),
             unsafe_allow_html=True,
         )
@@ -6038,13 +6184,7 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        st_folium(
-            slippy_ai,
-            height=540,
-            use_container_width=True,
-            returned_objects=[],
-            key=f"ai_chat_idx_map_{result_id}_{ai_op_i}_{basemap_now}",
-        )
+        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
         st.caption(t("ai_layer_toggle_hint"))
 
     elif ai_kind_show == "scene_rgb":
@@ -6092,13 +6232,318 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        st_folium(
-            slippy_ai,
-            height=540,
-            use_container_width=True,
-            returned_objects=[],
-            key=f"ai_chat_rgb_map_{result_id}_{ai_op_r}_{basemap_now}",
+        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+
+    elif ai_kind_show == "cloud_free_composite":
+        cm = ai_res_show.get("composite_meta") or {}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Št. posnetkov" if lang == "sl" else "Scenes Used", f"{int(cm.get('scenes_used', 0))}")
+        m2.metric(t("m_valid_ha"), f"{float(cm.get('valid_area_ha', 0.0)):,.1f} ha")
+        m3.metric(
+            "Mediana opazovanj/px" if lang == "sl" else "Median Obs/px",
+            f"{float(cm.get('median_obs_per_px', 0.0)):.1f}",
         )
+        m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+        ai_op_c = st.slider(
+            t("opacity_layer_label"),
+            0,
+            100,
+            100,
+            5,
+            key=f"ai_chat_comp_op_{result_id}",
+        )
+        sat_uri = ai_res_show.get("sat_overlay_uri")
+        sat_bnds = ai_res_show.get("sat_overlay_bounds")
+        if sat_uri and sat_bnds:
+            slippy_ai = build_satellite_slippy_map(
+                center_lat=float(ai_res_show["lat"]),
+                center_lon=float(ai_res_show["lon"]),
+                zoom=None,
+                basemap_mode=basemap_now,
+                overlay_layers=[
+                    {
+                        "name": t("ai_layer_comp_rgb"),
+                        "image": sat_uri,
+                        "bounds": sat_bnds,
+                        "opacity": float(ai_op_c) / 100.0,
+                        "show": True,
+                        "zindex": 15,
+                    }
+                ],
+                aoi_bbox_4326=ai_res_show["bbox_4326"],
+                aoi_outline_label=t("slippy_aoi_outline"),
+                lang=lang,
+            )
+            components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+
+    elif ai_kind_show == "change_comparison":
+        comp_r = ai_res_show.get("comparison_result") or {}
+        cs = ai_res_show.get("change_summary") or {}
+        c_dates = comp_r.get("dates") or ["t1", "t2"]
+        c_uris = comp_r.get("overlay_uris") or []
+        c_bnds = comp_r.get("overlay_bounds") or []
+        idx_lbl = str(pl.get("index_name", "NDVI"))
+
+        for rep in comp_r.get("replacements") or []:
+            st.info(
+                t(
+                    "comp3_replaced_badge",
+                    req=rep.get("requested_date", ""),
+                    orig_pct=float(rep.get("original_clear_pct", 0.0)),
+                    act=rep.get("actual_date", ""),
+                    act_pct=float(rep.get("actual_clear_pct", 0.0)),
+                )
+            )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Datuma" if lang == "sl" else "Dates", f"{c_dates[0]} ↔ {c_dates[-1]}")
+        m2.metric(f"Δ {idx_lbl}", f"{float(cs.get('mean', 0.0)):+.3f}" if cs else "—")
+        m3.metric(
+            "Porast (+)" if lang == "sl" else "Increase (+)",
+            f"{float(cs.get('pos_area_ha', 0.0)):,.1f} ha" if cs else "—",
+        )
+        m4.metric(
+            "Upad (-)" if lang == "sl" else "Decrease (-)",
+            f"{float(cs.get('neg_area_ha', 0.0)):,.1f} ha" if cs else "—",
+        )
+
+        ai_op_chg = st.slider(
+            t("opacity_layer_label"),
+            0,
+            100,
+            95,
+            5,
+            key=f"ai_chat_chg_op_{result_id}",
+        )
+        if len(c_uris) >= 2 and len(c_bnds) >= 2:
+            swipe_html = build_zoomable_swipe_map(
+                overlay_uri_t1=c_uris[0],
+                bounds_t1=c_bnds[0],
+                overlay_uri_t2=c_uris[-1],
+                bounds_t2=c_bnds[-1],
+                label_t1=f"t1: {c_dates[0]} ({idx_lbl})",
+                label_t2=f"t2: {c_dates[-1]} ({idx_lbl})",
+                center_lat=float(ai_res_show["lat"]),
+                center_lon=float(ai_res_show["lon"]),
+                basemap_mode=basemap_now,
+                aoi_bbox_4326=ai_res_show.get("bbox_4326"),
+                aoi_bbox_3794=ai_res_show.get("bbox_3794"),
+                aoi_outline_label=t("slippy_aoi_outline"),
+                height=520,
+                opacity=float(ai_op_chg) / 100.0,
+                lang=lang,
+            )
+            components.html(swipe_html, height=540, scrolling=False)
+
+    elif ai_kind_show == "terrain_dem":
+        ds_t = ai_res_show.get("dem_stats") or {}
+        min_h = float(ds_t.get("min_h", 0.0))
+        max_h = float(ds_t.get("max_h", 0.0))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Višina (min–max)" if lang == "sl" else "Elevation (min–max)",
+            f"{min_h:,.0f}–{max_h:,.0f} m",
+        )
+        m2.metric(
+            "Povp. naklon" if lang == "sl" else "Mean Slope",
+            f"{float(ds_t.get('mean_slope_deg', 0.0)):.1f}°",
+        )
+        m3.metric(
+            "Strmina > 20°" if lang == "sl" else "Steep > 20°",
+            f"{float(ds_t.get('steep_20_ha', 0.0)):,.1f} ha",
+        )
+        m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+        ai_op_dem = st.slider(
+            t("opacity_layer_label"),
+            0,
+            100,
+            85,
+            5,
+            key=f"ai_chat_dem_op_{result_id}",
+        )
+        st.markdown(
+            build_horizontal_colorbar_html(
+                "terrain",
+                min_h,
+                max(max_h, min_h + 10.0),
+                label="Nadmorska višina" if lang == "sl" else "Elevation",
+                units="m",
+            ),
+            unsafe_allow_html=True,
+        )
+
+        dem_layers: list[dict[str, Any]] = []
+        if ai_res_show.get("dem_hill_uri") and ai_res_show.get("dem_hill_bounds"):
+            dem_layers.append(
+                {
+                    "name": t("ai_layer_dem_hillshade"),
+                    "image": ai_res_show["dem_hill_uri"],
+                    "bounds": ai_res_show["dem_hill_bounds"],
+                    "opacity": 0.90,
+                    "show": True,
+                    "zindex": 11,
+                }
+            )
+        if ai_res_show.get("dem_elev_uri") and ai_res_show.get("dem_elev_bounds"):
+            dem_layers.append(
+                {
+                    "name": t("ai_layer_dem_elev"),
+                    "image": ai_res_show["dem_elev_uri"],
+                    "bounds": ai_res_show["dem_elev_bounds"],
+                    "opacity": float(ai_op_dem) / 100.0,
+                    "show": True,
+                    "zindex": 16,
+                }
+            )
+        if ai_res_show.get("dem_slope_uri") and ai_res_show.get("dem_slope_bounds"):
+            dem_layers.append(
+                {
+                    "name": t("ai_layer_dem_slope"),
+                    "image": ai_res_show["dem_slope_uri"],
+                    "bounds": ai_res_show["dem_slope_bounds"],
+                    "opacity": float(ai_op_dem) / 100.0,
+                    "show": False,
+                    "zindex": 20,
+                }
+            )
+        if dem_layers:
+            slippy_ai = build_satellite_slippy_map(
+                center_lat=float(ai_res_show["lat"]),
+                center_lon=float(ai_res_show["lon"]),
+                zoom=None,
+                basemap_mode=basemap_now,
+                overlay_layers=dem_layers,
+                aoi_bbox_4326=ai_res_show["bbox_4326"],
+                aoi_outline_label=t("slippy_aoi_outline"),
+                lang=lang,
+            )
+            components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+            st.caption(t("ai_layer_toggle_hint"))
+
+        prof_df = ai_res_show.get("profile_df")
+        if (
+            isinstance(prof_df, pd.DataFrame)
+            and not prof_df.empty
+            and "distance_m" in prof_df.columns
+            and "elevation_m" in prof_df.columns
+        ):
+            fig_prof = go.Figure()
+            fig_prof.add_trace(
+                go.Scatter(
+                    x=prof_df["distance_m"],
+                    y=prof_df["elevation_m"],
+                    mode="lines",
+                    fill="tozeroy",
+                    fillcolor="rgba(15, 118, 110, 0.16)",
+                    line=dict(color="#0F766E", width=2.4),
+                    name="DEM [m]",
+                )
+            )
+            fig_prof.update_layout(
+                title=t("ai_profile_title"),
+                xaxis_title="Razdalja [m]" if lang == "sl" else "Distance [m]",
+                yaxis_title="Nadmorska višina [m]" if lang == "sl" else "Elevation [m a.s.l.]",
+                height=310,
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                font=dict(color="#0F172A"),
+                margin=dict(l=48, r=20, t=42, b=42),
+            )
+            st.plotly_chart(fig_prof, width="stretch", key=f"ai_chat_dem_prof_{result_id}")
+
+    elif ai_kind_show == "gnss_plan":
+        g_res = ai_res_show.get("gnss_result") or {}
+        g_sum = g_res.get("summary") or {}
+        tl_df = g_res.get("timeline_df")
+        opt_wins = g_sum.get("optimal_windows") or []
+        best_win = str(opt_wins[0]) if opt_wins else "—"
+        min_pdop = g_sum.get("min_pdop_real")
+        min_pdop_s = (
+            f"{float(min_pdop):.2f}"
+            if (min_pdop is not None and np.isfinite(float(min_pdop)))
+            else "—"
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "Vidni sateliti (real/odprto)" if lang == "sl" else "Visible Sats (real/open)",
+            f"{float(g_sum.get('avg_vis_real', 0.0)):.1f} / {float(g_sum.get('avg_vis_open', 0.0)):.1f}",
+        )
+        m2.metric("Min PDOP", min_pdop_s)
+        m3.metric(
+            "Zastrtost neba" if lang == "sl" else "Sky Obstruction",
+            f"{float(g_sum.get('sky_blocked_pct', 0.0)):.1f} %",
+        )
+        m4.metric("Optimalno okno" if lang == "sl" else "Best Window", best_win)
+
+        if isinstance(tl_df, pd.DataFrame) and not tl_df.empty:
+            fig_g = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.10,
+                subplot_titles=(
+                    "Vidnost satelitov (24 h)" if lang == "sl" else "Satellite Visibility (24 h)",
+                    "PDOP (realne ovire vs. odprto nebo)" if lang == "sl" else "PDOP (Real Obstacles vs. Open Sky)",
+                ),
+            )
+            fig_g.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["visible_open"],
+                    mode="lines",
+                    name="Odprto nebo" if lang == "sl" else "Open Sky",
+                    line=dict(color="#94A3B8", width=1.6, dash="dot"),
+                ),
+                row=1,
+                col=1,
+            )
+            fig_g.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["visible_real"],
+                    mode="lines",
+                    name="Realno (DEM+S2)" if lang == "sl" else "Real (DEM+S2)",
+                    line=dict(color="#0F766E", width=2.4),
+                    fill="tozeroy",
+                    fillcolor="rgba(15, 118, 110, 0.14)",
+                ),
+                row=1,
+                col=1,
+            )
+            fig_g.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["pdop_open"],
+                    mode="lines",
+                    name="PDOP (odprto)" if lang == "sl" else "PDOP (open)",
+                    line=dict(color="#94A3B8", width=1.4, dash="dot"),
+                ),
+                row=2,
+                col=1,
+            )
+            fig_g.add_trace(
+                go.Scatter(
+                    x=tl_df["time_str"],
+                    y=tl_df["pdop_real"],
+                    mode="lines",
+                    name="PDOP (realno)" if lang == "sl" else "PDOP (real)",
+                    line=dict(color="#DC2626", width=2.2),
+                ),
+                row=2,
+                col=1,
+            )
+            fig_g.add_hline(y=2.5, line_dash="dash", line_color="#0F766E", row=2, col=1)
+            fig_g.update_layout(
+                height=460,
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                font=dict(color="#0F172A"),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.20, xanchor="center", x=0.5),
+                margin=dict(l=48, r=20, t=42, b=52),
+            )
+            st.plotly_chart(fig_g, width="stretch", key=f"ai_chat_gnss_plotly_{result_id}")
 
     elif ai_kind_show == "time_series":
         ts_ai: pd.DataFrame = ai_res_show["ts_df"]
@@ -6149,38 +6594,41 @@ def _render_ai_chat_analysis_fragment(
         st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
 
     # 3. Export & Cartography Handoff Bar
-    if ai_kind_show == "time_series":
-        st.download_button(
-            label=t("ai_btn_dl_csv"),
-            data=ai_res_show["csv_bytes"],
-            file_name=ai_res_show["csv_filename"],
-            mime="text/csv",
-            width="stretch",
-            key=f"ai_chat_dl_csv_{result_id}",
-        )
-    else:
-        ac1, ac2 = st.columns(2)
-        with ac1:
+    if ai_kind_show in ("time_series", "gnss_plan"):
+        if ai_res_show.get("csv_bytes"):
             st.download_button(
-                label=t("ai_btn_dl_tif"),
-                data=ai_res_show["tif_bytes"],
-                file_name=ai_res_show["tif_filename"],
-                mime="image/tiff",
+                label=t("ai_btn_dl_csv"),
+                data=ai_res_show["csv_bytes"],
+                file_name=ai_res_show["csv_filename"],
+                mime="text/csv",
                 width="stretch",
-                key=f"ai_chat_dl_tif_{result_id}",
+                key=f"ai_chat_dl_csv_{result_id}",
             )
-        with ac2:
-            if st.button(
-                t("ai_btn_send_carto"),
-                type="primary",
-                width="stretch",
-                key=f"ai_chat_send_carto_{result_id}",
-            ):
-                st.session_state["tab6_ai_result"] = ai_res_show
-                st.session_state["tab4_pending_source_select"] = "tab6_ai"
-                st.session_state["tab6_sent_to_carto"] = True
-                st.session_state["pending_workspace"] = "ws_geo"
-                st.rerun(scope="app")
+    else:
+        has_tif = bool(ai_res_show.get("tif_bytes"))
+        if has_tif:
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                st.download_button(
+                    label=t("ai_btn_dl_tif"),
+                    data=ai_res_show["tif_bytes"],
+                    file_name=ai_res_show["tif_filename"],
+                    mime="image/tiff",
+                    width="stretch",
+                    key=f"ai_chat_dl_tif_{result_id}",
+                )
+            with ac2:
+                if st.button(
+                    t("ai_btn_send_carto"),
+                    type="primary",
+                    width="stretch",
+                    key=f"ai_chat_send_carto_{result_id}",
+                ):
+                    st.session_state["tab6_ai_result"] = ai_res_show
+                    st.session_state["tab4_pending_source_select"] = "tab6_ai"
+                    st.session_state["tab6_sent_to_carto"] = True
+                    st.session_state["pending_workspace"] = "ws_geo"
+                    st.rerun(scope="app")
 
     with st.expander(t("ai_copy_expander"), expanded=False):
         st.code(ai_res_show.get("technical_summary", ""), language="text")
@@ -8996,7 +9444,7 @@ def main() -> None:
                 gc.collect()
                 st.rerun()
 
-        # --- 1. Nastavitve Gemini API (POLNA ŠIRINA — brez odrezanih gumbov!) ---
+        # --- 1. Nastavitve Gemini API (čist 6-gumbni izbirnik + kompakten gumb za preverjanje ključa) ---
         with st.expander(t("ai_api_expander"), expanded=False):
             # Vrstica 1: API ključ (polna širina)
             st.text_input(
@@ -9005,7 +9453,7 @@ def main() -> None:
                 key="tab6_gemini_key",
             )
 
-            # Vrstica 2: Izbira modela Gemini v polni širini s kratkimi, berljivimi oznakami
+            # Vrstica 2: Čista vrstica 6 modelov (3.8 Flash privzeto | 3.6 Flash | 3.5 Flash | 4 Hydrogen | 2.5 Flash | Po meri)
             preset_ids: list[str] = [m["id"] for m in GEMINI_MODEL_OPTIONS]
             mod_lbl_key = "label_en" if lang == "en" else "label_sl"
             preset_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
@@ -9013,16 +9461,12 @@ def main() -> None:
             if st.session_state.get("gemini_model") not in preset_ids:
                 st.session_state["gemini_model"] = DEFAULT_GEMINI_MODEL
 
-            def _on_preset_model_change() -> None:
-                st.session_state["gemini_active_live_model"] = None
-
             selected_mod_choice = _touch_selector(
                 t("ai_model_select_label"),
                 options=preset_ids,
                 default=DEFAULT_GEMINI_MODEL,
                 format_func=lambda mid: preset_lbl_map.get(mid, mid),
                 key="gemini_model",
-                on_change=_on_preset_model_change,
                 use_pills=True,
             )
 
@@ -9034,65 +9478,59 @@ def main() -> None:
                     key="gemini_custom_model",
                 )
 
-            # Vrstica 3: Gumb za preverjanje živih modelov na uporabnikovem API ključu + polnoširinski izbirnik
+            effective_gemini_model = resolve_gemini_model_id(
+                str(selected_mod_choice or DEFAULT_GEMINI_MODEL),
+                custom_id=custom_mod_id,
+            )
+
+            # Vrstica 3: Kompakten gumb za preverjanje povezave API ključa (1-vrstična značka — brez 49-gumbne stene!)
             cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
             if st.button(
-                t("ai_btn_check_models"),
+                t("ai_btn_verify_key"),
                 width="stretch",
-                key="tab6_btn_check_models",
+                key="tab6_btn_verify_key",
             ):
                 if not cur_api_key:
-                    st.warning(t("ai_models_need_key"))
+                    st.session_state["ai_api_verify_result"] = {"status": "need_key"}
                 else:
                     try:
-                        live_list = list_available_gemini_models(cur_api_key)
-                        st.session_state["gemini_discovered_models"] = live_list
-                        st.session_state["tab6_models_check_count"] = len(live_list)
-                        st.rerun()
+                        v_res = verify_gemini_api_connection(cur_api_key, model=effective_gemini_model)
+                        st.session_state["ai_api_verify_result"] = {"status": "ok", **v_res}
                     except Exception as exc:
-                        st.error(t("ai_models_check_err", err=exc))
+                        st.session_state["ai_api_verify_result"] = {"status": "err", "error": str(exc)}
 
-            discovered_models: list[str] = list(st.session_state.get("gemini_discovered_models") or [])
-            if discovered_models:
-                st.caption(t("ai_models_found_ok", n=len(discovered_models)))
-                if hasattr(st, "pills"):
-                    picked_live = st.pills(
-                        t("ai_models_live_select_label"),
-                        options=discovered_models,
-                        selection_mode="single",
-                        default=(
-                            st.session_state.get("gemini_active_live_model")
-                            if st.session_state.get("gemini_active_live_model") in discovered_models
-                            else None
-                        ),
-                        key="tab6_live_model_picker",
-                    )
-                else:
-                    picked_live = st.radio(
-                        t("ai_models_live_select_label"),
-                        options=discovered_models,
-                        index=None,
-                        horizontal=True,
-                        key="tab6_live_model_picker",
-                    )
-                if picked_live:
-                    st.session_state["gemini_active_live_model"] = str(picked_live)
-
-            active_live_override = st.session_state.get("gemini_active_live_model")
-            if active_live_override:
-                effective_gemini_model = resolve_gemini_model_id(str(active_live_override))
-            else:
-                effective_gemini_model = resolve_gemini_model_id(
-                    str(selected_mod_choice or DEFAULT_GEMINI_MODEL),
-                    custom_id=custom_mod_id,
-                )
+            ver_state = st.session_state.get("ai_api_verify_result")
+            if isinstance(ver_state, dict):
+                v_st = ver_state.get("status")
+                if v_st == "need_key":
+                    st.warning(t("ai_models_need_key"))
+                elif v_st == "ok":
+                    if ver_state.get("model_found"):
+                        st.success(
+                            t(
+                                "ai_verify_ok",
+                                model=ver_state.get("model", effective_gemini_model),
+                                n=int(ver_state.get("total_models", 0)),
+                            )
+                        )
+                    else:
+                        st.warning(
+                            t(
+                                "ai_verify_model_missing",
+                                model=ver_state.get("model", effective_gemini_model),
+                                n=int(ver_state.get("total_models", 0)),
+                                fallback=ver_state.get("fallback", DEFAULT_GEMINI_MODEL),
+                            )
+                        )
+                elif v_st == "err":
+                    st.error(t("ai_verify_err", err=ver_state.get("error", "")))
 
             if cur_api_key:
                 st.success(t("ai_status_gemini", source=key_src, model=effective_gemini_model))
             else:
                 st.info(t("ai_status_local"))
 
-        # --- 2. Pozdravna kartica + 4 klikabilni začetni primeri (ko je klepet prazen) ---
+        # --- 2. Pozdravna kartica + klikabilni začetni primeri (ko je klepet prazen) ---
         chat_messages: list[dict[str, Any]] = list(st.session_state.get("ai_chat_messages") or [])
         if not chat_messages:
             welcome_html = (
@@ -9172,9 +9610,11 @@ def main() -> None:
                         last_context=last_ctx,
                         api_key=active_key_now,
                         model=effective_gemini_model,
+                        lang=lang,
                     )
+                    action_now = str(route_res.get("action") or route_res.get("intent") or "chat_qa")
 
-                    if route_res.get("intent") == "run_analysis" and isinstance(route_res.get("plan"), dict):
+                    if action_now == "run_analysis" and isinstance(route_res.get("plan"), dict):
                         parsed_plan = route_res["plan"]
                         ai_out = execute_ai_plan(
                             parsed_plan,
@@ -9227,8 +9667,24 @@ def main() -> None:
                             {
                                 "role": "assistant",
                                 "content": str(reply_res.get("text") or ""),
+                                "action": "run_analysis",
                                 "plan": parsed_plan,
                                 "result_id": res_key,
+                                "fallback_note": fb_note_str,
+                            }
+                        )
+                    elif action_now == "ask_clarification" and str(route_res.get("clarification_question") or "").strip():
+                        fb_note_str = (
+                            route_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")
+                            or ""
+                        )
+                        st.session_state["ai_chat_messages"].append(
+                            {
+                                "role": "assistant",
+                                "content": str(route_res.get("clarification_question") or "").strip(),
+                                "action": "ask_clarification",
+                                "plan": None,
+                                "result_id": None,
                                 "fallback_note": fb_note_str,
                             }
                         )
@@ -9252,6 +9708,7 @@ def main() -> None:
                             {
                                 "role": "assistant",
                                 "content": str(reply_res.get("text") or ""),
+                                "action": "chat_qa",
                                 "plan": None,
                                 "result_id": None,
                                 "fallback_note": fb_note_str,
@@ -9270,6 +9727,7 @@ def main() -> None:
                         {
                             "role": "assistant",
                             "content": f"⚠️ {err_msg}",
+                            "action": "error",
                             "plan": None,
                             "result_id": None,
                             "fallback_note": "",
