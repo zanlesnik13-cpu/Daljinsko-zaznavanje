@@ -5271,7 +5271,7 @@ def _render_comp3_swipe_fragment(
             opacity=float(swipe_opacity_pct) / 100.0,
             lang=lang,
         )
-        _render_html_iframe(swipe_html, height=636)
+        components.html(swipe_html, height=640, scrolling=False)
     else:
         _render_before_after_swipe_html(
             png_t1_bytes=c_swipes[i_a],
@@ -8489,11 +8489,11 @@ def main() -> None:
                             aoi_bbox_4326=d_bbox,
                             aoi_polygon_geojson=dis_res_show.get("polygon_4326"),
                             aoi_outline_label=t("slippy_aoi_outline"),
-                            height=570,
+                            height=620,
                             opacity=1.0,
                             lang=lang,
                         )
-                        _render_html_iframe(dis_swipe_html, height=586)
+                        components.html(dis_swipe_html, height=640, scrolling=False)
                     else:
                         _render_before_after_swipe_html(
                             png_t1_bytes=dis_res_show["swipe_png_pre"],
