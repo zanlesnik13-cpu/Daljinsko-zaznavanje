@@ -49,6 +49,7 @@ from geodezija_crs import (
     export_to_geotiff_bytes,
 )
 from gnss_plan import run_gnss_mission_plan
+from kartografija import DEFAULT_LAYOUT_CONFIG, LAYOUT_PRESETS, merge_layout_config
 from map_overlay import raster_to_map_overlay_png
 from nesrece import (
     DISASTER_FLOOD,
@@ -1962,16 +1963,53 @@ def _call_gemini_rest_with_fallback(
     raise RuntimeError(f"All Gemini models failed ({req_model}): {last_exc}")
 
 
-_GEMINI_ROUTER_SYSTEM_PROMPT = """You are the intent router and geodetic Earth Observation planner for a Slovenian/English Remote Sensing Assistant.
-Analyze the user's latest message together with recent chat history and last executed analysis context, and choose ONE of 3 actions:
-1. "run_analysis": User provided enough details (or answered your previous clarifying question) to run a satellite, DEM terrain, or GNSS mission analysis.
-2. "ask_clarification": User wants to run an analysis, BUT critical details are missing or genuinely ambiguous (e.g., "Naredi analizo" with no location/topic, or "Primerjaj dve leti za Maribor" without specifying which years or which layer/index). Do NOT guess blindly — ask a concise, friendly clarifying question with 2–3 concrete suggestions!
-3. "chat_qa": User is asking a follow-up question about the current results, requesting an explanation/methodology/comparison of sensors, asking to draft a report paragraph, or having a general conversation.
+_GEMINI_ROUTER_SYSTEM_PROMPT = """You are the intent router, geodetic Earth Observation planner, and QGIS-style Cartographic Composer controller for a Slovenian/English Remote Sensing Assistant.
+Analyze the user's latest message together with recent chat history, last executed analysis context, and current map layout config, and choose ONE of 4 actions:
+1. "run_analysis": User wants to fetch/compute a satellite, DEM terrain, or GNSS mission analysis (with enough details or after answering a clarification).
+2. "generate_map": User wants to create, export, style, or iteratively modify a printable 300 DPI geodetic map / layout / PDF / PNG / poster from the active analysis or workspace layer (e.g. "Naredi karto iz teh rezultatov", "Izdelaj pokončno A4 karto s temno temo, severnico zgoraj levo, pregledno karto Slovenije in križci na 1 km", "Premakni legendo spodaj", "Dodaj naslov ...", "Skrij nogo in vklopi pregledno karto").
+3. "ask_clarification": User wants to run an analysis, BUT critical details are missing or genuinely ambiguous (e.g., "Naredi analizo" with no location/topic, or "Primerjaj dve leti za Maribor" without specifying years or index). Do NOT guess blindly — ask a concise, friendly clarifying question with 2–3 concrete suggestions!
+4. "chat_qa": User is asking a follow-up question about results, requesting an explanation/methodology/comparison of sensors, asking to draft a report paragraph, or having a general conversation.
 
 Return STRICT JSON ONLY (no markdown fences) with this exact schema:
 {
-  "action": "run_analysis" | "ask_clarification" | "chat_qa",
-  "clarification_question": null OR string (friendly specific question in the user's language with 2-3 quick options),
+  "action": "run_analysis" | "generate_map" | "ask_clarification" | "chat_qa",
+  "clarification_question": null OR string,
+  "target_layer": "latest_ai" | "satellite_rgb" | "analysis_mask" | "workspace_layer",
+  "reset_layout": false,
+  "layout_overrides": null OR {
+    // INCLUDE ONLY KEYS EXPLICITLY REQUESTED OR CHANGED BY THE USER (omit unchanged keys so previous tweaks are preserved!):
+    "paper_format": "A4_LANDSCAPE" | "A4_PORTRAIT" | "A3_LANDSCAPE" | "SQUARE_1_1",
+    "theme": "classic_light" | "minimal_white" | "dark_technical",
+    "show_title": true | false,
+    "title": string,
+    "subtitle": string,
+    "author": string,
+    "title_position": "top_left" | "top_center" | "inside_top_left" | "inside_top_center" | "none",
+    "show_footer": true | false,
+    "custom_note_text": string,
+    "custom_note_position": "bottom_left" | "bottom_right" | "below_legend" | "none",
+    "show_grid": true | false,
+    "grid_spacing": "auto" | 250 | 500 | 1000 | 2000 | 5000,
+    "grid_style": "lines" | "crosses" | "ticks_only",
+    "grid_color": "light" | "dark" | "teal",
+    "grid_alpha": number (0.1 to 1.0),
+    "show_aoi_outline": true | false,
+    "aoi_outline_color": "#0F766E" | "#DC2626" | "#FFFFFF" | "#000000",
+    "show_north_arrow": true | false,
+    "north_position": "top_right" | "top_left" | "bottom_right" | "bottom_left",
+    "north_style": "classic_compass" | "minimal_arrow" | "geodetic_star",
+    "north_size": "small" | "medium" | "large",
+    "show_scale_bar": true | false,
+    "scale_position": "bottom_left" | "bottom_right" | "top_left" | "top_right",
+    "scale_style": "alternating_bar" | "simple_line",
+    "show_numeric_scale": true | false,
+    "show_legend": true | false,
+    "legend_position": "right_panel" | "bottom_panel" | "inside_bottom_right" | "inside_top_right" | "inside_bottom_left",
+    "legend_title": string,
+    "show_metadata_in_legend": true | false,
+    "show_inset_map": true | false,
+    "inset_position": "bottom_right" | "top_right" | "bottom_left" | "top_left" | "right_panel_bottom"
+  },
   "plan": null OR {
     "place_name": string (nominative town/place name suitable for geocoding, e.g. "Celje", "Slovenj Gradec", "Črna na Koroškem", "Kras", "Bled", "Ljubljana", "Kranj", "Murska Sobota"),
     "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
@@ -2000,6 +2038,12 @@ ALL 10 SUPPORTED TASK TYPES FOR "run_analysis":
 - "terrain_dem": Copernicus DEM 30 m elevation, slope [°], aspect [°], hillshade, elevation profile (resolution_m=30).
 - "gnss_plan": GNSS Mission Planning (GPS/Galileo/GLONASS visibility, PDOP/HDOP/VDOP, DEM+S2 obstacle mask, optimal windows).
 
+CARTOGRAPHY RULES FOR "generate_map":
+- Use "generate_map" whenever the user asks to create a printable map/poster/PDF/PNG from existing results OR tweak map elements (paper format, theme, title, subtitle, author, note, footer, north arrow, scale bar, legend, grid lines/crosses/spacing, AOI outline, inset locator map).
+- Put ONLY the requested/changed keys inside "layout_overrides" so iterative edits merge cleanly on top of previous settings!
+- Set "target_layer": "satellite_rgb" if user explicitly asks for the RGB/satellite image map, "analysis_mask" if they ask for the flood/fire/index mask, "workspace_layer" if they refer to a layer loaded in Workspaces 1–3, else "latest_ai".
+- Set "reset_layout": true ONLY if the user explicitly asks to reset layout to defaults.
+
 SCIENTIFIC & REGIONAL RULES:
 - LST -> sensor="landsat-c2-l2", resolution_m=30.
 - start_date < 2016-01-01 -> sensor="landsat-c2-l2", resolution_m=30.
@@ -2007,6 +2051,377 @@ SCIENTIFIC & REGIONAL RULES:
 - Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
 - Normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota".
 - If user replies after a previous clarifying question, combine the previous user request + new answer into a complete "run_analysis" plan!"""
+
+
+_VALID_TARGET_LAYERS: tuple[str, ...] = (
+    "latest_ai",
+    "satellite_rgb",
+    "analysis_mask",
+    "workspace_layer",
+)
+
+
+def sanitize_layout_overrides(raw_overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Filter and normalize ONLY explicitly provided ``MapLayoutConfig`` override keys."""
+    if not isinstance(raw_overrides, dict):
+        return {}
+    clean: dict[str, Any] = {}
+    valid_keys = set(DEFAULT_LAYOUT_CONFIG.keys())
+    # Allow preset shorthand if passed
+    preset_name = str(raw_overrides.get("preset") or "").strip().lower()
+    if preset_name in LAYOUT_PRESETS:
+        clean.update(LAYOUT_PRESETS[preset_name])
+
+    for k, v in raw_overrides.items():
+        if k not in valid_keys or v is None:
+            continue
+        if isinstance(v, str) and not v.strip() and k in (
+            "paper_format",
+            "theme",
+            "title_position",
+            "custom_note_position",
+            "grid_style",
+            "grid_color",
+            "aoi_outline_color",
+            "north_position",
+            "north_style",
+            "north_size",
+            "scale_position",
+            "scale_style",
+            "legend_position",
+            "inset_position",
+        ):
+            continue
+        clean[k] = v
+
+    if not clean:
+        return {}
+
+    # Validate each supplied key through merge_layout_config without injecting untouched defaults
+    validated_full = merge_layout_config(clean)
+    return {k: validated_full[k] for k in clean if k in validated_full}
+
+
+def apply_incremental_layout_overrides(
+    base_layout: dict[str, Any] | None,
+    overrides: dict[str, Any] | None,
+    *,
+    reset_layout: bool = False,
+) -> dict[str, Any]:
+    """Incrementally merge ``overrides`` onto ``base_layout`` preserving all untouched settings."""
+    base = merge_layout_config() if (reset_layout or not isinstance(base_layout, dict)) else merge_layout_config(base_layout)
+    clean_ov = sanitize_layout_overrides(overrides)
+    if clean_ov:
+        base.update(clean_ov)
+    return merge_layout_config(base)
+
+
+_MAP_GEN_PATTERNS: tuple[str, ...] = (
+    "naredi kart",
+    "izdelaj kart",
+    "ustvari kart",
+    "pripravi kart",
+    "generiraj kart",
+    "natisni kart",
+    "izvozi kart",
+    "karto za tisk",
+    "karto iz ",
+    "karto tega",
+    "karto teh",
+    "tiskaln",
+    "pdf kart",
+    "png kart",
+    "pokoncno a4",
+    "pokoncna a4",
+    "lezeco a4",
+    "lezeca a4",
+    "a3 kart",
+    "kvadratn",
+    "poster",
+    "premakni severnic",
+    "premakni legend",
+    "premakni meril",
+    "premakni pregledn",
+    "premakni naslov",
+    "vklopi pregledn",
+    "izklopi pregledn",
+    "dodaj pregledn",
+    "pregledno karto",
+    "pregledna karta",
+    "inset map",
+    "overview map",
+    "temno temo",
+    "temna tema",
+    "svetlo temo",
+    "svetla tema",
+    "minimalisticn",
+    "dark theme",
+    "minimal theme",
+    "classic theme",
+    "krizc",
+    "samo oznak",
+    "brez noge",
+    "skrij nogo",
+    "brez severnic",
+    "skrij severnic",
+    "brez legend",
+    "skrij legend",
+    "brez meril",
+    "skrij meril",
+    "brez mrez",
+    "skrij mrez",
+    "severnico ",
+    "severnica ",
+    "legendo ",
+    "legenda ",
+    "graficno meril",
+    "make a map",
+    "create a map",
+    "generate a map",
+    "generate map",
+    "export map",
+    "print map",
+    "print layout",
+    "move north",
+    "move legend",
+    "move scale",
+    "portrait a4",
+    "landscape a4",
+    "a3 landscape",
+)
+
+
+def _detect_corner_in_span(span: str) -> str | None:
+    """Detect a map corner ('top_left', 'top_right', 'bottom_left', 'bottom_right') in normalized text."""
+    has_top = any(w in span for w in ("zgoraj", "zgornj", "top", "upper"))
+    has_bot = any(w in span for w in ("spodaj", "spodnj", "bottom", "lower"))
+    has_left = any(w in span for w in ("levo", "levi", "left"))
+    has_right = any(w in span for w in ("desno", "desni", "right"))
+    if has_top and has_left:
+        return "top_left"
+    if has_top and has_right:
+        return "top_right"
+    if has_bot and has_left:
+        return "bottom_left"
+    if has_bot and has_right:
+        return "bottom_right"
+    return None
+
+
+def parse_map_layout_overrides_local(message: str) -> tuple[dict[str, Any], str, bool]:
+    """Deterministic Slovenian/English parser mapping natural-language map instructions to ``MapLayoutConfig``."""
+    raw = str(message or "").strip()
+    norm = _normalize_ascii(raw)
+    ov: dict[str, Any] = {}
+
+    reset_layout = any(k in norm for k in ("ponastavi", "privzet", "reset layout", "na novo", "fresh layout"))
+
+    # Target layer preference
+    target_layer = "latest_ai"
+    if any(k in norm for k in ("rgb", "satelitskega posnetka", "satelitski posnetek", "true color", "prave barve")):
+        target_layer = "satellite_rgb"
+    elif any(k in norm for k in ("mask", "poplavnega obseg", "poplavn", "pozar", "indeks", "ndvi", "ndwi", "ndsi", "lst", "dem")):
+        target_layer = "analysis_mask"
+    elif any(k in norm for k in ("delovnega prostora", "workspace", "tega sloja", "active layer")):
+        target_layer = "workspace_layer"
+
+    # Quick presets
+    if any(k in norm for k in ("krizna karta", "krizno karto", "crisis preset", "crisis map")):
+        ov.update(LAYOUT_PRESETS["crisis"])
+    elif any(k in norm for k in ("cisti poster", "poster preset", "clean poster")):
+        ov.update(LAYOUT_PRESETS["poster"])
+    elif any(k in norm for k in ("magistrsk", "elaborat", "thesis preset")):
+        ov.update(LAYOUT_PRESETS["thesis"])
+
+    # 1. Paper format
+    if any(k in norm for k in ("pokonc", "portrait")):
+        ov["paper_format"] = "A4_PORTRAIT"
+    elif "a3" in norm:
+        ov["paper_format"] = "A3_LANDSCAPE"
+    elif any(k in norm for k in ("kvadrat", "1:1", "square")):
+        ov["paper_format"] = "SQUARE_1_1"
+    elif any(k in norm for k in ("lezec", "landscape")):
+        ov["paper_format"] = "A4_LANDSCAPE"
+
+    # 2. Theme
+    if any(k in norm for k in ("temn", "dark theme", "dark_technical", "temno temo", "temna tema")):
+        ov["theme"] = "dark_technical"
+    elif any(k in norm for k in ("minimal", "brez okvirj", "frameless")):
+        ov["theme"] = "minimal_white"
+    elif any(k in norm for k in ("svetl", "klasic", "classic_light", "light theme")):
+        ov["theme"] = "classic_light"
+
+    # 3. Title, subtitle, author, note, footer
+    if any(k in norm for k in ("brez naslov", "skrij naslov", "no title", "hide title")):
+        ov["show_title"] = False
+        ov["title_position"] = "none"
+    else:
+        m_title = re.search(
+            r"(?:z\s+naslovom|naslov\s*:|title\s*:?|naslovom)\s*[\"«'„]([^\"»'“]+)[\"»'“]",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if not m_title:
+            m_title = re.search(
+                r"(?:z\s+naslovom|naslov\s*:|title\s*:)\s*([^,;\n]+)",
+                raw,
+                flags=re.IGNORECASE,
+            )
+        if m_title:
+            ov["show_title"] = True
+            ov["title"] = m_title.group(1).strip().strip("\"'«»")
+        if "naslov" in norm or "title" in norm:
+            if any(k in norm for k in ("znotraj", "inside")):
+                ov["title_position"] = "inside_top_center" if any(c in norm for c in ("sredin", "center")) else "inside_top_left"
+            elif any(c in norm for c in ("sredin", "center")):
+                ov["title_position"] = "top_center"
+
+    m_sub = re.search(r"(?:podnaslov\s*:?|subtitle\s*:?)\s*[\"«'„]([^\"»'“]+)[\"»'“]", raw, flags=re.IGNORECASE)
+    if m_sub:
+        ov["subtitle"] = m_sub.group(1).strip()
+
+    m_auth = re.search(r"(?:avtor\s*:?|author\s*:?)\s*[\"«'„]([^\"»'“]+)[\"»'“]", raw, flags=re.IGNORECASE)
+    if m_auth:
+        ov["author"] = m_auth.group(1).strip()
+
+    m_note = re.search(r"(?:opomb[ao]?\s*:?|podpis\s*:?|note\s*:?|caption\s*:?)\s*[\"«'„]([^\"»'“]+)[\"»'“]", raw, flags=re.IGNORECASE)
+    if m_note:
+        ov["custom_note_text"] = m_note.group(1).strip()
+        if "pod legend" in norm or "below legend" in norm:
+            ov["custom_note_position"] = "below_legend"
+        elif "spodaj levo" in norm or "bottom left" in norm:
+            ov["custom_note_position"] = "bottom_left"
+        else:
+            ov["custom_note_position"] = "bottom_right"
+
+    if any(k in norm for k in ("brez noge", "skrij nogo", "no footer", "hide footer")):
+        ov["show_footer"] = False
+    elif any(k in norm for k in ("vklopi nogo", "prikazi nogo", "show footer")):
+        ov["show_footer"] = True
+
+    # 4. North arrow
+    if any(k in norm for k in ("brez severnic", "skrij severnic", "no north", "hide north")):
+        ov["show_north_arrow"] = False
+    else:
+        m_n = re.search(r"(?:severnic\w*|north\s*arrow|north)(.{0,45})", norm)
+        if m_n:
+            ov["show_north_arrow"] = True
+            span_n = m_n.group(0)
+            c_n = _detect_corner_in_span(span_n)
+            if c_n:
+                ov["north_position"] = c_n
+            if any(w in span_n for w in ("zvezd", "star", "kompas")):
+                ov["north_style"] = "geodetic_star"
+            elif "minimal" in span_n:
+                ov["north_style"] = "minimal_arrow"
+            elif "klasic" in span_n or "classic" in span_n:
+                ov["north_style"] = "classic_compass"
+            if any(w in span_n for w in ("velik", "large")):
+                ov["north_size"] = "large"
+            elif any(w in span_n for w in ("majhn", "small")):
+                ov["north_size"] = "small"
+
+    # 5. Scale bar
+    if any(k in norm for k in ("brez meril", "skrij meril", "no scale", "hide scale")):
+        ov["show_scale_bar"] = False
+    else:
+        m_s = re.search(r"(?:meril\w*|scale\s*bar|scale)(.{0,45})", norm)
+        if m_s:
+            ov["show_scale_bar"] = True
+            span_s = m_s.group(0)
+            c_s = _detect_corner_in_span(span_s)
+            if c_s:
+                ov["scale_position"] = c_s
+            if any(w in span_s for w in ("crt", "line")):
+                ov["scale_style"] = "simple_line"
+            elif any(w in span_s for w in ("izmenic", "alternat")):
+                ov["scale_style"] = "alternating_bar"
+    if any(k in norm for k in ("brez numericnega", "no numeric scale")):
+        ov["show_numeric_scale"] = False
+
+    # 6. Legend
+    if any(k in norm for k in ("brez legend", "skrij legend", "no legend", "hide legend")):
+        ov["show_legend"] = False
+    else:
+        m_l = re.search(r"(?:legend\w*)(.{0,48})", norm)
+        if m_l:
+            ov["show_legend"] = True
+            span_l = m_l.group(0)
+            if any(w in span_l for w in ("znotraj", "inside")):
+                c_l = _detect_corner_in_span(span_l)
+                if c_l == "top_right":
+                    ov["legend_position"] = "inside_top_right"
+                elif c_l == "bottom_left":
+                    ov["legend_position"] = "inside_bottom_left"
+                else:
+                    ov["legend_position"] = "inside_bottom_right"
+            elif any(w in span_l for w in ("spodaj", "spodnj", "bottom")):
+                ov["legend_position"] = "bottom_panel"
+            elif any(w in span_l for w in ("desn", "right")):
+                ov["legend_position"] = "right_panel"
+
+    # 7. Inset / Overview locator map
+    if any(k in norm for k in ("brez pregledn", "skrij pregledn", "izklopi pregledn", "no inset", "hide inset")):
+        ov["show_inset_map"] = False
+    else:
+        m_in = re.search(r"(?:pregledn\w*(?:\s+kart\w*)?(?:\s+slovenij\w*)?|inset\s*map|inset|overview\s*map|lokacijsk\w*\s+kart\w*)(.{0,40})", norm)
+        if m_in:
+            ov["show_inset_map"] = True
+            span_in = m_in.group(0)
+            if any(w in span_in for w in ("desni panel", "right panel")):
+                ov["inset_position"] = "right_panel_bottom"
+            else:
+                c_in = _detect_corner_in_span(span_in)
+                if c_in:
+                    ov["inset_position"] = c_in
+
+    # 8. Coordinate grid & AOI outline
+    if any(k in norm for k in ("brez mrez", "skrij mrez", "izklopi mrez", "no grid", "hide grid")):
+        ov["show_grid"] = False
+    else:
+        if any(k in norm for k in ("krizc", "cross")):
+            ov["show_grid"] = True
+            ov["grid_style"] = "crosses"
+        elif any(k in norm for k in ("samo oznak", "ticks only", "ticks_only")):
+            ov["show_grid"] = True
+            ov["grid_style"] = "ticks_only"
+        elif re.search(r"(?:mrez\w*|grid).{0,24}(?:crt|line)", norm):
+            ov["show_grid"] = True
+            ov["grid_style"] = "lines"
+
+        # Grid spacing (250 m, 500 m, 1 km / 1000 m, 2 km / 2000 m, 5 km / 5000 m)
+        m_gsp = re.search(r"(?:na\s+|razmak\s+|mrez\w*[^0-9]{0,16}|krizc\w*[^0-9]{0,16}|grid[^0-9]{0,16})(250|500|1000|2000|5000|1|2|5)\s*(km|m)\b", norm)
+        if m_gsp:
+            num_v = int(m_gsp.group(1))
+            unit_v = m_gsp.group(2)
+            meters = num_v * 1000 if unit_v == "km" else num_v
+            if meters in (250, 500, 1000, 2000, 5000):
+                ov["show_grid"] = True
+                ov["grid_spacing"] = meters
+
+        m_gcol = re.search(r"(?:mrez\w*|grid|krizc\w*)(.{0,30})", norm)
+        if m_gcol:
+            sg = m_gcol.group(0)
+            if "teal" in sg or "zelen" in sg:
+                ov["grid_color"] = "teal"
+            elif "temn" in sg or "dark" in sg or "crn" in sg:
+                ov["grid_color"] = "dark"
+            elif "svetl" in sg or "bel" in sg or "light" in sg:
+                ov["grid_color"] = "light"
+
+    if any(k in norm for k in ("brez aoi", "skrij aoi", "brez obrob", "hide aoi", "no aoi")):
+        ov["show_aoi_outline"] = False
+    elif any(k in norm for k in ("rdeca obrob", "rdeco obrob", "red outline")):
+        ov["show_aoi_outline"] = True
+        ov["aoi_outline_color"] = "#DC2626"
+    elif any(k in norm for k in ("bela obrob", "belo obrob", "white outline")):
+        ov["show_aoi_outline"] = True
+        ov["aoi_outline_color"] = "#FFFFFF"
+    elif any(k in norm for k in ("crna obrob", "crno obrob", "black outline")):
+        ov["show_aoi_outline"] = True
+        ov["aoi_outline_color"] = "#000000"
+
+    return sanitize_layout_overrides(ov), target_layer, reset_layout
 
 
 _QA_PATTERNS: tuple[str, ...] = (
@@ -2144,12 +2559,13 @@ def _route_user_message_local(
     last_context: dict[str, Any] | None = None,
     lang: str = "sl",
 ) -> dict[str, Any]:
-    """Deterministic offline intent router separating 'run_analysis', 'ask_clarification', and 'chat_qa'."""
+    """Deterministic offline intent router separating 'generate_map', 'run_analysis', 'ask_clarification', and 'chat_qa'."""
     raw_msg = str(message or "").strip()
     raw_norm = _normalize_ascii(raw_msg)
     raw_is_pure_qa = (
         (any(p in raw_norm for p in _QA_PATTERNS) or raw_norm.endswith("?"))
         and not any(p in raw_norm for p in _RUN_ACTION_PATTERNS)
+        and not any(p in raw_norm for p in _MAP_GEN_PATTERNS)
     )
     effective_msg = raw_msg
 
@@ -2186,12 +2602,35 @@ def _route_user_message_local(
         p in norm_q for p in ("isto obmocj", "isti lokacij", "tam", "same area", "same location")
     )
 
+    # 0. Printable Cartographic Map Creation / Iterative Layout Editing -> generate_map
+    map_overrides, map_target_layer, map_reset = parse_map_layout_overrides_local(raw_msg)
+    has_map_cue = any(p in raw_norm for p in _MAP_GEN_PATTERNS) or (
+        bool(map_overrides) and not (has_eo_subject and (has_year_or_month or has_known_place))
+    )
+    if has_map_cue and not raw_is_pure_qa:
+        return {
+            "action": "generate_map",
+            "intent": "generate_map",
+            "plan": None,
+            "layout_overrides": map_overrides,
+            "target_layer": map_target_layer,
+            "reset_layout": map_reset,
+            "clarification_question": None,
+            "engine": "local",
+            "gemini_model": None,
+            "fallback_note_sl": "",
+            "fallback_note_en": "",
+        }
+
     # 1. Pure explanation / follow-up question / writing request -> chat_qa
     if has_qa_cue and not (has_run_verb and has_eo_subject):
         return {
             "action": "chat_qa",
             "intent": "chat_qa",
             "plan": None,
+            "layout_overrides": None,
+            "target_layer": "latest_ai",
+            "reset_layout": False,
             "clarification_question": None,
             "engine": "local",
             "gemini_model": None,
@@ -2234,6 +2673,9 @@ def _route_user_message_local(
             "action": "ask_clarification",
             "intent": "ask_clarification",
             "plan": None,
+            "layout_overrides": None,
+            "target_layer": "latest_ai",
+            "reset_layout": False,
             "clarification_question": q_clar,
             "engine": "local",
             "gemini_model": None,
@@ -2258,6 +2700,9 @@ def _route_user_message_local(
             "action": "ask_clarification",
             "intent": "ask_clarification",
             "plan": None,
+            "layout_overrides": None,
+            "target_layer": "latest_ai",
+            "reset_layout": False,
             "clarification_question": q_clar,
             "engine": "local",
             "gemini_model": None,
@@ -2285,6 +2730,9 @@ def _route_user_message_local(
             "action": "run_analysis",
             "intent": "run_analysis",
             "plan": plan,
+            "layout_overrides": None,
+            "target_layer": "latest_ai",
+            "reset_layout": False,
             "clarification_question": None,
             "engine": "local",
             "gemini_model": None,
@@ -2296,6 +2744,9 @@ def _route_user_message_local(
         "action": "chat_qa",
         "intent": "chat_qa",
         "plan": None,
+        "layout_overrides": None,
+        "target_layer": "latest_ai",
+        "reset_layout": False,
         "clarification_question": None,
         "engine": "local",
         "gemini_model": None,
@@ -2309,11 +2760,12 @@ def route_user_message(
     chat_history: Sequence[dict[str, Any]] | None = None,
     last_context: dict[str, Any] | None = None,
     *,
+    last_map_layout: dict[str, Any] | None = None,
     api_key: str | None = None,
     model: str = DEFAULT_GEMINI_MODEL,
     lang: str = "sl",
 ) -> dict[str, Any]:
-    """Route a user chat message into ``'run_analysis'``, ``'ask_clarification'``, or ``'chat_qa'``."""
+    """Route a user chat message into ``'run_analysis'``, ``'generate_map'``, ``'ask_clarification'``, or ``'chat_qa'``."""
     resolved_key, _ = get_active_gemini_api_key(api_key)
     if resolved_key:
         history_lines: list[str] = []
@@ -2330,10 +2782,12 @@ def route_user_message(
             if last_context
             else "null"
         )
+        map_snippet = json.dumps(last_map_layout, ensure_ascii=False) if isinstance(last_map_layout, dict) else "null"
         lang_hint = "Slovenian" if lang == "sl" else "English"
         user_blob = (
             f"Today is {date.today().isoformat()}. Preferred language: {lang_hint}.\n"
             f"Last executed analysis context: {ctx_snippet}\n"
+            f"Current active MapLayoutConfig: {map_snippet}\n"
             f"Recent chat history:\n" + ("\n".join(history_lines) if history_lines else "(empty)") + "\n\n"
             f"Latest user message: {message}"
         )
@@ -2353,6 +2807,26 @@ def route_user_message(
             cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.DOTALL).strip()
             parsed = json.loads(cleaned)
             action = str(parsed.get("action") or parsed.get("intent") or "chat_qa").strip().lower()
+            if action == "generate_map":
+                raw_ov = parsed.get("layout_overrides") if isinstance(parsed.get("layout_overrides"), dict) else {}
+                clean_ov = sanitize_layout_overrides(raw_ov)
+                # Fill any subtle local cues if Gemini omitted them
+                t_layer = str(parsed.get("target_layer") or "latest_ai").strip().lower()
+                if t_layer not in _VALID_TARGET_LAYERS:
+                    t_layer = "latest_ai"
+                return {
+                    "action": "generate_map",
+                    "intent": "generate_map",
+                    "plan": None,
+                    "layout_overrides": clean_ov,
+                    "target_layer": t_layer,
+                    "reset_layout": bool(parsed.get("reset_layout", False)),
+                    "clarification_question": None,
+                    "engine": "gemini",
+                    "gemini_model": used_model,
+                    "fallback_note_sl": fb_sl,
+                    "fallback_note_en": fb_en,
+                }
             if action == "run_analysis" and isinstance(parsed.get("plan"), dict):
                 plan = validate_and_normalize_plan(parsed["plan"], engine="gemini")
                 plan["gemini_model"] = used_model
@@ -2362,6 +2836,9 @@ def route_user_message(
                     "action": "run_analysis",
                     "intent": "run_analysis",
                     "plan": plan,
+                    "layout_overrides": None,
+                    "target_layer": "latest_ai",
+                    "reset_layout": False,
                     "clarification_question": None,
                     "engine": "gemini",
                     "gemini_model": used_model,
@@ -2375,6 +2852,9 @@ def route_user_message(
                         "action": "ask_clarification",
                         "intent": "ask_clarification",
                         "plan": None,
+                        "layout_overrides": None,
+                        "target_layer": "latest_ai",
+                        "reset_layout": False,
                         "clarification_question": clar_q,
                         "engine": "gemini",
                         "gemini_model": used_model,
@@ -2385,6 +2865,9 @@ def route_user_message(
                 "action": "chat_qa",
                 "intent": "chat_qa",
                 "plan": None,
+                "layout_overrides": None,
+                "target_layer": "latest_ai",
+                "reset_layout": False,
                 "clarification_question": None,
                 "engine": "gemini",
                 "gemini_model": used_model,
@@ -2644,6 +3127,53 @@ def _generate_local_conversational_reply(
                 f"Loaded the clearest scene (`{sensor}`, **{res_m} m**, **{crs}**). You can inspect it interactively below, download the GeoTIFF, or send it to 300 DPI Cartography."
             )
 
+        if kind == "carto_map":
+            mc = analysis_context.get("layout_config") or {}
+            scale_d = int(analysis_context.get("scale_denom", 10000))
+            scale_str = f"{scale_d:,}".replace(",", " ")
+            grid_m = int(analysis_context.get("grid_spacing_m", 1000))
+            fmt_s = str(mc.get("paper_format", "A4_LANDSCAPE"))
+            theme_s = str(mc.get("theme", "classic_light"))
+            north_s = (
+                f"{mc.get('north_position', 'top_right')} ({mc.get('north_style', 'classic_compass')})"
+                if mc.get("show_north_arrow", True)
+                else ("skrita" if lang == "sl" else "hidden")
+            )
+            scale_pos_s = (
+                str(mc.get("scale_position", "bottom_left"))
+                if mc.get("show_scale_bar", True)
+                else ("skrito" if lang == "sl" else "hidden")
+            )
+            leg_s = (
+                str(mc.get("legend_position", "right_panel"))
+                if mc.get("show_legend", True)
+                else ("skrita" if lang == "sl" else "hidden")
+            )
+            inset_s = (
+                f"da ({mc.get('inset_position', 'right_panel_bottom')})"
+                if mc.get("show_inset_map", False)
+                else ("ne" if lang == "sl" else "off")
+            )
+            g_style = str(mc.get("grid_style", "lines")) if mc.get("show_grid", True) else ("brez" if lang == "sl" else "off")
+            map_title = str(mc.get("title") or analysis_context.get("layer_title") or "")
+            if lang == "sl":
+                return (
+                    f"### 🗺️ Pripravljena geodetska karta — **{map_title}**\n\n"
+                    f"Karta je izrisana v strogi metrični projekciji **{crs}** (1:1 razmerje brez distorzije) in pripravljena za tisk v **300 DPI (PDF in PNG)**.\n\n"
+                    f"- **Format in tema:** `{fmt_s}` · `{theme_s}`\n"
+                    f"- **Izračunano merilo:** **M ≈ 1 : {scale_str}** · **Mreža:** `{g_style}` ({grid_m} m)\n"
+                    f"- **Elementi:** severnica `{north_s}`, merilo `{scale_pos_s}`, legenda `{leg_s}`, pregledna karta `{inset_s}`\n\n"
+                    f"Če želite premakniti katerikoli element, spremeniti barvo mreže, dodati opombo ali preklopiti na temno/svetlo temo, mi preprosto napišite!"
+                )
+            return (
+                f"### 🗺️ Print-Ready Geodetic Map — **{map_title}**\n\n"
+                f"Rendered in exact 1:1 metric projection **{crs}** with **300 DPI PDF & PNG** exports ready below.\n\n"
+                f"- **Format & Theme:** `{fmt_s}` · `{theme_s}`\n"
+                f"- **Computed Scale:** **M ≈ 1 : {scale_str}** · **Grid:** `{g_style}` ({grid_m} m)\n"
+                f"- **Elements:** North arrow `{north_s}`, Scale bar `{scale_pos_s}`, Legend `{leg_s}`, Inset map `{inset_s}`\n\n"
+                f"Tell me if you'd like to move any element, switch themes, toggle the locator map, or add a figure caption!"
+            )
+
     # General QA / follow-up fallback when no Gemini API key is configured
     norm_q = _normalize_ascii(user_message)
     parts: list[str] = []
@@ -2732,7 +3262,16 @@ def generate_conversational_reply(
     lang_name = "Slovenian" if lang == "sl" else "English"
 
     if resolved_key:
-        if is_post_analysis:
+        if is_post_analysis and isinstance(analysis_context, dict) and analysis_context.get("kind") == "carto_map":
+            sys_prompt = (
+                f"You are an expert Geodetic Cartographer & Remote Sensing AI assistant. "
+                f"Write a crisp, helpful response in natural {lang_name} using clean Markdown.\n"
+                f"A publication-ready 300 DPI geodetic map was JUST generated from the user's request. "
+                f"Summarize the exact applied cartographic configuration from the JSON (paper format, exact computed scale M ≈ 1 : ..., "
+                f"metric CRS, theme, element placements for North arrow, Scale bar, Legend, Grid style & spacing, Inset map, custom note if any), "
+                f"and warmly invite the user to ask for any further layout tweaks in natural language (e.g., moving elements, switching theme, changing grid spacing, or adding a caption)."
+            )
+        elif is_post_analysis:
             sys_prompt = (
                 f"You are an expert, insightful Geodetic & Remote Sensing (Earth Observation) AI specialist. "
                 f"Write a thorough, complete, well-structured report in clear, natural {lang_name} using clean Markdown.\n"

@@ -1632,6 +1632,7 @@ def render_geodetic_map(
     aoi_bbox_4326: Sequence[float] | None = None,
     aoi_legend_label: str | None = None,
     lang: str = "sl",
+    dpi: int | None = None,
     preview_dpi: int = 150,
     export_dpi: int = 300,
 ) -> dict[str, Any]:
@@ -1674,7 +1675,7 @@ def render_geodetic_map(
     # Build unified MapLayoutConfig (legacy kwargs provide base, layout_config overrides them cleanly)
     base_overrides: dict[str, Any] = {
         "paper_format": page_format,
-        "dpi_preview": preview_dpi,
+        "dpi_preview": int(dpi) if dpi is not None else preview_dpi,
         "dpi_export": export_dpi,
         "title": title,
         "subtitle": subtitle,

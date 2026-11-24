@@ -649,6 +649,21 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_layer_dem_hillshade": "🏔️ Senčenje reliefa (Hillshade)",
         "ai_layer_comp_rgb": "✨ Brezoblačni mediani mozaik RGB ({d1} – {d2})",
         "ai_profile_title": "Višinski profil terena (Copernicus DEM 30 m) — {place}",
+        "ai_map_thinking": "🗺️ Generiram geodetsko karto (150 DPI predogled + 300 DPI PDF/PNG)...",
+        "ai_map_pill_scale": "Merilo",
+        "ai_map_pill_format": "Format",
+        "ai_map_pill_theme": "Tema",
+        "ai_map_btn_pdf": "📄 Prenesi karto (300 DPI PDF)",
+        "ai_map_btn_png": "🖼️ Prenesi sliko (300 DPI PNG)",
+        "ai_map_btn_edit_ws4": "✏️ Dodatno uredi v Kartografiji",
+        "ai_map_no_layer_clarify": (
+            "Z veseljem vam izdelam 300 DPI geodetsko karto, vendar v seji še ni naloženega nobenega satelitskega ali DEM sloja.\n\n"
+            "Najprej mi povejte **lokacijo in analizo**, ki naj jo izvedem, npr.:\n"
+            "- 🌊 *»Pokaži poplave na Koroškem leta 2023«*\n"
+            "- 🌿 *»Izračunaj NDVI za Bled poleti 2025«*\n"
+            "- ⛰️ *»Analiza reliefa (DEM) za Triglav«*\n\n"
+            "Nato mi samo napišite *»Naredi karto«* (ali želeno postavitev) in pripravil vam bom končno karto za tisk!"
+        ),
         # Phase 5: GNSS Mission Planning (Tab 7)
         "tab7": "📡 Načrtovanje GNSS izmere",
         "gnss_header": "📡 Načrtovanje GNSS izmere (Skyplot, DOP & 360° maska ovir)",
@@ -1496,6 +1511,21 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_layer_dem_hillshade": "🏔️ Analytical Hillshade",
         "ai_layer_comp_rgb": "✨ Cloud-Free Median RGB Composite ({d1} – {d2})",
         "ai_profile_title": "Terrain Elevation Profile (Copernicus DEM 30 m) — {place}",
+        "ai_map_thinking": "🗺️ Rendering geodetic map (150 DPI preview + 300 DPI PDF/PNG)...",
+        "ai_map_pill_scale": "Scale",
+        "ai_map_pill_format": "Format",
+        "ai_map_pill_theme": "Theme",
+        "ai_map_btn_pdf": "📄 Download Map (300 DPI PDF)",
+        "ai_map_btn_png": "🖼️ Download Image (300 DPI PNG)",
+        "ai_map_btn_edit_ws4": "✏️ Fine-Tune in Cartography",
+        "ai_map_no_layer_clarify": (
+            "I'd be happy to generate a 300 DPI geodetic map, but there is no satellite or DEM raster loaded in this session yet.\n\n"
+            "Please tell me which **location and analysis** to run first, for example:\n"
+            "- 🌊 *\"Show floods in Celje in August 2023\"*\n"
+            "- 🌿 *\"Compute NDVI for Bled in summer 2025\"*\n"
+            "- ⛰️ *\"Terrain DEM analysis for Triglav\"*\n\n"
+            "Once loaded, simply ask *\"Create a print map\"* with your preferred layout!"
+        ),
         # Phase 5: GNSS Mission Planning (Tab 7)
         "tab7": "📡 GNSS Mission Planning",
         "gnss_header": "📡 GNSS Mission Planning (Skyplot, DOP & 360° Obstruction Mask)",

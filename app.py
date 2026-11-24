@@ -81,6 +81,7 @@ from ai_pomocnik import (
     AI_EXAMPLE_PROMPTS,
     DEFAULT_GEMINI_MODEL,
     GEMINI_MODEL_OPTIONS,
+    apply_incremental_layout_overrides,
     build_analysis_context_dict,
     execute_ai_plan,
     generate_conversational_reply,
@@ -1097,6 +1098,7 @@ def _init_session_state() -> None:
         "ai_last_analysis_context": None,
         "ai_pending_chat_prompt": None,
         "ai_api_verify_result": None,
+        "ai_last_map_layout": None,
         # Tab 7 GNSS Mission Planning state
         "tab7_gnss_result": None,
         # Resolution guard
@@ -6270,6 +6272,70 @@ def _render_gnss_skyplot_fragment(gnss_res: dict[str, Any], lang: str) -> None:
     st.plotly_chart(fig_sky, width="stretch", key="tab7_skyplot_plotly")
 
 
+def _resolve_ai_target_carto_layer(target_layer: str, lang: str) -> dict[str, Any] | None:
+    """Resolve the best available raster layer for AI chat-driven map generation.
+
+    Priority order:
+    1. Latest spatial AI result (``tab6_ai``), respecting ``target_layer`` (``satellite_rgb`` vs ``analysis_mask``).
+    2. Any active loaded layer from Workspaces 1, 2, or 3 (``_collect_carto_sources``).
+    3. ``None`` if no spatial raster is loaded anywhere in the session yet.
+    """
+    sources = _collect_carto_sources(lang)
+    ai_res = st.session_state.get("tab6_ai_result")
+
+    # If user specifically asked for the satellite RGB scene of the latest AI result
+    if target_layer == "satellite_rgb":
+        if isinstance(ai_res, dict) and isinstance(ai_res.get("scene_ds"), xr.Dataset):
+            ai_plan = ai_res.get("plan") or {}
+            ai_place = str(ai_plan.get("place_name") or "AOI")
+            ai_crs = str(ai_res.get("crs", CRS_D96TM))
+            ai_sensor_cfg = SENSOR_META.get(ai_plan.get("sensor", SENSOR_S2), SENSOR_META[SENSOR_S2])
+            return {
+                "id": "tab6_ai",
+                "label": t("carto_layer_tab6_ai", lang=lang, title=f"RGB — {ai_place}"),
+                "raster": ai_res["scene_ds"],
+                "crs": ai_crs,
+                "is_rgb": True,
+                "bands": ai_res.get("bands", ["B04", "B03", "B02"]),
+                "use_percentile_stretch": True,
+                "gamma": 1.0,
+                "cmap_name": "Greys_r",
+                "vmin": 0.0,
+                "vmax": 1.0,
+                "discrete_items": None,
+                "legend_title": "RGB" if ai_plan.get("sensor") != SENSOR_S1 else "SAR VV+VH",
+                "legend_units": "",
+                "stats_summary": [],
+                "default_title": f"{ai_sensor_cfg['short_name']} RGB — {ai_place}",
+                "default_subtitle": f"{ai_res.get('date_str', '')} | {ai_res.get('tile', '')}",
+                "sensor_label": ai_sensor_cfg["short_name"],
+                "date_label": str(ai_res.get("date_str", "")),
+                "resolution_m": float(ai_plan.get("resolution_m", 10.0)),
+                "tif_bytes": ai_res.get("tif_bytes"),
+                "tif_filename": ai_res.get("tif_filename") or f"AI_RGB_{ai_place}.tif",
+                "file_stem": f"AI_RGB_{ai_place}",
+                "aoi_bbox_4326": ai_res.get("bbox_4326"),
+                "aoi_polygon_4326": None,
+            }
+        # Fall back to any RGB source loaded in Workspace 1/2
+        for s in sources:
+            if s.get("is_rgb"):
+                return s
+
+    if target_layer == "workspace_layer":
+        for s in sources:
+            if s["id"] != "tab6_ai":
+                return s
+
+    # Priority 1: latest AI spatial layer (`tab6_ai`)
+    for s in sources:
+        if s["id"] == "tab6_ai":
+            return s
+
+    # Priority 2: any loaded Workspace 1/2/3 layer
+    return sources[0] if sources else None
+
+
 @st.fragment
 def _render_ai_chat_analysis_fragment(
     *,
@@ -6277,16 +6343,84 @@ def _render_ai_chat_analysis_fragment(
     target_crs: str,
     lang: str,
 ) -> None:
-    """Fragment za prikaz rezultatov satelitske/geodetske analize znotraj klepetalnega mehurčka AI agenta.
+    """Fragment za prikaz rezultatov satelitske/geodetske analize ali izrisane 300 DPI karte znotraj klepeta AI agenta.
 
-    Podpira vseh 10 zmožnosti aplikacije (poplave, požari, gozd, spektralni indeksi + NDSI snežna meja + LST,
-    RGB/SAR prizori, brezoblačni mozaik, časovne vrste, primerjava Prej/Potem s poteznico, Copernicus DEM 30 m
-    + višinski profil, načrtovanje GNSS izmere). Zemljevidi se izrišejo prek ``components.html`` brez
-    dvosmernega ``st_folium`` povratnega klica, da drsenje strani nikoli ne skače.
+    Podpira vseh 10 zmožnosti aplikacije + neposredno generiranje 300 DPI geodetskih kart (QGIS-slog).
+    Zemljevidi se izrišejo prek ``components.html`` brez dvosmernega ``st_folium`` povratnega klica,
+    da drsenje strani nikoli ne skače.
     """
     results_store: dict[str, Any] = st.session_state.get("ai_chat_results") or {}
     ai_res_show: dict[str, Any] | None = results_store.get(result_id)
-    if not (isinstance(ai_res_show, dict) and ai_res_show.get("plan")):
+    if not isinstance(ai_res_show, dict):
+        return
+
+    # --- Direct AI Chat Cartographic Map Result (Part 3: Inline 150 DPI Preview + 300 DPI PDF/PNG + WS4 Handoff) ---
+    if ai_res_show.get("kind") == "carto_map" and isinstance(ai_res_show.get("map_result"), dict):
+        m_res = ai_res_show["map_result"]
+        m_cfg = ai_res_show.get("layout_config") or {}
+        m_crs = str(ai_res_show.get("crs", target_crs))
+        m_stem = str(ai_res_show.get("stem") or "AI_Geodetic_Map")
+        fmt_lbl = t(CARTO_FORMAT_I18N.get(str(m_cfg.get("paper_format", "A4_LANDSCAPE")), "carto_fmt_a4_land"))
+        theme_lbl = t(CARTO_THEME_I18N.get(str(m_cfg.get("theme", "classic_light")), "carto_theme_classic"))
+        scale_str = format_metric_number(int(m_res.get("scale_denom", 10000)))
+
+        # Crisp 150 DPI preview image
+        st.image(m_res["png_preview_bytes"], width="stretch")
+
+        # Compact metadata pills (cartographic teal & slate, zero purple)
+        pills_html = (
+            f'<div style="display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px 0;">'
+            f'<span style="background:#F0FDFA;color:#0F766E;border:1px solid #99F6E4;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📏 {t("ai_map_pill_scale")}: M ≈ 1 : {scale_str}</span>'
+            f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📄 {t("ai_map_pill_format")}: {fmt_lbl}</span>'
+            f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📐 {t("ai_plan_crs")}: {m_crs}</span>'
+            f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">🎨 {t("ai_map_pill_theme")}: {theme_lbl}</span>'
+            f'</div>'
+        )
+        st.markdown(pills_html, unsafe_allow_html=True)
+
+        # 3 side-by-side action buttons: 300 DPI PDF, 300 DPI PNG, Fine-tune in Workspace 4
+        mc1, mc2, mc3 = st.columns(3)
+        with mc1:
+            st.download_button(
+                label=t("ai_map_btn_pdf"),
+                data=m_res["pdf_bytes"],
+                file_name=f"{m_stem}_300dpi.pdf",
+                mime="application/pdf",
+                width="stretch",
+                key=f"ai_map_dl_pdf_{result_id}",
+            )
+        with mc2:
+            st.download_button(
+                label=t("ai_map_btn_png"),
+                data=m_res["png_hires_bytes"],
+                file_name=f"{m_stem}_300dpi.png",
+                mime="image/png",
+                width="stretch",
+                key=f"ai_map_dl_png_{result_id}",
+            )
+        with mc3:
+            if st.button(
+                t("ai_map_btn_edit_ws4"),
+                type="primary",
+                width="stretch",
+                key=f"ai_map_edit_ws4_{result_id}",
+            ):
+                src_id = str(ai_res_show.get("layer_source_id") or "tab6_ai")
+                st.session_state["tab4_pending_source_select"] = src_id
+                st.session_state["tab4_pending_layout_overrides"] = dict(m_cfg)
+                st.session_state["tab4_layout_config"] = dict(m_cfg)
+                st.session_state["tab4_carto_result"] = m_res
+                st.session_state["tab4_carto_meta"] = {
+                    "crs": m_crs,
+                    "stem": m_stem,
+                    "tif_bytes": ai_res_show.get("tif_bytes"),
+                    "tif_filename": ai_res_show.get("tif_filename") or f"{m_stem}.tif",
+                }
+                st.session_state["pending_workspace"] = "ws_geo"
+                st.rerun(scope="app")
+        return
+
+    if not ai_res_show.get("plan"):
         return
 
     pl = ai_res_show["plan"]
@@ -6799,7 +6933,7 @@ def _render_ai_chat_analysis_fragment(
                 )
             )
             fig_prof.update_layout(
-                title=t("ai_profile_title"),
+                title=t("ai_profile_title", place=str(pl.get("place_name", ""))),
                 xaxis_title="Razdalja [m]" if lang == "sl" else "Distance [m]",
                 yaxis_title="Nadmorska višina [m]" if lang == "sl" else "Elevation [m a.s.l.]",
                 height=310,
@@ -9795,6 +9929,7 @@ def main() -> None:
                 st.session_state["ai_chat_messages"] = []
                 st.session_state["ai_chat_results"] = {}
                 st.session_state["ai_last_analysis_context"] = None
+                st.session_state["ai_last_map_layout"] = None
                 st.session_state["tab6_ai_result"] = None
                 st.session_state["tab6_sent_to_carto"] = False
                 st.session_state["ai_pending_chat_prompt"] = None
@@ -9965,13 +10100,117 @@ def main() -> None:
                         incoming_prompt,
                         chat_history=prior_history,
                         last_context=last_ctx,
+                        last_map_layout=st.session_state.get("ai_last_map_layout"),
                         api_key=active_key_now,
                         model=effective_gemini_model,
                         lang=lang,
                     )
                     action_now = str(route_res.get("action") or route_res.get("intent") or "chat_qa")
 
-                    if action_now == "run_analysis" and isinstance(route_res.get("plan"), dict):
+                    if action_now == "generate_map":
+                        t_layer_req = str(route_res.get("target_layer") or "latest_ai")
+                        target_src = _resolve_ai_target_carto_layer(t_layer_req, lang=lang)
+                        fb_note_str = (
+                            route_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")
+                            or ""
+                        )
+                        if target_src is None:
+                            st.session_state["ai_chat_messages"].append(
+                                {
+                                    "role": "assistant",
+                                    "content": t("ai_map_no_layer_clarify"),
+                                    "action": "ask_clarification",
+                                    "plan": None,
+                                    "result_id": None,
+                                    "fallback_note": fb_note_str,
+                                }
+                            )
+                        else:
+                            _on_ai_prog(0.25, t("ai_map_thinking"))
+                            prev_layout = st.session_state.get("ai_last_map_layout")
+                            merged_cfg = apply_incremental_layout_overrides(
+                                prev_layout,
+                                route_res.get("layout_overrides"),
+                                reset_layout=bool(route_res.get("reset_layout", False)),
+                            )
+                            if not merged_cfg.get("title"):
+                                merged_cfg["title"] = str(target_src.get("default_title") or "")
+                            if not merged_cfg.get("subtitle"):
+                                merged_cfg["subtitle"] = str(target_src.get("default_subtitle") or "")
+                            if not merged_cfg.get("author"):
+                                merged_cfg["author"] = t("carto_author_default")
+                            if not merged_cfg.get("legend_title"):
+                                merged_cfg["legend_title"] = str(target_src.get("legend_title") or "")
+
+                            map_res = render_geodetic_map(
+                                target_src,
+                                layout_config=merged_cfg,
+                                dpi=150,
+                                aoi_polygon_geojson=(
+                                    target_src["aoi_polygon_4326"]
+                                    if "aoi_polygon_4326" in target_src
+                                    else active_polygon
+                                ),
+                                aoi_bbox_4326=target_src.get("aoi_bbox_4326") or active_bbox,
+                                aoi_legend_label=t("slippy_aoi_outline"),
+                                lang=lang,
+                            )
+                            st.session_state["ai_last_map_layout"] = merged_cfg
+                            _on_ai_prog(0.82, t("ai_chat_thinking_reply"))
+
+                            m_crs = str(target_src.get("crs", target_crs))
+                            epsg_tag = m_crs.replace(":", "")
+                            m_stem = f"{target_src.get('file_stem', 'AI_Map')}_{epsg_tag}_{str(merged_cfg['paper_format']).lower()}"
+                            map_ctx = {
+                                "kind": "carto_map",
+                                "crs": m_crs,
+                                "layer_title": str(target_src.get("default_title") or ""),
+                                "scale_denom": int(map_res.get("scale_denom", 10000)),
+                                "grid_spacing_m": int(map_res.get("grid_spacing_m", 1000)),
+                                "layout_config": merged_cfg,
+                            }
+                            reply_res = generate_conversational_reply(
+                                incoming_prompt,
+                                chat_history=prior_history,
+                                analysis_context=map_ctx,
+                                api_key=active_key_now,
+                                model=effective_gemini_model,
+                                lang=lang,
+                                is_post_analysis=True,
+                            )
+                            res_store = dict(st.session_state.get("ai_chat_results") or {})
+                            res_key = f"ai_map_{len(st.session_state['ai_chat_messages'])}_{datetime.now().strftime('%H%M%S')}"
+                            res_store[res_key] = {
+                                "kind": "carto_map",
+                                "crs": m_crs,
+                                "stem": m_stem,
+                                "layer_source_id": str(target_src.get("id") or "tab6_ai"),
+                                "layout_config": merged_cfg,
+                                "map_result": map_res,
+                                "tif_bytes": target_src.get("tif_bytes"),
+                                "tif_filename": target_src.get("tif_filename") or f"{m_stem}.tif",
+                            }
+                            if len(res_store) > 6:
+                                oldest_k = next(iter(res_store))
+                                res_store.pop(oldest_k, None)
+                            st.session_state["ai_chat_results"] = res_store
+
+                            fb_map_str = (
+                                reply_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")
+                                or fb_note_str
+                                or ""
+                            )
+                            st.session_state["ai_chat_messages"].append(
+                                {
+                                    "role": "assistant",
+                                    "content": str(reply_res.get("text") or ""),
+                                    "action": "generate_map",
+                                    "plan": None,
+                                    "result_id": res_key,
+                                    "fallback_note": fb_map_str,
+                                }
+                            )
+                    elif action_now == "run_analysis" and isinstance(route_res.get("plan"), dict):
                         parsed_plan = route_res["plan"]
                         ai_out = execute_ai_plan(
                             parsed_plan,
@@ -10003,6 +10242,7 @@ def main() -> None:
                             res_store.pop(oldest_k, None)
                         st.session_state["ai_chat_results"] = res_store
                         st.session_state["ai_last_analysis_context"] = new_ctx
+                        st.session_state["ai_last_map_layout"] = None
                         st.session_state["tab6_ai_result"] = ai_out
                         st.session_state["tab6_sent_to_carto"] = False
 
