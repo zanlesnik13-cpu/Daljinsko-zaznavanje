@@ -140,7 +140,13 @@ from gnss_plan import (
     run_gnss_mission_plan,
 )
 from i18n import t
-from kartografija import format_metric_number, render_geodetic_map
+from kartografija import (
+    DEFAULT_LAYOUT_CONFIG,
+    LAYOUT_PRESETS,
+    format_metric_number,
+    merge_layout_config,
+    render_geodetic_map,
+)
 from map_overlay import (
     build_horizontal_colorbar_html,
     build_satellite_slippy_map,
@@ -818,17 +824,105 @@ SAR_WATER_DISCRETE_RGBA: dict[int, tuple[int, int, int, int]] = {
     255: (0, 0, 0, 0),         # NoData transparent
 }
 
-CARTO_FORMAT_KEYS: list[str] = ["a4_landscape", "a4_portrait", "square"]
+CARTO_FORMAT_KEYS: list[str] = ["A4_LANDSCAPE", "A4_PORTRAIT", "A3_LANDSCAPE", "SQUARE_1_1"]
 CARTO_FORMAT_I18N: dict[str, str] = {
-    "a4_landscape": "carto_fmt_a4_land",
-    "a4_portrait": "carto_fmt_a4_port",
-    "square": "carto_fmt_square",
+    "A4_LANDSCAPE": "carto_fmt_a4_land",
+    "A4_PORTRAIT": "carto_fmt_a4_port",
+    "A3_LANDSCAPE": "carto_fmt_a3_land",
+    "SQUARE_1_1": "carto_fmt_square",
 }
-CARTO_GRID_OPTIONS: list[int] = [0, 500, 1000, 2000, 5000]  # 0 = Auto
-CARTO_GRID_STYLE_KEYS: list[str] = ["light", "dark"]
+CARTO_THEME_KEYS: list[str] = ["classic_light", "minimal_white", "dark_technical"]
+CARTO_THEME_I18N: dict[str, str] = {
+    "classic_light": "carto_theme_classic",
+    "minimal_white": "carto_theme_minimal",
+    "dark_technical": "carto_theme_dark",
+}
+CARTO_TITLE_POS_KEYS: list[str] = ["top_left", "top_center", "inside_top_left", "inside_top_center", "none"]
+CARTO_TITLE_POS_I18N: dict[str, str] = {
+    "top_left": "carto_tpos_top_left",
+    "top_center": "carto_tpos_top_center",
+    "inside_top_left": "carto_tpos_in_tl",
+    "inside_top_center": "carto_tpos_in_tc",
+    "none": "carto_tpos_none",
+}
+CARTO_NOTE_POS_KEYS: list[str] = ["bottom_left", "bottom_right", "below_legend", "none"]
+CARTO_NOTE_POS_I18N: dict[str, str] = {
+    "bottom_left": "carto_npos_bl",
+    "bottom_right": "carto_npos_br",
+    "below_legend": "carto_npos_leg",
+    "none": "carto_npos_none",
+}
+CARTO_CORNER_KEYS: list[str] = ["top_right", "top_left", "bottom_right", "bottom_left"]
+CARTO_CORNER_I18N: dict[str, str] = {
+    "top_right": "carto_pos_tr",
+    "top_left": "carto_pos_tl",
+    "bottom_right": "carto_pos_br",
+    "bottom_left": "carto_pos_bl",
+}
+CARTO_NORTH_STYLE_KEYS: list[str] = ["classic_compass", "minimal_arrow", "geodetic_star"]
+CARTO_NORTH_STYLE_I18N: dict[str, str] = {
+    "classic_compass": "carto_nstyle_classic",
+    "minimal_arrow": "carto_nstyle_minimal",
+    "geodetic_star": "carto_nstyle_star",
+}
+CARTO_NORTH_SIZE_KEYS: list[str] = ["small", "medium", "large"]
+CARTO_NORTH_SIZE_I18N: dict[str, str] = {
+    "small": "carto_nsize_small",
+    "medium": "carto_nsize_medium",
+    "large": "carto_nsize_large",
+}
+CARTO_SCALE_STYLE_KEYS: list[str] = ["alternating_bar", "simple_line"]
+CARTO_SCALE_STYLE_I18N: dict[str, str] = {
+    "alternating_bar": "carto_sstyle_alt",
+    "simple_line": "carto_sstyle_line",
+}
+CARTO_LEGEND_POS_KEYS: list[str] = [
+    "right_panel",
+    "bottom_panel",
+    "inside_bottom_right",
+    "inside_top_right",
+    "inside_bottom_left",
+]
+CARTO_LEGEND_POS_I18N: dict[str, str] = {
+    "right_panel": "carto_lpos_right",
+    "bottom_panel": "carto_lpos_bottom",
+    "inside_bottom_right": "carto_lpos_in_br",
+    "inside_top_right": "carto_lpos_in_tr",
+    "inside_bottom_left": "carto_lpos_in_bl",
+}
+CARTO_INSET_POS_KEYS: list[str] = [
+    "right_panel_bottom",
+    "bottom_right",
+    "top_right",
+    "bottom_left",
+    "top_left",
+]
+CARTO_INSET_POS_I18N: dict[str, str] = {
+    "right_panel_bottom": "carto_ipos_right_bot",
+    "bottom_right": "carto_pos_br",
+    "top_right": "carto_pos_tr",
+    "bottom_left": "carto_pos_bl",
+    "top_left": "carto_pos_tl",
+}
+CARTO_GRID_OPTIONS: list[int] = [0, 250, 500, 1000, 2000, 5000]  # 0 = Auto
+CARTO_GRID_TYPE_KEYS: list[str] = ["lines", "crosses", "ticks_only"]
+CARTO_GRID_TYPE_I18N: dict[str, str] = {
+    "lines": "carto_gtype_lines",
+    "crosses": "carto_gtype_crosses",
+    "ticks_only": "carto_gtype_ticks",
+}
+CARTO_GRID_STYLE_KEYS: list[str] = ["light", "dark", "teal"]
 CARTO_GRID_STYLE_I18N: dict[str, str] = {
     "light": "carto_grid_light",
     "dark": "carto_grid_dark",
+    "teal": "carto_grid_teal",
+}
+CARTO_AOI_COLOR_KEYS: list[str] = ["#0F766E", "#DC2626", "#FFFFFF", "#000000"]
+CARTO_AOI_COLOR_I18N: dict[str, str] = {
+    "#0F766E": "carto_aoi_col_teal",
+    "#DC2626": "carto_aoi_col_red",
+    "#FFFFFF": "carto_aoi_col_white",
+    "#000000": "carto_aoi_col_black",
 }
 
 DISASTER_TYPE_KEYS: list[str] = list(DISASTER_TYPES)
@@ -981,6 +1075,10 @@ def _init_session_state() -> None:
         # Tab 4 Cartography / Print Layout state
         "tab4_carto_result": None,
         "tab4_carto_meta": None,
+        "tab4_layout_config": merge_layout_config(),
+        "tab4_last_render_sig": None,
+        "tab4_pending_preset": None,
+        "tab4_pending_layout_overrides": None,
         # Tab 5 Natural Disaster Assessment state
         "tab5_disaster_result": None,
         "tab5_last_preset": "custom",
@@ -5510,6 +5608,52 @@ def _render_comp3_swipe_fragment(
                 )
 
 
+def _apply_carto_layout_to_widgets(overrides: dict[str, Any]) -> None:
+    """Apply a ``MapLayoutConfig`` partial override dict onto Workspace 4 widget session keys before widget creation."""
+    cfg = merge_layout_config(overrides)
+    mapping = {
+        "tab4_page_format": cfg["paper_format"],
+        "tab4_theme": cfg["theme"],
+        "tab4_chk_title": bool(cfg["show_title"]),
+        "tab4_title_pos": cfg["title_position"],
+        "tab4_chk_footer": bool(cfg["show_footer"]),
+        "tab4_note_pos": cfg["custom_note_position"],
+        "tab4_chk_grid": bool(cfg["show_grid"]),
+        "tab4_grid_type": cfg["grid_style"],
+        "tab4_grid_style": cfg["grid_color"],
+        "tab4_grid_alpha": float(cfg["grid_alpha"]),
+        "tab4_grid_spacing": 0 if cfg["grid_spacing"] == "auto" else int(cfg["grid_spacing"]),
+        "tab4_chk_aoi": bool(cfg["show_aoi_outline"]),
+        "tab4_aoi_color": cfg["aoi_outline_color"],
+        "tab4_chk_north": bool(cfg["show_north_arrow"]),
+        "tab4_north_pos": cfg["north_position"],
+        "tab4_north_style": cfg["north_style"],
+        "tab4_north_size": cfg["north_size"],
+        "tab4_chk_scalebar": bool(cfg["show_scale_bar"]),
+        "tab4_scale_pos": cfg["scale_position"],
+        "tab4_scale_style": cfg["scale_style"],
+        "tab4_chk_num_scale": bool(cfg["show_numeric_scale"]),
+        "tab4_chk_legend": bool(cfg["show_legend"]),
+        "tab4_legend_pos": cfg["legend_position"],
+        "tab4_chk_leg_meta": bool(cfg["show_metadata_in_legend"]),
+        "tab4_chk_inset": bool(cfg["show_inset_map"]),
+        "tab4_inset_pos": cfg["inset_position"],
+    }
+    for wk, wv in mapping.items():
+        if wk in overrides or True:
+            st.session_state[wk] = wv
+    if overrides.get("title"):
+        st.session_state["tab4_title_input"] = str(overrides["title"])
+    if overrides.get("subtitle") is not None and "subtitle" in overrides:
+        st.session_state["tab4_subtitle_input"] = str(overrides["subtitle"])
+    if overrides.get("author"):
+        st.session_state["tab4_author_input"] = str(overrides["author"])
+    if "custom_note_text" in overrides:
+        st.session_state["tab4_note_input"] = str(overrides["custom_note_text"] or "")
+    if "legend_title" in overrides and overrides["legend_title"]:
+        st.session_state["tab4_leg_title_input"] = str(overrides["legend_title"])
+
+
 @st.fragment
 def _render_cartography_fragment(
     *,
@@ -5526,7 +5670,7 @@ def _render_cartography_fragment(
     default_scene_idx: int,
     lang: str,
 ) -> None:
-    """Fragment za kartografski studio (300 DPI PDF/PNG/GeoTIFF) brez ponovnega zagona aplikacije."""
+    """Fragment za QGIS-slog kartografski studio (300 DPI PDF/PNG/GeoTIFF) brez ponovnega zagona aplikacije."""
     st.subheader(t("carto_header"))
     st.caption(t("carto_intro"))
 
@@ -5599,18 +5743,57 @@ def _render_cartography_fragment(
                         st.error(t("load_scene_error", err=exc))
         return
 
-    col_cfg, col_prev = st.columns([0.36, 0.64], gap="large")
+    # Apply any pending 1-click preset or AI layout overrides BEFORE instantiating widgets
+    pending_preset = st.session_state.pop("tab4_pending_preset", None)
+    if pending_preset in LAYOUT_PRESETS:
+        cur_merged = dict(st.session_state.get("tab4_layout_config") or DEFAULT_LAYOUT_CONFIG)
+        cur_merged.update(LAYOUT_PRESETS[pending_preset])
+        _apply_carto_layout_to_widgets(cur_merged)
+
+    pending_overrides = st.session_state.pop("tab4_pending_layout_overrides", None)
+    if isinstance(pending_overrides, dict) and pending_overrides:
+        cur_merged = dict(st.session_state.get("tab4_layout_config") or DEFAULT_LAYOUT_CONFIG)
+        cur_merged.update(pending_overrides)
+        _apply_carto_layout_to_widgets(cur_merged)
+
+    # Initialize toggle/slider widget keys via setdefault so preset updates never trigger Streamlit default warnings
+    for _wk, _wdef in (
+        ("tab4_chk_title", True),
+        ("tab4_chk_footer", True),
+        ("tab4_chk_north", True),
+        ("tab4_chk_scalebar", True),
+        ("tab4_chk_num_scale", True),
+        ("tab4_chk_legend", True),
+        ("tab4_chk_leg_meta", True),
+        ("tab4_chk_inset", False),
+        ("tab4_chk_grid", True),
+        ("tab4_grid_alpha", 0.45),
+        ("tab4_chk_aoi", True),
+    ):
+        st.session_state.setdefault(_wk, _wdef)
+
+    # Normalize legacy lowercase paper_format value if persisted in session state
+    if st.session_state.get("tab4_page_format") not in CARTO_FORMAT_KEYS:
+        legacy_f = str(st.session_state.get("tab4_page_format") or "A4_LANDSCAPE").lower()
+        st.session_state["tab4_page_format"] = {
+            "a4_landscape": "A4_LANDSCAPE",
+            "a4_portrait": "A4_PORTRAIT",
+            "a3_landscape": "A3_LANDSCAPE",
+            "square": "SQUARE_1_1",
+        }.get(legacy_f, "A4_LANDSCAPE")
+
+    col_cfg, col_prev = st.columns([0.40, 0.60], gap="large")
 
     with col_cfg:
-        with st.container(border=True):
-            st.markdown(f"#### {t('carto_settings_header')}")
+        src_ids = [s["id"] for s in carto_sources]
+        src_map = {s["id"]: s for s in carto_sources}
+        pending_src = st.session_state.pop("tab4_pending_source_select", None)
+        if pending_src in src_ids:
+            st.session_state["tab4_source_select"] = pending_src
+            st.session_state["tab4_last_src_sig"] = None
 
-            src_ids = [s["id"] for s in carto_sources]
-            src_map = {s["id"]: s for s in carto_sources}
-            pending_src = st.session_state.pop("tab4_pending_source_select", None)
-            if pending_src in src_ids:
-                st.session_state["tab4_source_select"] = pending_src
-                st.session_state["tab4_last_src_sig"] = None
+        # --- EXPANDER 1: Layer, Paper & Theme + 1-Click Quick Presets ---
+        with st.expander(t("carto_exp_1_layer"), expanded=True):
             selected_src_id = _touch_selector(
                 t("carto_layer_label"),
                 options=src_ids,
@@ -5624,21 +5807,164 @@ def _render_cartography_fragment(
             if st.session_state.get("tab4_last_src_sig") != src["label"]:
                 st.session_state["tab4_title_input"] = src["default_title"]
                 st.session_state["tab4_subtitle_input"] = src["default_subtitle"]
+                st.session_state["tab4_leg_title_input"] = str(src.get("legend_title") or "")
                 st.session_state["tab4_last_src_sig"] = src["label"]
 
             if "tab4_author_input" not in st.session_state:
                 st.session_state["tab4_author_input"] = t("carto_author_default")
-
-            carto_title = st.text_input(t("carto_title_label"), key="tab4_title_input")
-            carto_subtitle = st.text_input(t("carto_subtitle_label"), key="tab4_subtitle_input")
-            carto_author = st.text_input(t("carto_author_label"), key="tab4_author_input")
+            if "tab4_note_input" not in st.session_state:
+                st.session_state["tab4_note_input"] = ""
+            if "tab4_leg_title_input" not in st.session_state:
+                st.session_state["tab4_leg_title_input"] = str(src.get("legend_title") or "")
 
             carto_fmt = _touch_selector(
                 t("carto_format_label"),
                 options=CARTO_FORMAT_KEYS,
-                default="a4_landscape",
+                default="A4_LANDSCAPE",
                 format_func=lambda k, _lang=lang: t(CARTO_FORMAT_I18N[k], lang=_lang),
                 key="tab4_page_format",
+                use_pills=True,
+            )
+            carto_theme = _touch_selector(
+                t("carto_theme_label"),
+                options=CARTO_THEME_KEYS,
+                default="classic_light",
+                format_func=lambda k, _lang=lang: t(CARTO_THEME_I18N[k], lang=_lang),
+                key="tab4_theme",
+                use_pills=True,
+            )
+
+            st.caption(t("carto_presets_label"))
+            pr_c1, pr_c2, pr_c3 = st.columns(3)
+            with pr_c1:
+                if st.button(t("carto_preset_thesis"), width="stretch", key="tab4_preset_thesis"):
+                    st.session_state["tab4_pending_preset"] = "thesis"
+                    st.rerun(scope="fragment")
+            with pr_c2:
+                if st.button(t("carto_preset_poster"), width="stretch", key="tab4_preset_poster"):
+                    st.session_state["tab4_pending_preset"] = "poster"
+                    st.rerun(scope="fragment")
+            with pr_c3:
+                if st.button(t("carto_preset_crisis"), width="stretch", key="tab4_preset_crisis"):
+                    st.session_state["tab4_pending_preset"] = "crisis"
+                    st.rerun(scope="fragment")
+
+        # --- EXPANDER 2: Title, Notes & Footer ---
+        with st.expander(t("carto_exp_2_text"), expanded=False):
+            chk_title = st.toggle(t("carto_chk_title"), key="tab4_chk_title")
+            title_pos = _touch_selector(
+                t("carto_title_pos_label"),
+                options=CARTO_TITLE_POS_KEYS,
+                default="top_left",
+                format_func=lambda k, _lang=lang: t(CARTO_TITLE_POS_I18N[k], lang=_lang),
+                key="tab4_title_pos",
+                use_pills=True,
+            )
+            carto_title = st.text_input(t("carto_title_label"), key="tab4_title_input")
+            carto_subtitle = st.text_input(t("carto_subtitle_label"), key="tab4_subtitle_input")
+            carto_author = st.text_input(t("carto_author_label"), key="tab4_author_input")
+
+            carto_note = st.text_input(
+                t("carto_note_label"),
+                placeholder=t("carto_note_placeholder"),
+                key="tab4_note_input",
+            )
+            note_pos = _touch_selector(
+                t("carto_note_pos_label"),
+                options=CARTO_NOTE_POS_KEYS,
+                default="bottom_right",
+                format_func=lambda k, _lang=lang: t(CARTO_NOTE_POS_I18N[k], lang=_lang),
+                key="tab4_note_pos",
+                use_pills=True,
+            )
+            chk_footer = st.toggle(t("carto_chk_footer"), key="tab4_chk_footer")
+
+        # --- EXPANDER 3: Cartographic Elements & QGIS-Style Placement ---
+        with st.expander(t("carto_exp_3_elements"), expanded=False):
+            # North Arrow
+            chk_north = st.toggle(t("carto_chk_north"), key="tab4_chk_north")
+            north_pos = _touch_selector(
+                t("carto_north_pos_label"),
+                options=CARTO_CORNER_KEYS,
+                default="top_right",
+                format_func=lambda k, _lang=lang: t(CARTO_CORNER_I18N[k], lang=_lang),
+                key="tab4_north_pos",
+                use_pills=True,
+            )
+            north_style = _touch_selector(
+                t("carto_north_style_label"),
+                options=CARTO_NORTH_STYLE_KEYS,
+                default="classic_compass",
+                format_func=lambda k, _lang=lang: t(CARTO_NORTH_STYLE_I18N[k], lang=_lang),
+                key="tab4_north_style",
+                use_pills=True,
+            )
+            north_size = _touch_selector(
+                t("carto_north_size_label"),
+                options=CARTO_NORTH_SIZE_KEYS,
+                default="medium",
+                format_func=lambda k, _lang=lang: t(CARTO_NORTH_SIZE_I18N[k], lang=_lang),
+                key="tab4_north_size",
+                use_pills=True,
+            )
+            st.divider()
+
+            # Scale Bar
+            chk_scale = st.toggle(t("carto_chk_scalebar"), key="tab4_chk_scalebar")
+            scale_pos = _touch_selector(
+                t("carto_scale_pos_label"),
+                options=CARTO_CORNER_KEYS,
+                default="bottom_left",
+                format_func=lambda k, _lang=lang: t(CARTO_CORNER_I18N[k], lang=_lang),
+                key="tab4_scale_pos",
+                use_pills=True,
+            )
+            scale_style = _touch_selector(
+                t("carto_scale_style_label"),
+                options=CARTO_SCALE_STYLE_KEYS,
+                default="alternating_bar",
+                format_func=lambda k, _lang=lang: t(CARTO_SCALE_STYLE_I18N[k], lang=_lang),
+                key="tab4_scale_style",
+                use_pills=True,
+            )
+            chk_num_scale = st.toggle(t("carto_chk_num_scale"), key="tab4_chk_num_scale")
+            st.divider()
+
+            # Legend
+            chk_legend = st.toggle(t("carto_chk_legend"), key="tab4_chk_legend")
+            legend_pos = _touch_selector(
+                t("carto_leg_pos_label"),
+                options=CARTO_LEGEND_POS_KEYS,
+                default="right_panel",
+                format_func=lambda k, _lang=lang: t(CARTO_LEGEND_POS_I18N[k], lang=_lang),
+                key="tab4_legend_pos",
+                use_pills=True,
+            )
+            carto_leg_title = st.text_input(t("carto_leg_title_label"), key="tab4_leg_title_input")
+            chk_leg_meta = st.toggle(t("carto_chk_leg_meta"), key="tab4_chk_leg_meta")
+            st.divider()
+
+            # Overview / Inset Locator Map
+            chk_inset = st.toggle(t("carto_chk_inset"), key="tab4_chk_inset")
+            inset_pos = _touch_selector(
+                t("carto_inset_pos_label"),
+                options=CARTO_INSET_POS_KEYS,
+                default="right_panel_bottom",
+                format_func=lambda k, _lang=lang: t(CARTO_INSET_POS_I18N[k], lang=_lang),
+                key="tab4_inset_pos",
+                use_pills=True,
+            )
+
+        # --- EXPANDER 4: Coordinate Grid & AOI Frame ---
+        with st.expander(t("carto_exp_4_grid"), expanded=False):
+            chk_grid = st.toggle(t("carto_chk_grid"), key="tab4_chk_grid")
+            grid_type = _touch_selector(
+                t("carto_grid_type_label"),
+                options=CARTO_GRID_TYPE_KEYS,
+                default="lines",
+                format_func=lambda k, _lang=lang: t(CARTO_GRID_TYPE_I18N[k], lang=_lang),
+                key="tab4_grid_type",
+                use_pills=True,
             )
 
             def _fmt_grid_opt(val: int, _lang: str = lang) -> str:
@@ -5652,64 +5978,94 @@ def _render_cartography_fragment(
                 default=0,
                 format_func=_fmt_grid_opt,
                 key="tab4_grid_spacing",
+                use_pills=True,
             )
-
-            carto_grid_style = _touch_selector(
+            carto_grid_color = _touch_selector(
                 t("carto_grid_style_label"),
                 options=CARTO_GRID_STYLE_KEYS,
                 default="light",
                 format_func=lambda k, _lang=lang: t(CARTO_GRID_STYLE_I18N[k], lang=_lang),
                 key="tab4_grid_style",
+                use_pills=True,
+            )
+            carto_grid_alpha = st.slider(
+                t("carto_grid_alpha_label"),
+                0.10,
+                1.00,
+                step=0.05,
+                key="tab4_grid_alpha",
+            )
+            st.divider()
+            chk_aoi = st.toggle(t("carto_chk_aoi"), key="tab4_chk_aoi")
+            aoi_col = _touch_selector(
+                t("carto_aoi_color_label"),
+                options=CARTO_AOI_COLOR_KEYS,
+                default="#0F766E",
+                format_func=lambda k, _lang=lang: t(CARTO_AOI_COLOR_I18N[k], lang=_lang),
+                key="tab4_aoi_color",
+                use_pills=True,
             )
 
-            st.caption(t("carto_elements_label"))
-            chk_c1, chk_c2 = st.columns(2)
-            with chk_c1:
-                chk_grid = st.checkbox(t("carto_chk_grid"), value=True, key="tab4_chk_grid")
-                chk_north = st.checkbox(t("carto_chk_north"), value=True, key="tab4_chk_north")
-                chk_legend = st.checkbox(t("carto_chk_legend"), value=True, key="tab4_chk_legend")
-            with chk_c2:
-                chk_scale = st.checkbox(t("carto_chk_scalebar"), value=True, key="tab4_chk_scalebar")
-                chk_aoi = st.checkbox(t("carto_chk_aoi"), value=True, key="tab4_chk_aoi")
+        # Build unified MapLayoutConfig from current composer controls
+        active_layout_cfg = merge_layout_config(
+            {
+                "paper_format": str(carto_fmt),
+                "theme": str(carto_theme),
+                "show_title": bool(chk_title),
+                "title": str(carto_title or ""),
+                "subtitle": str(carto_subtitle or ""),
+                "author": str(carto_author or ""),
+                "title_position": str(title_pos),
+                "show_footer": bool(chk_footer),
+                "custom_note_text": str(carto_note or ""),
+                "custom_note_position": str(note_pos),
+                "show_grid": bool(chk_grid),
+                "grid_spacing": "auto" if int(carto_grid_val) == 0 else int(carto_grid_val),
+                "grid_style": str(grid_type),
+                "grid_color": str(carto_grid_color),
+                "grid_alpha": float(carto_grid_alpha),
+                "show_aoi_outline": bool(chk_aoi),
+                "aoi_outline_color": str(aoi_col),
+                "show_north_arrow": bool(chk_north),
+                "north_position": str(north_pos),
+                "north_style": str(north_style),
+                "north_size": str(north_size),
+                "show_scale_bar": bool(chk_scale),
+                "scale_position": str(scale_pos),
+                "scale_style": str(scale_style),
+                "show_numeric_scale": bool(chk_num_scale),
+                "show_legend": bool(chk_legend),
+                "legend_position": str(legend_pos),
+                "legend_title": str(carto_leg_title or src.get("legend_title") or ""),
+                "show_metadata_in_legend": bool(chk_leg_meta),
+                "show_inset_map": bool(chk_inset),
+                "inset_position": str(inset_pos),
+                "markers": list((st.session_state.get("tab4_layout_config") or {}).get("markers") or []),
+            }
+        )
+        st.session_state["tab4_layout_config"] = active_layout_cfg
 
-            btn_gen_map = st.button(
-                t("carto_btn_generate"),
-                type="primary",
-                width="stretch",
-                key="tab4_btn_generate",
-            )
+        auto_live = st.toggle(t("carto_auto_live_toggle"), value=True, key="tab4_auto_live_preview")
+        btn_gen_map = st.button(
+            t("carto_btn_generate"),
+            type="primary",
+            width="stretch",
+            key="tab4_btn_generate",
+        )
 
-        if btn_gen_map:
+        # Render on button click OR automatically when auto-live is enabled and settings changed
+        cur_render_sig = (src["label"], str(sorted(active_layout_cfg.items())), lang)
+        already_rendered = st.session_state.get("tab4_carto_result") is not None
+        should_render = bool(btn_gen_map) or (
+            auto_live and (not already_rendered or st.session_state.get("tab4_last_render_sig") != cur_render_sig)
+        )
+
+        if should_render:
             with st.spinner(t("carto_spinner")):
                 try:
                     res_map = render_geodetic_map(
-                        src["raster"],
-                        crs=src["crs"],
-                        is_rgb=bool(src["is_rgb"]),
-                        bands=src["bands"],
-                        use_percentile_stretch=bool(src["use_percentile_stretch"]),
-                        gamma=float(src["gamma"]),
-                        cmap_name=str(src["cmap_name"]),
-                        vmin=float(src["vmin"]),
-                        vmax=float(src["vmax"]),
-                        discrete_items=src["discrete_items"],
-                        legend_title=str(src["legend_title"]),
-                        legend_units=str(src["legend_units"]),
-                        stats_summary=src["stats_summary"],
-                        title=carto_title,
-                        subtitle=carto_subtitle,
-                        author=carto_author,
-                        sensor_label=str(src["sensor_label"]),
-                        date_label=str(src["date_label"]),
-                        resolution_m=float(src["resolution_m"]),
-                        page_format=str(carto_fmt),
-                        show_grid=bool(chk_grid),
-                        grid_spacing_m=(None if int(carto_grid_val) == 0 else int(carto_grid_val)),
-                        grid_style=str(carto_grid_style),
-                        show_scalebar=bool(chk_scale),
-                        show_north_arrow=bool(chk_north),
-                        show_legend=bool(chk_legend),
-                        show_aoi_outline=bool(chk_aoi),
+                        src,
+                        layout_config=active_layout_cfg,
                         aoi_polygon_geojson=(
                             src["aoi_polygon_4326"] if "aoi_polygon_4326" in src else active_polygon
                         ),
@@ -5726,7 +6082,7 @@ def _render_cartography_fragment(
                         )
                         tif_out = export_to_geotiff_bytes(tif_src, target_epsg=src["crs"])
                     epsg_tag = str(src["crs"]).replace(":", "")
-                    stem = f"{src['file_stem']}_{epsg_tag}_{carto_fmt}"
+                    stem = f"{src['file_stem']}_{epsg_tag}_{str(carto_fmt).lower()}"
                     st.session_state["tab4_carto_result"] = res_map
                     st.session_state["tab4_carto_meta"] = {
                         "crs": str(src["crs"]),
@@ -5734,6 +6090,7 @@ def _render_cartography_fragment(
                         "tif_bytes": tif_out,
                         "tif_filename": src["tif_filename"],
                     }
+                    st.session_state["tab4_last_render_sig"] = cur_render_sig
                     gc.collect()
                 except Exception as exc:
                     st.error(t("carto_error", err=exc))
