@@ -96,6 +96,30 @@ TEMPORAL_INTERVAL_KEYS: tuple[str, ...] = (
     INTERVAL_YEARLY,
 )
 
+# Target season definitions for Yearly ("Letno") same-season comparison
+SEASON_SUMMER: str = "summer"
+SEASON_SPRING: str = "spring"
+SEASON_AUTUMN: str = "autumn"
+SEASON_WINTER: str = "winter"
+SEASON_ALL_YEAR: str = "all_year"
+YEARLY_SEASON_KEYS: tuple[str, ...] = (
+    SEASON_SUMMER,
+    SEASON_SPRING,
+    SEASON_AUTUMN,
+    SEASON_WINTER,
+    SEASON_ALL_YEAR,
+)
+YEARLY_SEASON_SPECS: dict[str, dict[str, Any]] = {
+    SEASON_SUMMER: {"months": (6, 7, 8), "expanded_months": (5, 9), "mid_doy": 196},
+    SEASON_SPRING: {"months": (4, 5), "expanded_months": (3, 6), "mid_doy": 121},
+    SEASON_AUTUMN: {"months": (9, 10), "expanded_months": (8, 11), "mid_doy": 274},
+    SEASON_WINTER: {"months": (12, 1, 2), "expanded_months": (11, 3), "mid_doy": 15},
+    SEASON_ALL_YEAR: {"months": tuple(range(1, 13)), "expanded_months": (), "mid_doy": 196},
+}
+
+# Sentinel-2 granules with >= 95% nodata are corrupt/empty downlink gaps (often reporting 0.0% cloud!)
+S2_MAX_NODATA_PIXEL_PCT: float = 95.0
+
 # ESA Sentinel-2 Processing Baseline 04.00 activation date (added +1000 BOA offset)
 PB04_START_UTC: datetime = datetime(2022, 1, 25, 0, 0, 0, tzinfo=timezone.utc)
 REFLECTANCE_SCALE: float = 10000.0
@@ -609,14 +633,16 @@ def group_items_by_date(
                 reverse=True,
             )
         else:
-            # Prefer clearer and more recently processed tiles first during mosaic fusion
-            def _opt_sort_key(it: pystac.Item) -> tuple[float, float, str]:
+            # Prefer valid low-nodata tiles, then clearer and more recently processed tiles during mosaic fusion
+            def _opt_sort_key(it: pystac.Item) -> tuple[int, float, float, str]:
+                nd_pct = _get_s2_nodata_pct(it)
+                nd_pen = 1 if (nd_pct is not None and nd_pct >= 50.0) else 0
                 raw_c = it.properties.get("eo:cloud_cover")
                 try:
                     c_val = float(raw_c) if raw_c is not None else float("inf")
                 except (TypeError, ValueError):
                     c_val = float("inf")
-                return (c_val, -_extract_item_datetime_utc(it).timestamp(), it.id)
+                return (nd_pen, c_val, -_extract_item_datetime_utc(it).timestamp(), it.id)
 
             day_items.sort(key=_opt_sort_key)
 
@@ -652,22 +678,47 @@ def group_items_by_date(
     return grouped_items, summary_df
 
 
+def _get_s2_nodata_pct(item: pystac.Item) -> float | None:
+    """Return ``s2:nodata_pixel_percentage`` [0..100] if present and finite, else ``None``."""
+    raw = item.properties.get("s2:nodata_pixel_percentage")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+        return val if np.isfinite(val) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _circular_doy_distance(doy: int, target_doy: int) -> int:
+    """Return circular calendar distance in days (0..182) between two days-of-year."""
+    diff = abs(int(doy) - int(target_doy))
+    return min(diff, 365 - diff)
+
+
 def filter_by_temporal_interval(
     df_dates: pd.DataFrame,
     items_by_date: dict[str, list[pystac.Item]],
     interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Select the single best/clearest date per temporal bucket (14d / monthly / seasonal / yearly).
 
     For each bucket picks the date with the highest ``coverage_pct`` and lowest ``cloud_cover``.
-    For ``yearly`` mode applies a subtle preference for growing-season/summer months (May–Sep)
-    among full-coverage dates so multi-year vegetation/land-cover comparisons stay consistent.
+    For ``yearly`` mode enforces same-season matching via ``target_season`` (default: ``summer``
+    Jun–Aug) so winter and summer scenes are never mixed in multi-year comparisons. If a year
+    has zero scenes in the exact season months, optionally expands by ±1 month and records that
+    year in ``filtered_df.attrs["expanded_season_years"]``.
 
-    Returns ``(grouped_items, filtered_df)`` ordered newest-first.
+    Returns ``(grouped_items, filtered_df)`` ordered newest-first, keeping the top 4 clearest
+    candidates per bucket in ``filtered_df.attrs["candidates_by_bucket"]`` for AOI cloud fallback.
     """
     mode = str(interval_mode or INTERVAL_ALL).strip().lower()
     if mode not in TEMPORAL_INTERVAL_KEYS:
         mode = INTERVAL_ALL
+    season_key = str(target_season or SEASON_SUMMER).strip().lower()
+    if season_key not in YEARLY_SEASON_SPECS:
+        season_key = SEASON_SUMMER
 
     base_total = int(len(df_dates))
     base_before_cov = int(df_dates.attrs.get("total_dates_before_coverage_filter", base_total))
@@ -676,11 +727,14 @@ def filter_by_temporal_interval(
     if df_dates.empty:
         empty_df = pd.DataFrame(columns=SUMMARY_COLUMNS)
         empty_df.attrs["items_by_date"] = _NoDeepCopyDict()
+        empty_df.attrs["candidates_by_bucket"] = _NoDeepCopyDict()
         empty_df.attrs["total_dates_before_coverage_filter"] = base_before_cov
         empty_df.attrs["filtered_partial_dates"] = base_partial
         empty_df.attrs["total_dates_found"] = 0
         empty_df.attrs["selected_dates_count"] = 0
         empty_df.attrs["interval_mode"] = mode
+        empty_df.attrs["target_season"] = season_key
+        empty_df.attrs["expanded_season_years"] = []
         return [], empty_df
 
     # Extract lightweight plain records without triggering DataFrame.attrs deep copies
@@ -702,6 +756,8 @@ def filter_by_temporal_interval(
         ordered_df.attrs["total_dates_found"] = base_total
         ordered_df.attrs["selected_dates_count"] = len(ordered_df)
         ordered_df.attrs["interval_mode"] = mode
+        ordered_df.attrs["target_season"] = season_key
+        ordered_df.attrs["expanded_season_years"] = []
         return grouped, ordered_df
 
     buckets: dict[tuple[int, int], list[dict[str, Any]]] = {}
@@ -710,8 +766,8 @@ def filter_by_temporal_interval(
         if d_str not in items_by_date:
             continue
         dt_val = date.fromisoformat(d_str[:10])
+        doy = dt_val.timetuple().tm_yday
         if mode == INTERVAL_14D:
-            doy = dt_val.timetuple().tm_yday
             bucket_key = (dt_val.year, (doy - 1) // 14)
         elif mode == INTERVAL_MONTHLY:
             bucket_key = (dt_val.year, dt_val.month)
@@ -722,32 +778,53 @@ def filter_by_temporal_interval(
 
         rec_copy = dict(rec)
         rec_copy["_month"] = dt_val.month
+        rec_copy["_doy"] = doy
         buckets.setdefault(bucket_key, []).append(rec_copy)
+
+    season_spec = YEARLY_SEASON_SPECS[season_key]
+    exact_months = set(season_spec["months"])
+    expanded_months = set(season_spec["expanded_months"])
+    mid_doy = int(season_spec["mid_doy"])
 
     selected_rows: list[dict[str, Any]] = []
     candidates_by_bucket: dict[str, list[list[pystac.Item]]] = {}
+    expanded_season_years: list[int] = []
+
     for bucket_key in sorted(buckets.keys(), reverse=True):
         cands = buckets[bucket_key]
 
-        def _cand_rank(r: dict[str, Any]) -> tuple[float, int, float, int, str]:
+        if mode == INTERVAL_YEARLY and season_key != SEASON_ALL_YEAR:
+            in_season = [r for r in cands if int(r.get("_month", 0)) in exact_months]
+            if in_season:
+                cands = in_season
+            else:
+                # Fallback: ±1 month buffer if exact season has zero scenes that year
+                in_expanded = [r for r in cands if int(r.get("_month", 0)) in expanded_months]
+                if in_expanded:
+                    cands = in_expanded
+                    expanded_season_years.append(int(bucket_key[0]))
+                else:
+                    # Never mix opposite seasons (e.g., winter Dec in a Summer yearly series)
+                    continue
+
+        def _cand_rank(r: dict[str, Any]) -> tuple[float, float, int, str]:
             cov_raw = r.get("coverage_pct", 100.0)
             cov = float(cov_raw) if pd.notna(cov_raw) else 100.0
             cld_raw = r.get("cloud_cover", np.nan)
             cld = float(cld_raw) if pd.notna(cld_raw) else 50.0
-            month = int(r.get("_month", 7))
+            doy_val = int(r.get("_doy", mid_doy))
             if mode == INTERVAL_YEARLY:
-                # Highest rounded coverage first, then subtle growing-season preference (May-Sep),
-                # then lowest cloud cover, then closest to mid-July.
-                summer_pen = 0 if (5 <= month <= 9) else 1
-                return (-round(cov, 0), summer_pen, cld, abs(month - 7), str(r["date_str"]))
-            return (-round(cov, 1), 0, cld, 0, str(r["date_str"]))
+                doy_dist = _circular_doy_distance(doy_val, mid_doy)
+                return (-round(cov, 0), cld, doy_dist, str(r["date_str"]))
+            return (-round(cov, 1), cld, 0, str(r["date_str"]))
 
         ranked_cands = sorted(cands, key=_cand_rank)
         best = dict(ranked_cands[0])
         best.pop("_month", None)
+        best.pop("_doy", None)
         best_date = str(best["date_str"])
         selected_rows.append(best)
-        # Keep top 4 clearest candidate dates per time bucket for AOI-level cloud fallback
+        # Keep top 4 clearest same-season candidate dates per time bucket for AOI-level cloud fallback
         candidates_by_bucket[best_date] = [
             items_by_date[str(c["date_str"])]
             for c in ranked_cands[:4]
@@ -768,6 +845,8 @@ def filter_by_temporal_interval(
     filtered_df.attrs["total_dates_found"] = base_total
     filtered_df.attrs["selected_dates_count"] = len(filtered_df)
     filtered_df.attrs["interval_mode"] = mode
+    filtered_df.attrs["target_season"] = season_key
+    filtered_df.attrs["expanded_season_years"] = sorted(expanded_season_years)
     return grouped_items, filtered_df
 
 
@@ -826,6 +905,7 @@ def _finalize_search_results(
     aoi_polygon_4326: dict[str, Any] | None,
     min_coverage_pct: float,
     interval_mode: str,
+    target_season: str = SEASON_SUMMER,
     limit: int | None,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Group by date, filter partial swaths, apply temporal interval, and attach raw archive metadata."""
@@ -844,6 +924,7 @@ def _finalize_search_results(
         full_df,
         raw_items_by_date,
         interval_mode=interval_mode,
+        target_season=target_season,
     )
 
     if limit is not None and int(limit) > 0 and len(final_df) > int(limit):
@@ -873,6 +954,7 @@ def search_sentinel2(
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Search Sentinel-2 L2A scenes on Planetary Computer, grouped by date with coverage & interval filters."""
     if len(bbox_4326) != 4:
@@ -889,6 +971,14 @@ def search_sentinel2(
         max_items_per_window=1000,
         page_limit=250,
     )
+    # Filter out corrupt/empty Sentinel-2 granules (e.g. 2024-09-01 with s2:nodata_pixel_percentage == 100.0
+    # and misleading eo:cloud_cover == 0.0) that produce completely transparent/blank overlays.
+    raw_items = [
+        it
+        for it in raw_items
+        if (_get_s2_nodata_pct(it) is None or float(_get_s2_nodata_pct(it) or 0.0) < S2_MAX_NODATA_PIXEL_PCT)
+    ]
+
     return _finalize_search_results(
         raw_items,
         sensor=SENSOR_S2,
@@ -896,6 +986,7 @@ def search_sentinel2(
         aoi_polygon_4326=aoi_polygon_4326,
         min_coverage_pct=min_coverage_pct,
         interval_mode=interval_mode,
+        target_season=target_season,
         limit=limit,
     )
 
@@ -1044,6 +1135,7 @@ def search_landsat(
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Search Landsat 4/5/7/8/9 Collection 2 Level-2 scenes across the full 1984–present archive."""
     if len(bbox_4326) != 4:
@@ -1073,6 +1165,7 @@ def search_landsat(
         aoi_polygon_4326=aoi_polygon_4326,
         min_coverage_pct=min_coverage_pct,
         interval_mode=interval_mode,
+        target_season=target_season,
         limit=limit,
     )
 
@@ -1308,6 +1401,7 @@ def search_sentinel1(
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Search Sentinel-1 SAR RTC scenes on Planetary Computer, grouped by date with coverage & interval filters."""
     if len(bbox_4326) != 4:
@@ -1331,6 +1425,7 @@ def search_sentinel1(
         aoi_polygon_4326=aoi_polygon_4326,
         min_coverage_pct=min_coverage_pct,
         interval_mode=interval_mode,
+        target_season=target_season,
         limit=limit,
     )
 
@@ -1456,6 +1551,7 @@ def search_scenes(
     aoi_polygon_4326: dict[str, Any] | None = None,
     min_coverage_pct: float = DEFAULT_MIN_AOI_COVERAGE_PCT,
     interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
     """Dispatch full-archive date-grouped STAC search with coverage & temporal interval filters."""
     if sensor == SENSOR_S2:
@@ -1468,6 +1564,7 @@ def search_scenes(
             aoi_polygon_4326=aoi_polygon_4326,
             min_coverage_pct=min_coverage_pct,
             interval_mode=interval_mode,
+            target_season=target_season,
         )
     if sensor == SENSOR_LANDSAT:
         return search_landsat(
@@ -1480,6 +1577,7 @@ def search_scenes(
             aoi_polygon_4326=aoi_polygon_4326,
             min_coverage_pct=min_coverage_pct,
             interval_mode=interval_mode,
+            target_season=target_season,
         )
     if sensor == SENSOR_S1:
         return search_sentinel1(
@@ -1490,6 +1588,7 @@ def search_scenes(
             aoi_polygon_4326=aoi_polygon_4326,
             min_coverage_pct=min_coverage_pct,
             interval_mode=interval_mode,
+            target_season=target_season,
         )
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")
 

@@ -14,7 +14,7 @@ import logging
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Sequence
 
 import matplotlib
@@ -36,6 +36,7 @@ from analize import (
     get_required_bands_for_sensor,
 )
 from geodezija_crs import clip_to_aoi_polygon, get_parallel_workers
+from map_overlay import raster_to_map_overlay_png
 from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
 
 logger = logging.getLogger(__name__)
@@ -1057,6 +1058,212 @@ def generate_timelapse_frames(
     }
 
 
+def _compute_aoi_clear_pct(
+    ds: xr.Dataset,
+    *,
+    sensor: str,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+) -> float:
+    """Compute percentage [0..100] of genuinely cloud-free, non-NoData pixels inside the AOI."""
+    data_vars = [
+        str(v)
+        for v in ds.data_vars
+        if str(v) not in ("SCL", "QA_PIXEL", "qa_pixel")
+    ]
+    if not data_vars:
+        return 0.0
+
+    ref_da = ds[data_vars[0]]
+    denom_px = int(ref_da.size)
+    if aoi_polygon_4326 is not None and denom_px > 0:
+        try:
+            ones_da = xr.DataArray(
+                np.ones(ref_da.shape, dtype=np.float32),
+                dims=ref_da.dims,
+                coords=ref_da.coords,
+            )
+            crs = ds.rio.crs or ref_da.rio.crs
+            if crs is not None:
+                ones_da = ones_da.rio.write_crs(crs, inplace=False)
+            ones_da = ones_da.rio.write_nodata(np.nan, inplace=False)
+            clipped_ones = clip_to_aoi_polygon(ones_da, aoi_polygon_4326, drop=False)
+            poly_px = int(np.count_nonzero(np.isfinite(clipped_ones.values)))
+            if poly_px > 0:
+                denom_px = poly_px
+        except Exception:
+            pass
+
+    if denom_px <= 0:
+        return 0.0
+
+    if sensor == SENSOR_S1:
+        clear_mask = np.ones(ref_da.shape, dtype=bool)
+        for v in data_vars:
+            clear_mask &= np.isfinite(ds[v].values)
+    else:
+        masked_ds, _ = apply_cloud_mask(ds, mask_clouds=True, sensor=sensor)
+        clear_mask = np.ones(ref_da.shape, dtype=bool)
+        for v in data_vars:
+            clear_mask &= np.isfinite(masked_ds[v].values)
+
+    clear_px = int(np.count_nonzero(clear_mask))
+    return round(float(np.clip(100.0 * clear_px / denom_px, 0.0, 100.0)), 1)
+
+
+def load_clear_scene_with_fallback(
+    target_date: str,
+    all_candidates: Sequence[StacItemOrGroup],
+    bbox_4326: Sequence[float],
+    target_epsg: int | str = "EPSG:3794",
+    sensor: str = SENSOR_S2,
+    resolution: float = 10.0,
+    min_clear_pct: float = 75.0,
+    *,
+    bands: Sequence[str] = ("B04", "B03", "B02"),
+    primary_group: StacItemOrGroup | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    auto_fallback: bool = True,
+    max_day_delta: int = 45,
+    same_season_months: Sequence[int] | None = None,
+    max_attempts: int = 6,
+) -> tuple[xr.Dataset, dict[str, Any]]:
+    """Load the target scene and verify actual cloud-free pixel share INSIDE the AOI.
+
+    Uses Sentinel-2 ``SCL`` or Landsat ``QA_PIXEL`` to measure genuine cloud-free pixels over
+    the AOI (eliminating cases where global STAC ``eo:cloud_cover`` is low but a cloud sits
+    right on top of the AOI). If the chosen date has ``< min_clear_pct`` clear pixels and
+    ``auto_fallback`` is enabled, automatically searches nearby candidate dates (preferring
+    same-season / within ``±max_day_delta`` days and lowest cloud cover) until a genuinely
+    clear scene is found.
+    """
+    is_sar = sensor == SENSOR_S1
+    load_bands = [str(b) for b in bands]
+    added_mask_band = False
+    mask_band_name = "QA_PIXEL" if sensor == SENSOR_LANDSAT else "SCL"
+    if (not is_sar) and (mask_band_name not in load_bands):
+        load_bands.append(mask_band_name)
+        added_mask_band = True
+
+    # Normalize and deduplicate candidate groups by acquisition date
+    norm_groups: list[list[pystac.Item]] = []
+    seen_dates: set[str] = set()
+    primary_norm: list[pystac.Item] | None = None
+    if primary_group is not None:
+        pg = [primary_group] if isinstance(primary_group, pystac.Item) else list(primary_group)
+        if pg:
+            primary_norm = pg
+            _, p_date, _, _, _ = _group_metadata(pg, sensor=sensor)
+            seen_dates.add(p_date)
+
+    for raw_cand in all_candidates or ():
+        grp = [raw_cand] if isinstance(raw_cand, pystac.Item) else [it for it in raw_cand if isinstance(it, pystac.Item)]
+        if not grp:
+            continue
+        try:
+            _, c_date, _, _, _ = _group_metadata(grp, sensor=sensor)
+        except Exception:
+            continue
+        if primary_norm is None and c_date == str(target_date)[:10]:
+            primary_norm = grp
+            seen_dates.add(c_date)
+            continue
+        if c_date not in seen_dates:
+            seen_dates.add(c_date)
+            norm_groups.append(grp)
+
+    if primary_norm is None:
+        if not norm_groups:
+            raise ValueError(f"No candidate STAC items available for target_date={target_date!r}.")
+        primary_norm = norm_groups.pop(0)
+
+    target_dt = date.fromisoformat(str(target_date)[:10])
+    season_month_set = set(int(m) for m in same_season_months) if same_season_months else None
+
+    def _fallback_sort_key(grp: list[pystac.Item]) -> tuple[int, int, int, float, str]:
+        _, c_date, _, _, c_cld = _group_metadata(grp, sensor=sensor)
+        c_dt = date.fromisoformat(c_date[:10])
+        days_diff = abs((c_dt - target_dt).days)
+        same_year = 0 if c_dt.year == target_dt.year else 1
+        in_window = 0 if days_diff <= int(max_day_delta) else 1
+        in_season = 0 if (season_month_set is None or c_dt.month in season_month_set) else 1
+        cld_val = float(c_cld) if np.isfinite(c_cld) else 50.0
+        # Prefer: same-year & in-season/in-window first, then closest date, then lowest cloud
+        tier = 0 if (in_window == 0 and in_season == 0) else (
+            1 if (same_year == 0 and in_season == 0) else (
+                2 if in_window == 0 else (3 if same_year == 0 else 4)
+            )
+        )
+        return (tier, same_year, days_diff, cld_val, c_date)
+
+    fallback_groups = sorted(norm_groups, key=_fallback_sort_key)
+    # Only consider fallbacks in the same year or within ±max_day_delta days (never jump years)
+    fallback_groups = [
+        g
+        for g in fallback_groups
+        if (
+            abs((date.fromisoformat(_group_metadata(g, sensor=sensor)[1][:10]) - target_dt).days) <= max(int(max_day_delta), 120)
+            or date.fromisoformat(_group_metadata(g, sensor=sensor)[1][:10]).year == target_dt.year
+        )
+    ]
+
+    ordered_attempts = [primary_norm] + (fallback_groups[: max(0, int(max_attempts) - 1)] if auto_fallback else [])
+
+    best_ds: xr.Dataset | None = None
+    best_info: dict[str, Any] | None = None
+    orig_clear_pct: float | None = None
+    _, prim_date_str, _, _, _ = _group_metadata(primary_norm, sensor=sensor)
+
+    for attempt_idx, grp in enumerate(ordered_attempts):
+        _, d_str, s_id, plat, _ = _group_metadata(grp, sensor=sensor)
+        try:
+            ds_cand = load_scene(
+                sensor=sensor,
+                item=grp,
+                bbox_4326=bbox_4326,
+                bands=load_bands,
+                target_epsg=target_epsg,
+                resolution=float(resolution),
+                aoi_polygon_4326=aoi_polygon_4326,
+            )
+        except Exception as exc:
+            logger.warning("Failed loading candidate %s during cloud fallback: %s", d_str, exc)
+            continue
+
+        clear_pct = _compute_aoi_clear_pct(
+            ds_cand, sensor=sensor, aoi_polygon_4326=aoi_polygon_4326
+        )
+        if attempt_idx == 0:
+            orig_clear_pct = clear_pct
+
+        if best_info is None or clear_pct > float(best_info["actual_clear_pct"]):
+            if best_ds is not None:
+                del best_ds
+            best_ds = ds_cand
+            best_info = {
+                "requested_date": prim_date_str,
+                "actual_date": d_str,
+                "replaced": (attempt_idx > 0 and d_str != prim_date_str),
+                "original_clear_pct": float(orig_clear_pct if orig_clear_pct is not None else clear_pct),
+                "actual_clear_pct": float(clear_pct),
+                "platform": plat,
+                "scene_id": s_id,
+                "item_group": grp,
+            }
+        else:
+            del ds_cand
+
+        if (not auto_fallback) or (clear_pct >= float(min_clear_pct)):
+            break
+
+    if best_ds is None or best_info is None:
+        raise RuntimeError(f"Could not load any valid scene around {target_date}.")
+
+    if added_mask_band and mask_band_name in best_ds.data_vars:
+        best_ds = best_ds.drop_vars(mask_band_name)
+
+    return best_ds, best_info
+
+
 def render_multi_date_comparison(
     item_groups: Sequence[StacItemOrGroup],
     date_labels: Sequence[str],
@@ -1068,12 +1275,24 @@ def render_multi_date_comparison(
     aoi_polygon_4326: dict[str, Any] | None = None,
     mask_clouds: bool = True,
     max_width: int = 720,
+    *,
+    all_candidates: Sequence[StacItemOrGroup] | None = None,
+    candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
+    auto_cloud_fallback: bool = True,
+    min_clear_pct: float = 75.0,
+    same_season_months: Sequence[int] | None = None,
+    overlay_max_width: int = 1800,
 ) -> dict[str, Any]:
     """Render 2 or 3 pixel-aligned dates (RGB, NIR, or Spectral Index / SAR) for multi-date comparison.
 
-    Returns identical-dimension ``swipe_pngs`` (unstamped, for clean curtain swipe),
-    ``strip_pngs`` (date-stamped, for 3-panel side-by-side strip), and when an index/SAR
-    metric is selected, ``da_first``, ``da_last``, and ``diff_da = da_last - da_first``.
+    Performs automatic pixel-level AOI cloud-free validation & fallback via
+    ``load_clear_scene_with_fallback`` (default ``min_clear_pct=75.0``) so cloudy dates
+    over the AOI are swapped with the nearest genuinely clear scene.
+
+    Returns identical-dimension ``swipe_pngs``, ``strip_pngs``, high-resolution EPSG:4326
+    Leaflet ``overlay_uris`` + ``overlay_bounds`` (for the zoomable/pannable curtain swipe map),
+    ``replacements`` log, and when an index/SAR metric is selected, ``da_first``, ``da_last``,
+    and ``diff_da = da_last - da_first``.
     """
     mode = layer_mode.strip().upper()
     is_sar = sensor == SENSOR_S1
@@ -1096,20 +1315,49 @@ def render_multi_date_comparison(
 
     swipe_pngs: list[bytes] = []
     strip_pngs: list[bytes] = []
+    overlay_uris: list[str] = []
+    overlay_bounds: list[list[list[float]]] = []
+    actual_dates: list[str] = []
+    clear_pcts: list[float] = []
+    replacements: list[dict[str, Any]] = []
     target_size: tuple[int, int] | None = None
     da_first: xr.DataArray | None = None
     da_last: xr.DataArray | None = None
 
     for idx, (grp, d_lbl) in enumerate(zip(item_groups, date_labels)):
-        ds = load_scene(
-            sensor=sensor,
-            item=grp,
+        cand_pool: list[StacItemOrGroup] = []
+        if candidates_by_date and str(d_lbl) in candidates_by_date:
+            cand_pool.extend(candidates_by_date[str(d_lbl)])
+        if all_candidates:
+            cand_pool.extend(all_candidates)
+
+        ds, fb_info = load_clear_scene_with_fallback(
+            target_date=str(d_lbl),
+            all_candidates=cand_pool,
             bbox_4326=bbox_4326,
-            bands=req_bands,
             target_epsg=target_epsg,
+            sensor=sensor,
             resolution=float(resolution),
+            min_clear_pct=float(min_clear_pct),
+            bands=req_bands,
+            primary_group=grp,
             aoi_polygon_4326=aoi_polygon_4326,
+            auto_fallback=bool(auto_cloud_fallback),
+            same_season_months=same_season_months,
         )
+        eff_date = str(fb_info["actual_date"])
+        actual_dates.append(eff_date)
+        clear_pcts.append(float(fb_info["actual_clear_pct"]))
+        if fb_info.get("replaced"):
+            replacements.append(
+                {
+                    "requested_date": str(fb_info["requested_date"]),
+                    "actual_date": eff_date,
+                    "original_clear_pct": float(fb_info["original_clear_pct"]),
+                    "actual_clear_pct": float(fb_info["actual_clear_pct"]),
+                }
+            )
+
         try:
             if is_rgb_composite:
                 y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64)
@@ -1119,7 +1367,19 @@ def render_multi_date_comparison(
                 if target_size is None:
                     target_size = im.size
                 swipe_pngs.append(pil_to_png_bytes(im))
-                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{d_lbl} | {mode}")))
+                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{eff_date} | {mode}")))
+
+                ov_uri, ov_bnds = raster_to_map_overlay_png(
+                    ds,
+                    src_epsg=target_epsg,
+                    is_rgb=True,
+                    bands=req_bands,
+                    use_percentile_stretch=True,
+                    gamma=1.0,
+                    max_width=int(overlay_max_width),
+                )
+                overlay_uris.append(ov_uri)
+                overlay_bounds.append(ov_bnds)
             else:
                 masked_ds, _ = apply_cloud_mask(ds, mask_clouds=use_cloud_mask, sensor=sensor)
                 layer_da = _compute_layer(masked_ds, sensor=sensor, metric_name=mode)
@@ -1140,7 +1400,19 @@ def render_multi_date_comparison(
                 if target_size is None:
                     target_size = im.size
                 swipe_pngs.append(pil_to_png_bytes(im))
-                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{d_lbl} | {mode}")))
+                strip_pngs.append(pil_to_png_bytes(_stamp_banner_on_pil(im.copy(), f"{eff_date} | {mode}")))
+
+                ov_uri, ov_bnds = raster_to_map_overlay_png(
+                    layer_da,
+                    src_epsg=target_epsg,
+                    is_rgb=False,
+                    cmap_name=str(spec["cmap"]),
+                    vmin=float(spec["vmin"]),
+                    vmax=float(spec["vmax"]),
+                    max_width=int(overlay_max_width),
+                )
+                overlay_uris.append(ov_uri)
+                overlay_bounds.append(ov_bnds)
         finally:
             del ds
             gc.collect()
@@ -1161,10 +1433,16 @@ def render_multi_date_comparison(
         diff_da = diff_da.rio.write_nodata(np.nan, inplace=False)
 
     return {
-        "dates": list(date_labels),
+        "dates": actual_dates,
+        "requested_dates": list(date_labels),
+        "clear_pcts": clear_pcts,
+        "replacements": replacements,
         "layer_mode": mode,
         "swipe_pngs": swipe_pngs,
         "strip_pngs": strip_pngs,
+        "overlay_uris": overlay_uris,
+        "overlay_bounds": overlay_bounds,
+        "bbox_4326": [float(v) for v in bbox_4326],
         "da_first": da_first,
         "da_last": da_last,
         "diff_da": diff_da,

@@ -34,6 +34,7 @@ import xarray as xr
 
 from analize import apply_cloud_mask, compute_index
 from geodezija_crs import CRS_D96TM, export_to_geotiff_bytes
+from map_overlay import raster_to_map_overlay_png
 from stac_loader import (
     DEFAULT_MIN_AOI_COVERAGE_PCT,
     INTERVAL_ALL,
@@ -835,9 +836,55 @@ def run_disaster_assessment(
         aoi_polygon_4326=aoi_polygon_4326,
     )
 
-    # 3. Compute before/after swipe RGB/SAR pair + disaster impact classification
+    # 3. Compute before/after swipe RGB/SAR pair + zoomable EPSG:4326 overlays + disaster impact classification
     _prog(0.84, "Računam karto prizadetosti in površine [ha]..." if lang == "sl" else "Computing impact map and exact areas [ha]...")
     swipe_pre_png, swipe_post_png = render_disaster_swipe_pair(ds_pre, ds_ev, is_sar=is_sar)
+
+    overlay_uri_pre: str | None = None
+    overlay_uri_post: str | None = None
+    overlay_bounds_pre: list[list[float]] | None = None
+    overlay_bounds_post: list[list[float]] | None = None
+    try:
+        if is_sar:
+            overlay_uri_pre, overlay_bounds_pre = raster_to_map_overlay_png(
+                ds_pre["VV"],
+                src_epsg=target_crs,
+                is_rgb=False,
+                cmap_name="Greys_r",
+                vmin=-22.0,
+                vmax=-2.0,
+                max_width=1800,
+            )
+            overlay_uri_post, overlay_bounds_post = raster_to_map_overlay_png(
+                ds_ev["VV"],
+                src_epsg=target_crs,
+                is_rgb=False,
+                cmap_name="Greys_r",
+                vmin=-22.0,
+                vmax=-2.0,
+                max_width=1800,
+            )
+        else:
+            overlay_uri_pre, overlay_bounds_pre = raster_to_map_overlay_png(
+                ds_pre,
+                src_epsg=target_crs,
+                is_rgb=True,
+                bands=["B04", "B03", "B02"],
+                use_percentile_stretch=True,
+                gamma=1.0,
+                max_width=1800,
+            )
+            overlay_uri_post, overlay_bounds_post = raster_to_map_overlay_png(
+                ds_ev,
+                src_epsg=target_crs,
+                is_rgb=True,
+                bands=["B04", "B03", "B02"],
+                use_percentile_stretch=True,
+                gamma=1.0,
+                max_width=1800,
+            )
+    except Exception:
+        pass
 
     continuous_da: xr.DataArray | None = None
     if disaster_type == DISASTER_FLOOD:
@@ -900,6 +947,10 @@ def run_disaster_assessment(
         "summary": summary,
         "swipe_png_pre": swipe_pre_png,
         "swipe_png_post": swipe_post_png,
+        "overlay_uri_pre": overlay_uri_pre,
+        "overlay_uri_post": overlay_uri_post,
+        "overlay_bounds_pre": overlay_bounds_pre,
+        "overlay_bounds_post": overlay_bounds_post,
         "tif_bytes": tif_bytes,
         "tif_filename": tif_filename,
         "bbox_4326": list(bbox_4326),

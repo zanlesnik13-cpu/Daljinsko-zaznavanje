@@ -15,7 +15,9 @@ from web slippy-map visualization (EPSG:4326 / EPSG:3857):
 from __future__ import annotations
 
 import base64
+import html as _html
 import io
+import json
 import math
 from typing import Any, Sequence
 
@@ -252,6 +254,9 @@ def raster_to_map_overlay_png(
             stacked = data_array_or_rgb.astype(np.float32, copy=False)
             if stacked.ndim != 3:
                 raise ValueError(f"RGB DataArray must be 3D (band, y, x), got shape {stacked.shape}.")
+            if stacked.shape[0] != 3 and stacked.shape[-1] == 3:
+                dims_3 = list(stacked.dims)
+                stacked = stacked.transpose(dims_3[2], dims_3[0], dims_3[1])
         else:
             raise TypeError(f"Expected xarray DataArray or Dataset, got {type(data_array_or_rgb).__name__}.")
 
@@ -577,3 +582,344 @@ def build_satellite_slippy_map(
     # QGIS-style always-visible layer control
     folium.LayerControl(collapsed=False).add_to(fmap)
     return fmap
+
+
+def build_zoomable_swipe_map(
+    *,
+    overlay_uri_t1: str,
+    bounds_t1: list[list[float]],
+    overlay_uri_t2: str,
+    bounds_t2: list[list[float]],
+    label_t1: str,
+    label_t2: str,
+    center_lat: float,
+    center_lon: float,
+    basemap_mode: str = "satellite",
+    aoi_bbox_4326: Sequence[float] | None = None,
+    aoi_polygon_geojson: dict[str, Any] | None = None,
+    aoi_bbox_3794: Sequence[float] | None = None,
+    aoi_metric_crs: int | str | None = None,
+    aoi_outline_label: str = "AOI",
+    height: int = 620,
+    opacity: float = 1.0,
+    lang: str = "sl",
+) -> str:
+    """Build a standalone HTML interactive Leaflet map with zoom, pan, and draggable curtain swipe (`t1 ↔ t2`).
+
+    Uses two dedicated Leaflet panes (``t1Pane`` at zIndex 450, ``t2Pane`` at zIndex 460) and
+    pure built-in JavaScript + CSS ``map.containerPointToLayerPoint`` clipping (zero external
+    CDN swipe plugins) so the curtain stays pixel-locked at any zoom level on desktop & tablets.
+    """
+    bm_key = basemap_mode if basemap_mode in SLIPPY_BASEMAP_SPECS else "satellite"
+    zoom_start = (
+        _estimate_zoom_for_bbox(aoi_bbox_4326)
+        if (aoi_bbox_4326 is not None and len(aoi_bbox_4326) == 4)
+        else 12
+    )
+
+    fmap = folium.Map(
+        location=[float(center_lat), float(center_lon)],
+        zoom_start=int(zoom_start),
+        tiles=None,
+        control_scale=True,
+        prefer_canvas=True,
+        height=f"{int(height)}px",
+        width="100%",
+    )
+
+    # Add active basemap (plus selectable alternatives in LayerControl)
+    name_key = "name_en" if lang == "en" else "name_sl"
+    for key in [bm_key] + [k for k in SLIPPY_BASEMAP_SPECS if k != bm_key]:
+        spec = SLIPPY_BASEMAP_SPECS[key]
+        tile_kwargs: dict[str, Any] = {
+            "tiles": spec["tiles"],
+            "name": spec[name_key],
+            "overlay": False,
+            "control": True,
+            "show": (key == bm_key),
+            "max_zoom": int(spec["max_zoom"]),
+        }
+        if spec["attr"] is not None:
+            tile_kwargs["attr"] = spec["attr"]
+        folium.TileLayer(**tile_kwargs).add_to(fmap)
+
+    # Exact AOI boundary outline in cartographic teal (#0F766E)
+    if aoi_polygon_geojson is not None or aoi_bbox_3794 is not None or aoi_bbox_4326 is not None:
+        aoi_fg = folium.FeatureGroup(name=f"📐 {aoi_outline_label}", show=True)
+        if aoi_polygon_geojson is not None:
+            folium.GeoJson(
+                aoi_polygon_geojson,
+                name=aoi_outline_label,
+                style_function=lambda _feat: {
+                    "color": "#0F766E",
+                    "weight": 2.6,
+                    "dashArray": "6, 4",
+                    "fill": False,
+                    "fillOpacity": 0.0,
+                },
+                tooltip=aoi_outline_label,
+            ).add_to(aoi_fg)
+        elif aoi_bbox_3794 is not None and len(aoi_bbox_3794) == 4:
+            if aoi_metric_crs is not None:
+                eff_ring_crs: int | str = aoi_metric_crs
+            else:
+                eff_ring_crs, _ = get_best_metric_crs(float(center_lat), float(center_lon), mode="auto")
+            ring = _metric_bbox_to_wgs84_ring(aoi_bbox_3794, metric_crs=eff_ring_crs)
+            folium.Polygon(
+                locations=ring,
+                color="#0F766E",
+                weight=2.6,
+                dash_array="6, 4",
+                fill=False,
+                tooltip=aoi_outline_label,
+            ).add_to(aoi_fg)
+        elif aoi_bbox_4326 is not None and len(aoi_bbox_4326) == 4:
+            min_lon, min_lat, max_lon, max_lat = (float(v) for v in aoi_bbox_4326)
+            folium.Rectangle(
+                bounds=[[min_lat, min_lon], [max_lat, max_lon]],
+                color="#0F766E",
+                weight=2.6,
+                dash_array="6, 4",
+                fill=False,
+                tooltip=aoi_outline_label,
+            ).add_to(aoi_fg)
+        aoi_fg.add_to(fmap)
+
+    # Fit cleanly to AOI bounds if available
+    if aoi_bbox_4326 is not None and len(aoi_bbox_4326) == 4:
+        fmap.fit_bounds(
+            [[float(aoi_bbox_4326[1]), float(aoi_bbox_4326[0])], [float(aoi_bbox_4326[3]), float(aoi_bbox_4326[2])]],
+            padding=(24, 24),
+        )
+    elif bounds_t1:
+        fmap.fit_bounds(bounds_t1, padding=(24, 24))
+
+    MousePosition(
+        position="bottomleft",
+        separator=" , ",
+        empty_string="",
+        lng_first=False,
+        num_digits=5,
+        prefix="WGS84 (φ, λ):",
+    ).add_to(fmap)
+
+    folium.LayerControl(collapsed=True, position="bottomright").add_to(fmap)
+
+    map_var = fmap.get_name()
+    safe_t1 = _html.escape(str(label_t1))
+    safe_t2 = _html.escape(str(label_t2))
+    op_val = float(np.clip(opacity, 0.0, 1.0))
+
+    swipe_css = f"""
+    <style>
+      html, body {{
+        margin: 0 !important;
+        padding: 0 !important;
+        width: 100%;
+        height: {int(height)}px;
+        overflow: hidden;
+        background: #F8FAFC;
+      }}
+      .folium-map {{
+        width: 100% !important;
+        height: {int(height)}px !important;
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid #CBD5E1;
+        box-sizing: border-box;
+      }}
+      .geo-swipe-divider {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 50%;
+        width: 3px;
+        margin-left: -1.5px;
+        background: #FFFFFF;
+        box-shadow: 0 0 0 1px rgba(15, 118, 110, 0.85), 0 0 10px rgba(15, 23, 42, 0.45);
+        z-index: 950;
+        cursor: ew-resize;
+        touch-action: none;
+        user-select: none;
+      }}
+      .geo-swipe-hitarea {{
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: -20px;
+        width: 43px;
+        cursor: ew-resize;
+        touch-action: none;
+      }}
+      .geo-swipe-handle {{
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 42px;
+        height: 42px;
+        border-radius: 50%;
+        background: #0F766E;
+        color: #FFFFFF;
+        border: 2.5px solid #FFFFFF;
+        box-shadow: 0 3px 12px rgba(15, 23, 42, 0.45);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        font-weight: 700;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        cursor: ew-resize;
+        touch-action: none;
+        user-select: none;
+      }}
+      .geo-swipe-handle:hover {{
+        background: #115E59;
+      }}
+      .geo-swipe-badge {{
+        position: absolute;
+        top: 12px;
+        z-index: 960;
+        padding: 6px 12px;
+        border-radius: 7px;
+        background: rgba(15, 23, 42, 0.88);
+        color: #F8FAFC;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12.5px;
+        font-weight: 600;
+        border: 1px solid rgba(153, 246, 228, 0.45);
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.30);
+        pointer-events: none;
+        max-width: 42%;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }}
+      .geo-swipe-badge-left {{
+        left: 52px;
+        border-left: 3.5px solid #14B8A6;
+      }}
+      .geo-swipe-badge-right {{
+        right: 12px;
+        border-right: 3.5px solid #14B8A6;
+      }}
+    </style>
+    """
+
+    swipe_js = f"""
+    (function() {{
+      var map = {map_var};
+      if (!map) return;
+
+      var t1Pane = map.createPane('t1Pane');
+      t1Pane.style.zIndex = 450;
+      t1Pane.style.pointerEvents = 'none';
+
+      var t2Pane = map.createPane('t2Pane');
+      t2Pane.style.zIndex = 460;
+      t2Pane.style.pointerEvents = 'none';
+
+      var uri1 = {json.dumps(str(overlay_uri_t1))};
+      var bounds1 = {json.dumps(bounds_t1)};
+      var uri2 = {json.dumps(str(overlay_uri_t2))};
+      var bounds2 = {json.dumps(bounds_t2)};
+      var op = {op_val:.3f};
+
+      L.imageOverlay(uri1, bounds1, {{pane: 't1Pane', opacity: op, interactive: false}}).addTo(map);
+      L.imageOverlay(uri2, bounds2, {{pane: 't2Pane', opacity: op, interactive: false}}).addTo(map);
+
+      var container = map.getContainer();
+
+      var badgeL = document.createElement('div');
+      badgeL.className = 'geo-swipe-badge geo-swipe-badge-left';
+      badgeL.innerHTML = '◀ ' + {json.dumps(safe_t1)};
+      container.appendChild(badgeL);
+
+      var badgeR = document.createElement('div');
+      badgeR.className = 'geo-swipe-badge geo-swipe-badge-right';
+      badgeR.innerHTML = {json.dumps(safe_t2)} + ' ▶';
+      container.appendChild(badgeR);
+
+      var divider = document.createElement('div');
+      divider.className = 'geo-swipe-divider';
+      divider.innerHTML = '<div class="geo-swipe-hitarea"></div><div class="geo-swipe-handle">↔</div>';
+      container.appendChild(divider);
+
+      L.DomEvent.disableClickPropagation(divider);
+      L.DomEvent.disableScrollPropagation(divider);
+
+      var splitRatio = 0.5;
+      var isDragging = false;
+
+      function updateClip() {{
+        var size = map.getSize();
+        if (!size || size.x <= 0 || size.y <= 0) return;
+        var splitX = Math.max(0, Math.min(size.x, Math.round(size.x * splitRatio)));
+        divider.style.left = splitX + 'px';
+        var nw = map.containerPointToLayerPoint([0, 0]);
+        var se = map.containerPointToLayerPoint([size.x, size.y]);
+        var clipX = map.containerPointToLayerPoint([splitX, 0]).x;
+        t1Pane.style.clip = 'rect(' + [nw.y, clipX, se.y, nw.x].join('px,') + 'px)';
+        t2Pane.style.clip = 'rect(' + [nw.y, se.x, se.y, clipX].join('px,') + 'px)';
+      }}
+
+      function setFromClientX(clientX) {{
+        var rect = container.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        var ratio = (clientX - rect.left) / rect.width;
+        splitRatio = Math.max(0.02, Math.min(0.98, ratio));
+        updateClip();
+      }}
+
+      function startDrag(e) {{
+        isDragging = true;
+        if (e.stopPropagation) e.stopPropagation();
+        if (e.preventDefault) e.preventDefault();
+        if (map.dragging && map.dragging.enabled()) {{
+          map.dragging.disable();
+        }}
+        if (e.touches && e.touches.length > 0) {{
+          setFromClientX(e.touches[0].clientX);
+        }} else if (typeof e.clientX === 'number') {{
+          setFromClientX(e.clientX);
+        }}
+      }}
+
+      function moveDrag(e) {{
+        if (!isDragging) return;
+        if (e.stopPropagation) e.stopPropagation();
+        if (e.preventDefault) e.preventDefault();
+        if (e.touches && e.touches.length > 0) {{
+          setFromClientX(e.touches[0].clientX);
+        }} else if (typeof e.clientX === 'number') {{
+          setFromClientX(e.clientX);
+        }}
+      }}
+
+      function endDrag() {{
+        if (!isDragging) return;
+        isDragging = false;
+        if (map.dragging && !map.dragging.enabled()) {{
+          map.dragging.enable();
+        }}
+      }}
+
+      divider.addEventListener('mousedown', startDrag);
+      divider.addEventListener('touchstart', startDrag, {{passive: false}});
+      window.addEventListener('mousemove', moveDrag);
+      window.addEventListener('touchmove', moveDrag, {{passive: false}});
+      window.addEventListener('mouseup', endDrag);
+      window.addEventListener('touchend', endDrag);
+      window.addEventListener('touchcancel', endDrag);
+
+      map.on('move zoom viewreset resize zoomend moveend', updateClip);
+      updateClip();
+      setTimeout(updateClip, 150);
+      setTimeout(updateClip, 450);
+    }})();
+    """
+
+    fmap.get_root().header.add_child(folium.Element(swipe_css))
+    fmap.get_root().script.add_child(folium.Element(swipe_js))
+    return fmap.get_root().render()
+

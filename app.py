@@ -139,6 +139,7 @@ from kartografija import format_metric_number, render_geodetic_map
 from map_overlay import (
     build_horizontal_colorbar_html,
     build_satellite_slippy_map,
+    build_zoomable_swipe_map,
     expand_bbox_for_panning,
     raster_to_map_overlay_png,
 )
@@ -161,10 +162,13 @@ from stac_loader import (
     INTERVAL_MONTHLY,
     INTERVAL_SEASONAL,
     INTERVAL_YEARLY,
+    SEASON_SUMMER,
     SENSOR_LANDSAT,
     SENSOR_S1,
     SENSOR_S2,
     TEMPORAL_INTERVAL_KEYS,
+    YEARLY_SEASON_KEYS,
+    YEARLY_SEASON_SPECS,
     filter_by_temporal_interval,
     load_copernicus_dem,
     load_scene,
@@ -840,6 +844,13 @@ WS1_AOI_MODE_I18N: dict[str, str] = {
     "preset": "ws1_aoi_mode_preset",
     "geojson": "ws1_aoi_mode_geojson",
 }
+YEARLY_SEASON_I18N: dict[str, str] = {
+    "summer": "season_summer",
+    "spring": "season_spring",
+    "autumn": "season_autumn",
+    "winter": "season_winter",
+    "all_year": "season_all_year",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +890,9 @@ def _init_session_state() -> None:
         "temporal_interval": INTERVAL_ALL,
         "sidebar_interval_select": INTERVAL_ALL,
         "tab3_interval_select": INTERVAL_ALL,
+        "yearly_target_season": SEASON_SUMMER,
+        "sidebar_yearly_season": SEASON_SUMMER,
+        "tab3_yearly_season": SEASON_SUMMER,
         "expand_pan_buffer": True,
         "sidebar_expand_pan_buffer": True,
         "map_basemap": "satellite",
@@ -1778,6 +1792,7 @@ def _sync_interval_state(source_key: str | None = None, explicit_interval: str |
     st.session_state["sidebar_interval_select"] = new_int
     st.session_state["tab3_interval_select"] = new_int
 
+    cur_season = str(st.session_state.get("yearly_target_season", SEASON_SUMMER))
     raw_df = st.session_state.get("stac_raw_summary_df")
     raw_by_date = st.session_state.get("stac_raw_items_by_date")
     if (
@@ -1787,7 +1802,44 @@ def _sync_interval_state(source_key: str | None = None, explicit_interval: str |
         and isinstance(raw_by_date, dict)
         and raw_by_date
     ):
-        grouped_f, df_f = filter_by_temporal_interval(raw_df, raw_by_date, interval_mode=new_int)
+        grouped_f, df_f = filter_by_temporal_interval(
+            raw_df, raw_by_date, interval_mode=new_int, target_season=cur_season
+        )
+        df_f.attrs["raw_summary_df"] = raw_df
+        df_f.attrs["raw_items_by_date"] = raw_by_date
+        st.session_state["stac_items"] = grouped_f
+        st.session_state["stac_summary_df"] = df_f
+        st.session_state["pending_reset_scene_widgets"] = True
+
+
+def _sync_yearly_season_state(source_key: str | None = None, explicit_season: str | None = None) -> None:
+    """Sinhronizira ciljno obdobje leta (Poletje/Pomlad/Jesen/Zima/Celotno leto) in takoj prefiltrira letne rezultate."""
+    prev_season = str(st.session_state.get("yearly_target_season", SEASON_SUMMER))
+    raw_val = (
+        explicit_season
+        if explicit_season is not None
+        else st.session_state.get(source_key or "yearly_target_season", prev_season)
+    )
+    new_season = raw_val if raw_val in YEARLY_SEASON_KEYS else prev_season
+
+    st.session_state["yearly_target_season"] = new_season
+    st.session_state["sidebar_yearly_season"] = new_season
+    st.session_state["tab3_yearly_season"] = new_season
+
+    cur_int = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
+    raw_df = st.session_state.get("stac_raw_summary_df")
+    raw_by_date = st.session_state.get("stac_raw_items_by_date")
+    if (
+        cur_int == INTERVAL_YEARLY
+        and st.session_state.get("search_performed", False)
+        and isinstance(raw_df, pd.DataFrame)
+        and not raw_df.empty
+        and isinstance(raw_by_date, dict)
+        and raw_by_date
+    ):
+        grouped_f, df_f = filter_by_temporal_interval(
+            raw_df, raw_by_date, interval_mode=cur_int, target_season=new_season
+        )
         df_f.attrs["raw_summary_df"] = raw_df
         df_f.attrs["raw_items_by_date"] = raw_by_date
         st.session_state["stac_items"] = grouped_f
@@ -1850,6 +1902,10 @@ def _format_interval_summary_caption(summary_df: pd.DataFrame, lang: str) -> str
     partial_n = int(summary_df.attrs.get("filtered_partial_dates", 0))
     int_mode = str(summary_df.attrs.get("interval_mode", st.session_state.get("temporal_interval", INTERVAL_ALL)))
     int_label = t(INTERVAL_I18N.get(int_mode, "interval_all"), lang=lang)
+    if int_mode == INTERVAL_YEARLY:
+        season_k = str(summary_df.attrs.get("target_season", st.session_state.get("yearly_target_season", SEASON_SUMMER)))
+        season_lbl = t(YEARLY_SEASON_I18N.get(season_k, "season_summer"), lang=lang)
+        int_label = f"{int_label} · {season_lbl}"
     partial_note = t("partial_filtered_note", lang=lang, n=partial_n) if partial_n > 0 else ""
     return t(
         "interval_summary_caption",
@@ -1874,10 +1930,16 @@ def _execute_stac_search(
     exclude_l7_slc_off: bool,
     exclude_partial_swaths: bool = True,
     interval_mode: str = INTERVAL_ALL,
+    target_season: str | None = None,
     limit: int | None = None,
 ) -> None:
     """Izvede celotno zgodovinsko STAC iskanje s filtrom pokritosti AOI in časovnim vzorčenjem."""
     min_cov = DEFAULT_MIN_AOI_COVERAGE_PCT if exclude_partial_swaths else 0.0
+    eff_season = str(
+        target_season
+        if target_season is not None
+        else st.session_state.get("yearly_target_season", SEASON_SUMMER)
+    )
     items_res, summary_res = search_scenes(
         sensor=sensor,
         bbox_4326=bbox_4326,
@@ -1889,6 +1951,7 @@ def _execute_stac_search(
         aoi_polygon_4326=aoi_polygon_4326,
         min_coverage_pct=min_cov,
         interval_mode=interval_mode,
+        target_season=eff_season,
     )
     st.session_state["stac_items"] = items_res
     st.session_state["stac_summary_df"] = summary_res
@@ -5105,8 +5168,13 @@ def _render_comp3_swipe_fragment(
     active_sensor: str,
     ch_threshold: float,
     lang: str,
+    active_bbox: Sequence[float] | None = None,
+    active_polygon: dict[str, Any] | None = None,
+    bbox_3794: Sequence[float] | None = None,
+    center_lat: float = 46.0569,
+    center_lon: float = 14.5058,
 ) -> None:
-    """Fragment za interaktivno 2–3 datumsko primerjavo (zavesa, pas in Δ karta)."""
+    """Fragment za interaktivno 2–3 datumsko primerjavo (zoomabilna zavesa, pas in Δ karta)."""
     comp_show: dict[str, Any] | None = st.session_state.get("tab3_comp_result")
     if not (
         isinstance(comp_show, dict)
@@ -5118,14 +5186,35 @@ def _render_comp3_swipe_fragment(
     c_dates: list[str] = list(comp_show["dates"])
     c_swipes: list[bytes] = list(comp_show["swipe_pngs"])
     c_strips: list[bytes] = list(comp_show["strip_pngs"])
+    c_overlay_uris: list[str] = list(comp_show.get("overlay_uris") or [])
+    c_overlay_bounds: list[list[list[float]]] = list(comp_show.get("overlay_bounds") or [])
+    c_replacements: list[dict[str, Any]] = list(comp_show.get("replacements") or [])
     c_layer = str(comp_show["layer_mode"])
     c_is_sar = comp_show.get("sensor") == SENSOR_S1
     c_is_lst = (not c_is_sar) and c_layer == "LST"
     unit_b = " [dB]" if c_is_sar else (" [°C]" if c_is_lst else "")
     idx_lbl = f"{c_layer}{unit_b}"
 
+    # Prikaz jasnih obvestil o samodejni zamenjavi oblačnih posnetkov nad AOI
+    for rep in c_replacements:
+        st.info(
+            t(
+                "comp3_replaced_badge",
+                req=str(rep.get("requested_date", "")),
+                orig_pct=float(rep.get("original_clear_pct", 0.0)),
+                act=str(rep.get("actual_date", "")),
+                act_pct=float(rep.get("actual_clear_pct", 0.0)),
+            )
+        )
+
     st.markdown(f"#### {t('swipe_header')}")
-    st.caption(t("swipe_hint"))
+    has_zoom_swipe = (
+        len(c_overlay_uris) == len(c_dates)
+        and len(c_overlay_bounds) == len(c_dates)
+        and all(bool(u) for u in c_overlay_uris)
+    )
+    st.caption(t("swipe_zoom_hint") if has_zoom_swipe else t("swipe_hint"))
+
     if len(c_dates) == 3:
         pair_map = {"0_1": (0, 1), "1_2": (1, 2), "0_2": (0, 2)}
         pair_choice = _touch_selector(
@@ -5143,13 +5232,54 @@ def _render_comp3_swipe_fragment(
     else:
         i_a, i_b = 0, 1
 
-    _render_before_after_swipe_html(
-        png_t1_bytes=c_swipes[i_a],
-        png_t2_bytes=c_swipes[i_b],
-        label_t1=f"t{i_a + 1}: {c_dates[i_a]} ({idx_lbl})",
-        label_t2=f"t{i_b + 1}: {c_dates[i_b]} ({idx_lbl})",
-        height=520,
-    )
+    if has_zoom_swipe:
+        swipe_opacity_pct = st.slider(
+            t("opacity_layer_label"),
+            min_value=20,
+            max_value=100,
+            value=100,
+            step=5,
+            format="%d %%",
+            key=f"tab3_comp3_opacity_{active_sensor}",
+        )
+        comp_bbox = comp_show.get("bbox_4326") or active_bbox
+        c_lat_s = (
+            0.5 * (float(comp_bbox[1]) + float(comp_bbox[3]))
+            if (comp_bbox is not None and len(comp_bbox) == 4)
+            else float(center_lat)
+        )
+        c_lon_s = (
+            0.5 * (float(comp_bbox[0]) + float(comp_bbox[2]))
+            if (comp_bbox is not None and len(comp_bbox) == 4)
+            else float(center_lon)
+        )
+        swipe_html = build_zoomable_swipe_map(
+            overlay_uri_t1=c_overlay_uris[i_a],
+            bounds_t1=c_overlay_bounds[i_a],
+            overlay_uri_t2=c_overlay_uris[i_b],
+            bounds_t2=c_overlay_bounds[i_b],
+            label_t1=f"t{i_a + 1}: {c_dates[i_a]} ({idx_lbl})",
+            label_t2=f"t{i_b + 1}: {c_dates[i_b]} ({idx_lbl})",
+            center_lat=c_lat_s,
+            center_lon=c_lon_s,
+            basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+            aoi_bbox_4326=comp_bbox,
+            aoi_polygon_geojson=active_polygon,
+            aoi_bbox_3794=bbox_3794,
+            aoi_outline_label=t("slippy_aoi_outline"),
+            height=620,
+            opacity=float(swipe_opacity_pct) / 100.0,
+            lang=lang,
+        )
+        _render_html_iframe(swipe_html, height=636)
+    else:
+        _render_before_after_swipe_html(
+            png_t1_bytes=c_swipes[i_a],
+            png_t2_bytes=c_swipes[i_b],
+            label_t1=f"t{i_a + 1}: {c_dates[i_a]} ({idx_lbl})",
+            label_t2=f"t{i_b + 1}: {c_dates[i_b]} ({idx_lbl})",
+            height=520,
+        )
 
     st.markdown(f"#### {t('comp3_strip_header', n=len(c_dates))}")
     strip_cols = st.columns(len(c_dates))
@@ -5879,6 +6009,18 @@ def main() -> None:
             use_pills=True,
         )
         active_interval = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
+        if active_interval == INTERVAL_YEARLY:
+            _touch_selector(
+                t("yearly_season_label"),
+                options=list(YEARLY_SEASON_KEYS),
+                default=str(st.session_state.get("yearly_target_season", SEASON_SUMMER)),
+                format_func=lambda k, _lang=lang: t(YEARLY_SEASON_I18N[k], lang=_lang),
+                help=t("yearly_season_help"),
+                key="sidebar_yearly_season",
+                on_change=_sync_yearly_season_state,
+                args=("sidebar_yearly_season",),
+                use_pills=True,
+            )
 
         if sensor == SENSOR_S1:
             max_cloud_cover = 100
@@ -6213,6 +6355,23 @@ def main() -> None:
                                 )
                                 ds_display = ds_loaded
 
+                            var_names = (
+                                list(vis_spec["var_names"]) if is_sar_active else list(req_bands)
+                            )
+                            _check_vars = [v for v in var_names if v in ds_loaded.data_vars] or list(
+                                ds_loaded.data_vars
+                            )
+                            if _check_vars:
+                                _v_mask = np.ones(ds_loaded[_check_vars[0]].shape, dtype=bool)
+                                for _vn in _check_vars:
+                                    _arr_v = np.asarray(ds_loaded[_vn].values)
+                                    _v_mask &= np.isfinite(_arr_v)
+                                loaded_valid_pct = float(
+                                    100.0 * np.count_nonzero(_v_mask) / max(_v_mask.size, 1)
+                                )
+                            else:
+                                loaded_valid_pct = 0.0
+
                             tif_bytes = export_to_geotiff_bytes(ds_loaded, target_epsg=target_crs)
                             epsg_num = target_crs.replace("EPSG:", "")
                             prefix = active_sensor_cfg["file_prefix"]
@@ -6221,9 +6380,6 @@ def main() -> None:
                                 f"EPSG{epsg_num}_{selected_resolution}m.tif"
                             )
 
-                            var_names = (
-                                list(vis_spec["var_names"]) if is_sar_active else list(req_bands)
-                            )
                             st.session_state["loaded_scene_ds"] = ds_loaded
                             st.session_state["loaded_scene_display_ds"] = ds_display
                             st.session_state["loaded_scene_meta"] = {
@@ -6246,9 +6402,18 @@ def main() -> None:
                                 "vis_code": vis_code,
                                 "area_km2": float(st.session_state["search_area_km2"] or area_km2),
                                 "expanded_pan": use_pan_buf,
+                                "valid_pct": round(loaded_valid_pct, 1),
                             }
                             st.session_state["loaded_tif_bytes"] = tif_bytes
                             st.session_state["loaded_tif_filename"] = tif_filename
+                            if loaded_valid_pct < 5.0:
+                                st.warning(
+                                    t(
+                                        "t1_empty_nodata_warn",
+                                        date=str(chosen_row["date_str"]),
+                                        pct=loaded_valid_pct,
+                                    )
+                                )
                             gc.collect()
                         except Exception as exc:
                             st.error(t("load_scene_error", err=exc))
@@ -7380,6 +7545,18 @@ def main() -> None:
                         args=("tab3_l7_slc_exclude",),
                     )
             t3_interval_cur = str(st.session_state.get("temporal_interval", INTERVAL_ALL))
+            if t3_interval_cur == INTERVAL_YEARLY:
+                _touch_selector(
+                    t("yearly_season_label"),
+                    options=list(YEARLY_SEASON_KEYS),
+                    default=str(st.session_state.get("yearly_target_season", SEASON_SUMMER)),
+                    format_func=lambda k, _lang=lang: t(YEARLY_SEASON_I18N[k], lang=_lang),
+                    help=t("yearly_season_help"),
+                    key="tab3_yearly_season",
+                    on_change=_sync_yearly_season_state,
+                    args=("tab3_yearly_season",),
+                    use_pills=True,
+                )
 
             t3_dates_ok = t3_start <= t3_end
             if not t3_dates_ok:
@@ -7411,6 +7588,14 @@ def main() -> None:
                         f"{t('t3_loaded_status', sensor=active_sensor_cfg['short_name'], n=len(items), d1=d_min, d2=d_max)}  \n"
                         f"{_format_interval_summary_caption(summary_df, lang=lang)}"
                     )
+                    exp_yrs = summary_df.attrs.get("expanded_season_years") or []
+                    if exp_yrs:
+                        st.caption(
+                            t(
+                                "yearly_season_expanded_note",
+                                years=", ".join(str(y) for y in exp_yrs),
+                            )
+                        )
                 else:
                     st.caption(t("need_search_first"))
 
@@ -7430,6 +7615,9 @@ def main() -> None:
                         exclude_l7_slc_off=bool(st.session_state.get("exclude_l7_slc_off", True)),
                         exclude_partial_swaths=bool(t3_exclude_partial),
                         interval_mode=t3_interval_cur,
+                        target_season=str(
+                            st.session_state.get("yearly_target_season", SEASON_SUMMER)
+                        ),
                         limit=None,
                     )
                     st.rerun()
@@ -7685,6 +7873,7 @@ def main() -> None:
                     with col_c_scl:
                         if is_sar_t3:
                             ch_mask_clouds = False
+                            comp_auto_fallback = False
                             st.caption(t("sar_allweather_note"))
                         else:
                             ch_mask_clouds = st.checkbox(
@@ -7693,6 +7882,12 @@ def main() -> None:
                                 help=t("scl_toggle_help"),
                                 disabled=is_comp_rgb,
                                 key="tab3_ch_scl",
+                            )
+                            comp_auto_fallback = st.checkbox(
+                                t("comp3_auto_fallback_label"),
+                                value=True,
+                                help=t("comp3_auto_fallback_help"),
+                                key="tab3_comp_auto_fallback",
                             )
 
                     picked_raw = _multi_date_touch_picker(
@@ -7722,6 +7917,26 @@ def main() -> None:
                 if ch_clicked and active_bbox is not None and valid_pick_count:
                     chosen_groups = [items[i] for i in picked_sorted]
                     chosen_dates = [str(summary_df.iloc[i]["date_str"]) for i in picked_sorted]
+                    raw_by_date = st.session_state.get("stac_raw_items_by_date") or {}
+                    all_cand_groups = (
+                        list(raw_by_date.values())
+                        if isinstance(raw_by_date, dict) and raw_by_date
+                        else list(items)
+                    )
+                    cands_by_bucket = summary_df.attrs.get("candidates_by_bucket") or None
+                    _cur_season_key = str(
+                        st.session_state.get("yearly_target_season", SEASON_SUMMER)
+                    )
+                    _season_months: tuple[int, ...] | None = None
+                    if (
+                        str(st.session_state.get("temporal_interval", INTERVAL_ALL))
+                        == INTERVAL_YEARLY
+                        and _cur_season_key in YEARLY_SEASON_SPECS
+                    ):
+                        _sm = YEARLY_SEASON_SPECS[_cur_season_key].get("months")
+                        if _sm:
+                            _season_months = tuple(_sm)
+
                     with st.spinner(
                         t("comp3_spinner", n=len(chosen_dates), layer=comp_layer_key)
                     ):
@@ -7743,7 +7958,13 @@ def main() -> None:
                                 sensor=active_sensor,
                                 aoi_polygon_4326=active_polygon,
                                 mask_clouds=ch_mask_clouds,
+                                all_candidates=all_cand_groups,
+                                candidates_by_date=cands_by_bucket,
+                                auto_cloud_fallback=bool(comp_auto_fallback),
+                                min_clear_pct=75.0,
+                                same_season_months=_season_months,
                             )
+                            resolved_dates = list(comp_res.get("dates") or chosen_dates)
                             diff_da = comp_res.get("diff_da")
                             da_first = comp_res.get("da_first")
                             da_last = comp_res.get("da_last")
@@ -7754,7 +7975,7 @@ def main() -> None:
                                 epsg_num = target_crs.replace("EPSG:", "")
                                 prefix = active_sensor_cfg["file_prefix"]
                                 diff_fname = (
-                                    f"{prefix}_delta_{comp_layer_key}_{chosen_dates[0]}_to_{chosen_dates[-1]}_"
+                                    f"{prefix}_delta_{comp_layer_key}_{resolved_dates[0]}_to_{resolved_dates[-1]}_"
                                     f"EPSG{epsg_num}_{selected_resolution}m.tif"
                                 )
                                 # Sinhronizacija za Kartografijo (Workspace 4)
@@ -7764,8 +7985,8 @@ def main() -> None:
                                 st.session_state["tab3_change_meta"] = {
                                     "sensor": active_sensor,
                                     "index_key": comp_layer_key,
-                                    "date_t1": chosen_dates[0],
-                                    "date_t2": chosen_dates[-1],
+                                    "date_t1": resolved_dates[0],
+                                    "date_t2": resolved_dates[-1],
                                     "crs": target_crs,
                                     "resolution_m": int(selected_resolution),
                                 }
@@ -7788,6 +8009,11 @@ def main() -> None:
                     active_sensor=active_sensor,
                     ch_threshold=float(ch_threshold),
                     lang=lang,
+                    active_bbox=active_bbox,
+                    active_polygon=active_polygon,
+                    bbox_3794=bbox_3794,
+                    center_lat=center_lat,
+                    center_lon=center_lon,
                 )
 
         # -------------------------------------------------------------------
@@ -8237,16 +8463,45 @@ def main() -> None:
                 )
                 st.caption(t("geodetic_separation_caption", crs=d_crs_show))
 
-                # 3. Before / After Curtain Swipe Comparison
-                if dis_res_show.get("swipe_png_pre") and dis_res_show.get("swipe_png_post"):
+                # 3. Before / After Zoomable Leaflet Curtain Swipe Comparison
+                has_dis_zoom_swipe = bool(
+                    dis_res_show.get("overlay_uri_pre")
+                    and dis_res_show.get("overlay_uri_post")
+                    and dis_res_show.get("overlay_bounds_pre")
+                    and dis_res_show.get("overlay_bounds_post")
+                )
+                if has_dis_zoom_swipe or (
+                    dis_res_show.get("swipe_png_pre") and dis_res_show.get("swipe_png_post")
+                ):
                     st.markdown(f"#### {t('dis_swipe_header')}")
-                    _render_before_after_swipe_html(
-                        png_t1_bytes=dis_res_show["swipe_png_pre"],
-                        png_t2_bytes=dis_res_show["swipe_png_post"],
-                        label_t1=t("dis_swipe_pre_lbl", date=dis_res_show["date_pre"]),
-                        label_t2=t("dis_swipe_post_lbl", date=dis_res_show["date_event"]),
-                        height=500,
-                    )
+                    if has_dis_zoom_swipe:
+                        st.caption(t("swipe_zoom_hint"))
+                        dis_swipe_html = build_zoomable_swipe_map(
+                            overlay_uri_t1=dis_res_show["overlay_uri_pre"],
+                            bounds_t1=dis_res_show["overlay_bounds_pre"],
+                            overlay_uri_t2=dis_res_show["overlay_uri_post"],
+                            bounds_t2=dis_res_show["overlay_bounds_post"],
+                            label_t1=t("dis_swipe_pre_lbl", date=dis_res_show["date_pre"]),
+                            label_t2=t("dis_swipe_post_lbl", date=dis_res_show["date_event"]),
+                            center_lat=c_lat_d,
+                            center_lon=c_lon_d,
+                            basemap_mode=str(st.session_state.get("map_basemap", "satellite")),
+                            aoi_bbox_4326=d_bbox,
+                            aoi_polygon_geojson=dis_res_show.get("polygon_4326"),
+                            aoi_outline_label=t("slippy_aoi_outline"),
+                            height=570,
+                            opacity=1.0,
+                            lang=lang,
+                        )
+                        _render_html_iframe(dis_swipe_html, height=586)
+                    else:
+                        _render_before_after_swipe_html(
+                            png_t1_bytes=dis_res_show["swipe_png_pre"],
+                            png_t2_bytes=dis_res_show["swipe_png_post"],
+                            label_t1=t("dis_swipe_pre_lbl", date=dis_res_show["date_pre"]),
+                            label_t2=t("dis_swipe_post_lbl", date=dis_res_show["date_event"]),
+                            height=500,
+                        )
 
                 # 4. Severity / Area Breakdown Table + Plotly Bar Chart
                 st.markdown(f"#### {t('dis_breakdown_header')}")

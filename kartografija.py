@@ -280,7 +280,10 @@ def _build_rgb_rgba_array(
             raise ValueError(f"RGB rendering requires 3 bands (or SAR VV+VH), got {req_bands!r}.")
     elif isinstance(raster, xr.DataArray) and raster.ndim == 3:
         arr3 = np.asarray(raster.values, dtype=np.float32)
-        ch_arrays = [arr3[0], arr3[1], arr3[2]]
+        if arr3.shape[0] != 3 and arr3.shape[-1] == 3:
+            ch_arrays = [arr3[..., 0], arr3[..., 1], arr3[..., 2]]
+        else:
+            ch_arrays = [arr3[0], arr3[1], arr3[2]]
         legend_bands = list(bands[:3]) if (bands and len(bands) >= 3) else ["R", "G", "B"]
     else:
         raise TypeError("RGB mode requires an xarray.Dataset or 3D xarray.DataArray.")
