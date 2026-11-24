@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Sequence
 
 import folium

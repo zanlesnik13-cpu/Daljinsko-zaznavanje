@@ -199,9 +199,23 @@ AI_EXAMPLE_PROMPTS: tuple[dict[str, str], ...] = (
 )
 
 # Built-in Slovenian places & declension stem matching (normalized ASCII stems -> canonical name + coords)
+# Note: More specific town/valley stems MUST appear before broader regional stems (e.g. Črna na Koroškem before Koroška).
 _SLOVENIAN_PLACE_STEMS: tuple[tuple[str, str, float, float], ...] = (
     ("ljubljansko barj", "Ljubljansko barje", 46.0050, 14.4600),
+    ("ljubljanskem barj", "Ljubljansko barje", 46.0050, 14.4600),
     ("barj", "Ljubljansko barje", 46.0050, 14.4600),
+    ("crna na korosk", "Črna na Koroškem", 46.4706, 14.8500),
+    ("crni na korosk", "Črna na Koroškem", 46.4706, 14.8500),
+    ("slovenj grad", "Slovenj Gradec", 46.5103, 15.0806),
+    ("ravn", "Ravne na Koroškem", 46.5431, 14.9692),
+    ("mezic", "Mežica", 46.5214, 14.8544),
+    ("prevalj", "Prevalje", 46.5469, 14.9208),
+    ("dravograd", "Dravograd", 46.5881, 15.0192),
+    ("korosk", "Slovenj Gradec", 46.5103, 15.0806),
+    ("logarsk", "Logarska dolina", 46.3947, 14.6292),
+    ("solcav", "Solčava", 46.4200, 14.6917),
+    ("mozir", "Mozirje", 46.3394, 14.9633),
+    ("nazarj", "Nazarje", 46.3175, 14.9539),
     ("savinjsk", "Celje", 46.2397, 15.2677),
     ("kostanjevic", "Kras", 45.8480, 13.6350),
     ("cerj", "Kras", 45.8480, 13.6350),
@@ -220,6 +234,7 @@ _SLOVENIAN_PLACE_STEMS: tuple[tuple[str, str, float, float], ...] = (
     ("velenj", "Velenje", 46.3592, 15.1103),
     ("mursk", "Murska Sobota", 46.6625, 16.1664),
     ("prekmur", "Murska Sobota", 46.6625, 16.1664),
+    ("pomur", "Murska Sobota", 46.6625, 16.1664),
     ("ptuj", "Ptuj", 46.4200, 15.8702),
     ("bled", "Bled", 46.3683, 14.1146),
     ("bohinj", "Bohinj", 46.2784, 13.8606),
@@ -231,6 +246,9 @@ _SLOVENIAN_PLACE_STEMS: tuple[tuple[str, str, float, float], ...] = (
     ("pohorj", "Pohorje", 46.5167, 15.4667),
     ("kamnik", "Kamnik", 46.2259, 14.6121),
     ("kamnisk", "Kamnik", 46.2259, 14.6121),
+    ("medvod", "Medvode", 46.1422, 14.4111),
+    ("menges", "Mengeš", 46.1669, 14.5750),
+    ("komend", "Komenda", 46.2047, 14.5394),
     ("domzal", "Domžale", 46.1377, 14.5937),
     ("skofj", "Škofja Loka", 46.1655, 14.3063),
     ("jesenic", "Jesenice", 46.4306, 14.0669),
@@ -246,13 +264,18 @@ _SLOVENIAN_PLACE_STEMS: tuple[tuple[str, str, float, float], ...] = (
     ("tolmin", "Tolmin", 46.1830, 13.7332),
     ("bovec", "Bovec", 46.3380, 13.5524),
     ("bovc", "Bovec", 46.3380, 13.5524),
-    ("slovenj grad", "Slovenj Gradec", 46.5103, 15.0806),
-    ("ravn", "Ravne na Koroškem", 46.5431, 14.9692),
     ("lendav", "Lendava", 46.5649, 16.4509),
     ("ormoz", "Ormož", 46.4114, 16.1544),
     ("radovljic", "Radovljica", 46.3444, 14.1744),
-    ("logarsk", "Logarska dolina", 46.3947, 14.6292),
     ("vipav", "Vipava", 45.8467, 13.9631),
+    # Broad historical Slovenian regions (resolved to central regional hub for geocoding)
+    ("gorenjsk", "Kranj", 46.2389, 14.3556),
+    ("dolenjsk", "Novo mesto", 45.8040, 15.1689),
+    ("stajersk", "Maribor", 46.5547, 15.6459),
+    ("primorsk", "Nova Gorica", 45.9560, 13.6484),
+    ("notranjsk", "Postojna", 45.7744, 14.2153),
+    ("posav", "Krško", 45.9592, 15.4917),
+    ("zasav", "Trbovlje", 46.1550, 15.0533),
 )
 
 _MONTH_PATTERNS: tuple[tuple[str, int], ...] = (
@@ -332,10 +355,27 @@ def _parse_iso_date(raw: Any, fallback: date) -> date:
     return d
 
 
+def _normalize_slovenian_place_name(raw_name: str) -> str:
+    """Normalize declined Slovenian town/region strings (e.g. 'na koroškem', 'v Celju', 'na Gorenjskem') to nominative names."""
+    cleaned = re.sub(
+        r"^(?:na|v|pri|okoli|za|in|near|around|over)\s+",
+        "",
+        str(raw_name or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    if not cleaned:
+        return "Ljubljana"
+    norm = _normalize_ascii(cleaned)
+    for stem, canonical, _lat, _lon in _SLOVENIAN_PLACE_STEMS:
+        if stem in norm:
+            return canonical
+    return cleaned
+
+
 def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local") -> dict[str, Any]:
     """Validate and enforce strict geodetic/sensor rules on any parsed JSON plan."""
     today = date.today()
-    place_name = str(raw_plan.get("place_name") or "Ljubljana").strip() or "Ljubljana"
+    place_name = _normalize_slovenian_place_name(str(raw_plan.get("place_name") or "Ljubljana"))
 
     try:
         radius_m = int(round(float(raw_plan.get("radius_m", 4000))))
@@ -437,11 +477,11 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
 _GEMINI_SYSTEM_PROMPT = """You are a geodetic Earth Observation (remote sensing) planner for Slovenia and Europe.
 Convert the user's Slovenian or English request into a STRICT JSON object with these exact keys:
 {
-  "place_name": string (nominative place name, e.g. "Celje", "Kras", "Bled", "Ljubljana"),
+  "place_name": string (nominative town/place name suitable for geocoding, e.g. "Celje", "Slovenj Gradec", "Črna na Koroškem", "Kras", "Bled", "Ljubljana", "Kranj", "Murska Sobota"),
   "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
   "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
   "task_type": "scene_rgb" | "spectral_index" | "time_series" | "disaster_flood" | "disaster_fire" | "disaster_forest",
-  "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "VV",
+  "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "NDSI" | "LST" | "VV",
   "start_date": "YYYY-MM-DD",
   "end_date": "YYYY-MM-DD",
   "event_date": "YYYY-MM-DD",
@@ -456,7 +496,8 @@ STRICT SCIENTIFIC RULES:
 3. For windthrow / clearcut / forest loss / drought disturbance -> task_type="disaster_forest", index_name="NDVI".
 4. Whenever start_date is before 2016-01-01 -> MUST use sensor="landsat-c2-l2" and resolution_m=30.
 5. For multi-year trends / time series (>5 years) -> task_type="time_series", interval="Letno".
-6. Known Slovenian events: Savinja/Celje floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
+6. Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
+7. Always normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota".
 Return ONLY valid JSON without markdown code fences."""
 
 
@@ -612,6 +653,11 @@ def _extract_dates_local(norm_q: str) -> tuple[date, date, date, str]:
         return s_d, e_d, e_d, "Mesečno"
 
     if years_found:
+        if target_year == 2023 and any(k in norm_q for k in ("poplav", "flood")):
+            ev_d = date(2023, 8, 5) if "barj" in norm_q else date(2023, 8, 4)
+            return date(2023, 8, 1), date(2023, 8, 31), ev_d, "Vsi posnetki"
+        if target_year == 2022 and any(k in norm_q for k in ("pozar", "fire", "kras")):
+            return date(2022, 7, 1), date(2022, 7, 31), date(2022, 7, 22), "Vsi posnetki"
         s_d = date(target_year, 5, 1)
         e_d = min(date(target_year, 9, 30), today)
         if s_d > today:
@@ -1424,7 +1470,7 @@ Return STRICT JSON ONLY (no markdown fences) with this schema:
 {
   "intent": "run_analysis" | "chat_qa",
   "plan": null OR {
-    "place_name": string (nominative place name, e.g. "Celje", "Kras", "Bled", "Ljubljana"),
+    "place_name": string (nominative town/place name suitable for geocoding, e.g. "Celje", "Slovenj Gradec", "Črna na Koroškem", "Kras", "Bled", "Ljubljana", "Kranj", "Murska Sobota"),
     "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
     "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
     "task_type": "scene_rgb" | "spectral_index" | "time_series" | "disaster_flood" | "disaster_fire" | "disaster_forest",
@@ -1454,7 +1500,8 @@ ROUTING RULES:
    - NDSI / snow / glaciers -> index_name="NDSI".
    - start_date < 2016-01-01 -> sensor="landsat-c2-l2", resolution_m=30.
    - Multi-year trend / time series (>5 years) -> task_type="time_series", interval="Letno".
-   - Known Slovenian events: Celje/Savinja floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22."""
+   - Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
+   - Always normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota"."""
 
 
 _QA_PATTERNS: tuple[str, ...] = (
