@@ -42,10 +42,12 @@ from geodezija_crs import (
     bbox_from_point_wgs84,
     export_to_geotiff_bytes,
 )
+from map_overlay import raster_to_map_overlay_png
 from nesrece import (
     DISASTER_FLOOD,
     DISASTER_FOREST,
     DISASTER_WILDFIRE,
+    build_slippy_rgba_map,
     run_disaster_assessment,
 )
 from stac_loader import (
@@ -73,44 +75,50 @@ GEMINI_MODELS_LIST_URL: str = "https://generativelanguage.googleapis.com/v1beta/
 GEMINI_MODEL_OPTIONS: tuple[dict[str, str], ...] = (
     {
         "id": "gemini-3.5-flash",
-        "label_sl": "gemini-3.5-flash (Zelo hiter, najmanjša poraba tokenov — privzeto)",
-        "label_en": "gemini-3.5-flash (Very fast, lowest token usage — default)",
+        "label_sl": "3.5 Flash",
+        "label_en": "3.5 Flash",
     },
     {
         "id": "gemini-3.6-flash",
-        "label_sl": "gemini-3.6-flash (Hiter, uravnotežen)",
-        "label_en": "gemini-3.6-flash (Fast, balanced)",
+        "label_sl": "3.6 Flash",
+        "label_en": "3.6 Flash",
     },
     {
         "id": "gemini-3.8-flash",
-        "label_sl": "gemini-3.8-flash (Napredni Flash)",
-        "label_en": "gemini-3.8-flash (Advanced Flash)",
+        "label_sl": "3.8 Flash",
+        "label_en": "3.8 Flash",
     },
     {
         "id": "gemini-4-hydrogen",
-        "label_sl": "gemini-4-hydrogen (Gemini 4 Hydrogen)",
-        "label_en": "gemini-4-hydrogen (Gemini 4 Hydrogen)",
+        "label_sl": "4 Hydrogen",
+        "label_en": "4 Hydrogen",
     },
     {
         "id": "gemini-2.5-flash",
-        "label_sl": "gemini-2.5-flash (Klasični stabilni)",
-        "label_en": "gemini-2.5-flash (Classic stable)",
+        "label_sl": "2.5 Flash",
+        "label_en": "2.5 Flash",
     },
     {
         "id": "custom",
-        "label_sl": "Po meri (Custom Model ID)",
-        "label_en": "Custom (Custom Model ID)",
+        "label_sl": "Po meri",
+        "label_en": "Custom",
     },
 )
 
 
+def resolve_gemini_model_id(choice: str | None, custom_id: str | None = None) -> str:
+    """Resolve a preset selector value, live-discovered model ID, or custom model ID to a clean Gemini model name."""
+    raw = str(choice or DEFAULT_GEMINI_MODEL).strip()
+    if raw.lower() == "custom":
+        raw = str(custom_id or "").strip()
+    if raw.startswith("models/"):
+        raw = raw[len("models/") :]
+    return raw or DEFAULT_GEMINI_MODEL
+
+
 def build_gemini_endpoint(model_id: str | None = None) -> str:
     """Build the Gemini REST API generateContent URL for any selected or custom model ID."""
-    clean = str(model_id or DEFAULT_GEMINI_MODEL).strip()
-    if clean.startswith("models/"):
-        clean = clean[len("models/") :]
-    if not clean or clean == "custom":
-        clean = DEFAULT_GEMINI_MODEL
+    clean = resolve_gemini_model_id(model_id)
     return f"https://generativelanguage.googleapis.com/v1beta/models/{clean}:generateContent"
 
 
@@ -155,7 +163,7 @@ VALID_TASKS: tuple[str, ...] = (
     "disaster_fire",
     "disaster_forest",
 )
-VALID_INDICES: tuple[str, ...] = ("NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "VV")
+VALID_INDICES: tuple[str, ...] = ("NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "NDSI", "LST", "VV")
 VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60)
 
 INTERVAL_LABEL_TO_KEY: dict[str, str] = {
@@ -358,6 +366,8 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
     if task_type == "disaster_flood" or index_name == "VV":
         sensor = SENSOR_S1
         index_name = "VV"
+    elif index_name == "LST":
+        sensor = SENSOR_LANDSAT
     elif task_type in ("disaster_fire", "disaster_forest"):
         if event_d < date(2016, 1, 1):
             sensor = SENSOR_LANDSAT
@@ -641,7 +651,11 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
     ) or ((end_d - start_d).days >= 400 and not (is_flood or is_fire or is_forest))
 
     # Index detection
-    if "mndwi" in norm_q:
+    if "ndsi" in norm_q or any(k in norm_q for k in ("sneg", "snez", "ledenik", "snow", "glacier")):
+        index_name = "NDSI"
+    elif "lst" in norm_q or any(k in norm_q for k in ("temperat", "vrocin", "toplot", "thermal", "heat island")):
+        index_name = "LST"
+    elif "mndwi" in norm_q:
         index_name = "MNDWI"
     elif "ndwi" in norm_q or any(k in norm_q for k in ("vodn", "jezer", "water", "lake", "river", "reka")):
         index_name = "NDWI"
@@ -914,6 +928,107 @@ def build_technical_summary(
     return "\n".join(lines)
 
 
+def build_analysis_context_dict(
+    plan: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract a clean, JSON-serializable structured summary of an executed EO analysis for chat memory."""
+    kind = str(result.get("kind", ""))
+    ctx: dict[str, Any] = {
+        "kind": kind,
+        "place_name": str(plan.get("place_name", "")),
+        "resolved_place": str(result.get("resolved_place", plan.get("place_name", ""))),
+        "lat": round(float(result.get("lat", 0.0)), 5),
+        "lon": round(float(result.get("lon", 0.0)), 5),
+        "radius_m": int(plan.get("radius_m", 4000)),
+        "crs": str(result.get("crs", CRS_D96TM)),
+        "sensor": str(plan.get("sensor", SENSOR_S2)),
+        "resolution_m": int(plan.get("resolution_m", 10)),
+        "task_type": str(plan.get("task_type", "")),
+        "index_name": str(plan.get("index_name", "")),
+        "start_date": str(plan.get("start_date", "")),
+        "end_date": str(plan.get("end_date", "")),
+        "event_date": str(plan.get("event_date", "")),
+        "technical_summary": str(result.get("technical_summary", "")),
+    }
+
+    if kind == "disaster" and isinstance(result.get("disaster_result"), dict):
+        dis = result["disaster_result"]
+        d_sum = dis.get("summary") or {}
+        bdf = dis.get("breakdown_df")
+        breakdown_rows: list[dict[str, Any]] = []
+        if isinstance(bdf, pd.DataFrame) and not bdf.empty:
+            for _, row in bdf.iterrows():
+                breakdown_rows.append(
+                    {
+                        "class_label": str(row.get("class_label", "")),
+                        "area_ha": round(float(row.get("area_ha", 0.0)), 2),
+                        "area_km2": round(float(row.get("area_km2", 0.0)), 3),
+                        "pct": round(float(row.get("pct", 0.0)), 2),
+                    }
+                )
+        ctx.update(
+            {
+                "disaster_type": str(dis.get("disaster_type", "")),
+                "date_pre": str(dis.get("date_pre", "")),
+                "date_event": str(dis.get("date_event", "")),
+                "affected_area_ha": round(float(d_sum.get("affected_area_ha", 0.0)), 2),
+                "affected_area_km2": round(float(d_sum.get("affected_area_km2", 0.0)), 3),
+                "affected_pct": round(float(d_sum.get("affected_pct", 0.0)), 2),
+                "permanent_water_ha": round(float(d_sum.get("permanent_water_ha", 0.0)), 2),
+                "mean_dnbr": d_sum.get("mean_dnbr"),
+                "mean_dndvi": d_sum.get("mean_dndvi"),
+                "severity_breakdown": breakdown_rows,
+            }
+        )
+    elif kind == "spectral_index" and isinstance(result.get("stats"), dict):
+        st_d = result["stats"]
+        ctx.update(
+            {
+                "date_str": str(result.get("date_str", "")),
+                "tile": str(result.get("tile", "")),
+                "stats": {
+                    "min": round(float(st_d.get("min", 0.0)), 4),
+                    "max": round(float(st_d.get("max", 0.0)), 4),
+                    "mean": round(float(st_d.get("mean", 0.0)), 4),
+                    "median": round(float(st_d.get("median", 0.0)), 4),
+                    "std": round(float(st_d.get("std", 0.0)), 4),
+                    "valid_area_ha": round(float(st_d.get("valid_area_ha", 0.0)), 2),
+                    "valid_pct": round(float(st_d.get("valid_pct", 0.0)), 2),
+                },
+            }
+        )
+    elif kind == "scene_rgb":
+        ctx.update(
+            {
+                "date_str": str(result.get("date_str", "")),
+                "tile": str(result.get("tile", "")),
+            }
+        )
+    elif kind == "time_series" and isinstance(result.get("ts_df"), pd.DataFrame):
+        ts_df: pd.DataFrame = result["ts_df"]
+        n_obs = len(ts_df)
+        vals = ts_df["mean"].to_numpy(dtype=np.float64) if n_obs else np.array([], dtype=np.float64)
+        slope = None
+        if n_obs >= 3:
+            slope = round(float(np.polyfit(np.arange(n_obs, dtype=np.float64), vals, 1)[0]), 5)
+        ctx.update(
+            {
+                "n_dates": int(n_obs),
+                "date_start": str(ts_df["date_str"].iloc[0]) if n_obs else str(plan.get("start_date", "")),
+                "date_end": str(ts_df["date_str"].iloc[-1]) if n_obs else str(plan.get("end_date", "")),
+                "interval": str(plan.get("interval", "")),
+                "mean": round(float(np.nanmean(vals)), 4) if n_obs else None,
+                "min": round(float(np.nanmin(vals)), 4) if n_obs else None,
+                "max": round(float(np.nanmax(vals)), 4) if n_obs else None,
+                "first_val": round(float(vals[0]), 4) if n_obs else None,
+                "last_val": round(float(vals[-1]), 4) if n_obs else None,
+                "trend_slope_per_obs": slope,
+            }
+        )
+    return ctx
+
+
 def execute_ai_plan(
     plan: dict[str, Any],
     *,
@@ -922,7 +1037,13 @@ def execute_ai_plan(
     lang: str = "sl",
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Execute a validated AI EO plan strictly in metric projection (EPSG:3794 / EPSG:32633)."""
+    """Execute a validated AI EO plan strictly in metric projection (EPSG:3794 / EPSG:32633).
+
+    Always produces BOTH a toggleable satellite imagery overlay (``sat_overlay_uri`` +
+    ``sat_overlay_bounds``) AND the computed analysis/change overlay (``analysis_overlay_uri`` +
+    ``analysis_overlay_bounds``) for all spatial tasks so users can toggle both layers
+    independently in the interactive slippy map.
+    """
 
     def _prog(pct: float, msg: str) -> None:
         if progress_cb is not None:
@@ -963,26 +1084,42 @@ def execute_ai_plan(
             "disaster_fire": DISASTER_WILDFIRE,
             "disaster_forest": DISASTER_FOREST,
         }
+        dt_k = dis_map[task]
         ev_date = datetime.strptime(plan["event_date"], "%Y-%m-%d").date()
         dis_out = run_disaster_assessment(
-            disaster_type=dis_map[task],
+            disaster_type=dt_k,
             bbox_4326=bbox_4326,
             event_date=ev_date,
             target_crs=target_epsg,
             resolution=max(res_m, 30 if sensor == SENSOR_LANDSAT else 10),
             search_window_days=60,
             lang=lang,
-            progress_cb=lambda f, m: _prog(0.15 + 0.80 * f, m),
+            progress_cb=lambda f, m: _prog(0.15 + 0.78 * f, m),
+        )
+        analysis_uri, analysis_bnds = raster_to_map_overlay_png(
+            dis_out["class_da"],
+            src_epsg=target_epsg,
+            is_rgb=False,
+            discrete_rgba_map=build_slippy_rgba_map(dt_k),
+            max_width=1800,
         )
         base_out.update(
             {
                 "kind": "disaster",
                 "disaster_result": dis_out,
+                "sat_overlay_uri": dis_out.get("overlay_uri_post"),
+                "sat_overlay_bounds": dis_out.get("overlay_bounds_post"),
+                "sat_overlay_uri_pre": dis_out.get("overlay_uri_pre"),
+                "sat_overlay_bounds_pre": dis_out.get("overlay_bounds_pre"),
+                "sat_date_str": str(dis_out.get("date_event", "")),
+                "analysis_overlay_uri": analysis_uri,
+                "analysis_overlay_bounds": analysis_bnds,
                 "tif_bytes": dis_out["tif_bytes"],
                 "tif_filename": dis_out["tif_filename"],
             }
         )
         base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+        base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
         _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
         return base_out
 
@@ -1042,6 +1179,7 @@ def execute_ai_plan(
             }
         )
         base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+        base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
         _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
         return base_out
 
@@ -1088,6 +1226,8 @@ def execute_ai_plan(
 
     if task == "spectral_index":
         _prog(0.55, f"Prenašam pasove in računam {plan['index_name']} ({date_str})..." if lang == "sl" else f"Streaming bands and computing {plan['index_name']} ({date_str})...")
+        sat_uri: str | None = None
+        sat_bnds: list[list[float]] | None = None
         if sensor == SENSOR_S1:
             ds = load_scene(
                 sensor=sensor,
@@ -1098,22 +1238,65 @@ def execute_ai_plan(
                 resolution=res_m,
             )
             idx_da = ds["VV"]
+            try:
+                sat_uri, sat_bnds = raster_to_map_overlay_png(
+                    ds["VV"],
+                    src_epsg=target_epsg,
+                    is_rgb=False,
+                    cmap_name="Greys_r",
+                    vmin=-22.0,
+                    vmax=-2.0,
+                    max_width=1800,
+                )
+            except Exception:
+                sat_uri, sat_bnds = None, None
         else:
             req_bands = get_required_bands_for_sensor(
                 sensor=sensor,
                 metric_name=plan["index_name"],
                 include_cloud_mask=True,
             )
+            # Also fetch True Color RGB bands in the same single STAC request for the toggleable satellite layer
+            fetch_bands = list(dict.fromkeys([*req_bands, "B04", "B03", "B02"]))
             ds = load_scene(
                 sensor=sensor,
                 item=best_group,
                 bbox_4326=bbox_4326,
-                bands=req_bands,
+                bands=fetch_bands,
                 target_epsg=target_epsg,
                 resolution=res_m,
             )
+            try:
+                if all(b in ds.data_vars for b in ("B04", "B03", "B02")):
+                    sat_uri, sat_bnds = raster_to_map_overlay_png(
+                        ds,
+                        src_epsg=target_epsg,
+                        is_rgb=True,
+                        bands=["B04", "B03", "B02"],
+                        use_percentile_stretch=True,
+                        gamma=1.0,
+                        max_width=1800,
+                    )
+            except Exception:
+                sat_uri, sat_bnds = None, None
             ds_masked, _ = apply_cloud_mask(ds, sensor=sensor)
             idx_da = compute_index(ds_masked, plan["index_name"])
+
+        idx_key = str(plan["index_name"])
+        spec_ai = (
+            SAR_METRICS.get(idx_key, SAR_METRICS["VV"])
+            if sensor == SENSOR_S1
+            else SPECTRAL_INDICES.get(idx_key, SPECTRAL_INDICES["NDVI"])
+        )
+        analysis_uri, analysis_bnds = raster_to_map_overlay_png(
+            idx_da,
+            src_epsg=target_epsg,
+            is_rgb=False,
+            cmap_name=str(spec_ai["cmap"]),
+            vmin=float(spec_ai["vmin"]),
+            vmax=float(spec_ai["vmax"]),
+            max_width=1800,
+        )
         stats = compute_index_stats(idx_da, resolution_m=float(res_m))
         tif_bytes = export_to_geotiff_bytes(idx_da, target_epsg=target_epsg)
         tif_fname = f"AI_{plan['index_name']}_{plan['place_name']}_{date_str}_EPSG{epsg_num}_{res_m}m.tif"
@@ -1124,12 +1307,18 @@ def execute_ai_plan(
                 "index_da": idx_da,
                 "stats": stats,
                 "date_str": date_str,
+                "sat_date_str": date_str,
                 "tile": tile_str,
+                "sat_overlay_uri": sat_uri,
+                "sat_overlay_bounds": sat_bnds,
+                "analysis_overlay_uri": analysis_uri,
+                "analysis_overlay_bounds": analysis_bnds,
                 "tif_bytes": tif_bytes,
                 "tif_filename": tif_fname,
             }
         )
         base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+        base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
         _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
         return base_out
 
@@ -1145,6 +1334,15 @@ def execute_ai_plan(
         target_epsg=target_epsg,
         resolution=res_m,
     )
+    sat_uri, sat_bnds = raster_to_map_overlay_png(
+        ds_rgb,
+        src_epsg=target_epsg,
+        is_rgb=True,
+        bands=rgb_vars,
+        use_percentile_stretch=True,
+        gamma=1.0,
+        max_width=1800,
+    )
     tif_bytes = export_to_geotiff_bytes(ds_rgb[rgb_vars], target_epsg=target_epsg)
     tif_fname = f"AI_RGB_{plan['place_name']}_{date_str}_EPSG{epsg_num}_{res_m}m.tif"
     gc.collect()
@@ -1154,11 +1352,662 @@ def execute_ai_plan(
             "scene_ds": ds_rgb,
             "bands": rgb_vars,
             "date_str": date_str,
+            "sat_date_str": date_str,
             "tile": tile_str,
+            "sat_overlay_uri": sat_uri,
+            "sat_overlay_bounds": sat_bnds,
             "tif_bytes": tif_bytes,
             "tif_filename": tif_fname,
         }
     )
     base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+    base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
     _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
     return base_out
+
+
+# ---------------------------------------------------------------------------
+# Multi-Turn Conversational EO Agent (Router + Rich Response Generator)
+# ---------------------------------------------------------------------------
+def _call_gemini_rest_with_fallback(
+    payload: dict[str, Any],
+    *,
+    api_key: str,
+    model: str = DEFAULT_GEMINI_MODEL,
+    timeout: int = 20,
+) -> tuple[str, str, str, str]:
+    """Send a generateContent request to Gemini REST API with automatic model fallback cascade.
+
+    Returns ``(response_text, used_model, fallback_note_sl, fallback_note_en)``.
+    """
+    req_model = resolve_gemini_model_id(model)
+    candidates: list[str] = [req_model]
+    for fb in FALLBACK_GEMINI_MODELS:
+        if fb not in candidates:
+            candidates.append(fb)
+
+    first_status: int | None = None
+    last_exc: Exception | None = None
+    for idx, cand_model in enumerate(candidates):
+        try:
+            resp = requests.post(
+                build_gemini_endpoint(cand_model),
+                params={"key": api_key},
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            text = str(body["candidates"][0]["content"]["parts"][0]["text"]).strip()
+            if idx == 0:
+                return text, cand_model, "", ""
+            code_txt = f" (HTTP {first_status})" if first_status else ""
+            return (
+                text,
+                cand_model,
+                f"Model `{req_model}` ni bil dosegljiv{code_txt}; samodejni preklop na `{cand_model}`.",
+                f"Model `{req_model}` unavailable{code_txt}; automatically switched to `{cand_model}`.",
+            )
+        except Exception as exc:
+            last_exc = exc
+            if idx == 0:
+                first_status = getattr(getattr(exc, "response", None), "status_code", None)
+            continue
+
+    raise RuntimeError(f"All Gemini models failed ({req_model}): {last_exc}")
+
+
+_GEMINI_ROUTER_SYSTEM_PROMPT = """You are the intent router and geodetic EO planner for a Slovenian/English Remote Sensing Assistant.
+Decide whether the user's latest message requires executing a NEW or MODIFIED satellite analysis ("run_analysis"), OR whether it is a follow-up question, explanation request, interpretation, report-writing request, or general conversation ("chat_qa").
+
+Return STRICT JSON ONLY (no markdown fences) with this schema:
+{
+  "intent": "run_analysis" | "chat_qa",
+  "plan": null OR {
+    "place_name": string (nominative place name, e.g. "Celje", "Kras", "Bled", "Ljubljana"),
+    "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
+    "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
+    "task_type": "scene_rgb" | "spectral_index" | "time_series" | "disaster_flood" | "disaster_fire" | "disaster_forest",
+    "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "NDSI" | "LST" | "VV",
+    "start_date": "YYYY-MM-DD",
+    "end_date": "YYYY-MM-DD",
+    "event_date": "YYYY-MM-DD",
+    "interval": "Vsi posnetki" | "Vsakih 14 dni" | "Mesečno" | "Sezonsko (3 mes.)" | "Letno",
+    "resolution_m": 10 | 20 | 30 | 60,
+    "explanation_sl": string (concise 1-2 sentence Slovenian plan note),
+    "explanation_en": string (concise 1-2 sentence English plan note)
+  }
+}
+
+ROUTING RULES:
+1. Choose "chat_qa" (with "plan": null) when the user asks:
+   - What a result/index/class means ("Kaj pomeni ta povprečni NDVI?", "Zakaj je toliko visoke poškodovanosti?")
+   - How a sensor or method works ("Kako deluje SAR?", "Bi bilo bolje uporabiti Landsat ali Sentinel-2?")
+   - To summarize, interpret, or draft report/thesis text ("Napiši kratek odstavek za poročilo")
+   - General greetings or conceptual geodetic/EO questions without asking to compute/map new satellite imagery.
+2. Choose "run_analysis" (with complete "plan") when the user explicitly asks to show, compute, map, analyze, or plot satellite data (floods, fires, forest loss, NDVI/NDWI/MNDWI/NDBI/NBR/NDSI/LST, RGB scenes, or time series), including modifications like "Zdaj izračunaj še NDWI za isto območje" (inheriting place/dates from last_context).
+3. Scientific rules for plans:
+   - Floods/inundation/radar -> sensor="sentinel-1-rtc", task_type="disaster_flood", index_name="VV".
+   - Wildfire/burn severity -> task_type="disaster_fire", index_name="NBR".
+   - Forest loss/windthrow/clearcut -> task_type="disaster_forest", index_name="NDVI".
+   - LST / surface temperature -> sensor="landsat-c2-l2", index_name="LST", resolution_m=30.
+   - NDSI / snow / glaciers -> index_name="NDSI".
+   - start_date < 2016-01-01 -> sensor="landsat-c2-l2", resolution_m=30.
+   - Multi-year trend / time series (>5 years) -> task_type="time_series", interval="Letno".
+   - Known Slovenian events: Celje/Savinja floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22."""
+
+
+_QA_PATTERNS: tuple[str, ...] = (
+    "kaj pomeni",
+    "kaj je ",
+    "kaj so ",
+    "zakaj",
+    "kako deluje",
+    "kako se izracun",
+    "kako deluj",
+    "razlozi",
+    "pojasni",
+    "ali je bolje",
+    "bi bilo bolje",
+    "kaksna je razlika",
+    "razlika med",
+    "napisi odstavek",
+    "napisi povzetek",
+    "napisi besedilo",
+    "za porocilo",
+    "za seminarsko",
+    "za diplomo",
+    "interpretiraj",
+    "komentiraj",
+    "ta rezultat",
+    "te stevilke",
+    "tega rezultata",
+    "what does",
+    "what is ",
+    "why ",
+    "how does",
+    "how is ",
+    "explain",
+    "interpret",
+    "summarize",
+    "write a paragraph",
+    "for my report",
+    "would it be better",
+    "difference between",
+    "zivijo",
+    "pozdravljen",
+    "dober dan",
+    "hvala",
+    "hello",
+    "hi ",
+    "thanks",
+    "thank you",
+)
+
+_RUN_ACTION_PATTERNS: tuple[str, ...] = (
+    "pokazi",
+    "prikazi",
+    "analiziraj",
+    "izracunaj",
+    "naredi",
+    "prenesi",
+    "poisci",
+    "oceni",
+    "izdelaj",
+    "narisi",
+    "zazeni",
+    "show ",
+    "analyze",
+    "analyse",
+    "compute",
+    "calculate",
+    "run ",
+    "fetch",
+    "plot ",
+    "load ",
+    "map ",
+)
+
+_EO_SUBJECT_PATTERNS: tuple[str, ...] = (
+    "poplav",
+    "flood",
+    "pozar",
+    "wildfire",
+    "fire",
+    "vetrolom",
+    "posek",
+    "windthrow",
+    "clearcut",
+    "ndvi",
+    "ndwi",
+    "mndwi",
+    "ndbi",
+    "nbr",
+    "dnbr",
+    "dndvi",
+    "ndsi",
+    "lst",
+    "sneg",
+    "ledenik",
+    "snow",
+    "temperat",
+    "casovn",
+    "time series",
+    "rgb",
+    "posnetek",
+    "vegetacij",
+)
+
+
+def _route_user_message_local(
+    message: str,
+    last_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deterministic offline intent router separating 'run_analysis' from 'chat_qa'."""
+    norm_q = _normalize_ascii(message)
+    has_qa_cue = any(p in norm_q for p in _QA_PATTERNS) or norm_q.endswith("?")
+    has_run_verb = any(p in norm_q for p in _RUN_ACTION_PATTERNS)
+    has_eo_subject = any(p in norm_q for p in _EO_SUBJECT_PATTERNS)
+    has_year_or_month = bool(re.search(r"\b(19[89]\d|20[0-2]\d)\b", norm_q)) or any(
+        pat in norm_q for pat, _ in _MONTH_PATTERNS
+    ) or any(s in norm_q for s in ("polet", "pomlad", "jesen", "zim", "summer", "winter", "spring", "autumn"))
+    has_known_place = any(stem in norm_q for stem, _, _, _ in _SLOVENIAN_PLACE_STEMS)
+    refers_same_area = any(
+        p in norm_q for p in ("isto obmocj", "isti lokacij", "tam", "same area", "same location")
+    )
+
+    # Pure explanation / follow-up question / writing request -> chat_qa
+    if has_qa_cue and not (has_run_verb and has_eo_subject):
+        return {
+            "intent": "chat_qa",
+            "plan": None,
+            "engine": "local",
+            "gemini_model": None,
+            "fallback_note_sl": "",
+            "fallback_note_en": "",
+        }
+
+    # Explicit spatial/temporal EO execution request -> run_analysis
+    should_run = (
+        (has_run_verb and (has_eo_subject or has_known_place or refers_same_area))
+        or (has_eo_subject and (has_known_place or has_year_or_month or refers_same_area))
+    )
+    if should_run:
+        plan = parse_eo_request_local(message)
+        # Inherit previous location if user said "isto območje" / "same area" without naming a place
+        if (
+            refers_same_area
+            and not has_known_place
+            and isinstance(last_context, dict)
+            and last_context.get("place_name")
+        ):
+            plan["place_name"] = str(last_context["place_name"])
+            if last_context.get("radius_m"):
+                plan["radius_m"] = int(last_context["radius_m"])
+        return {
+            "intent": "run_analysis",
+            "plan": plan,
+            "engine": "local",
+            "gemini_model": None,
+            "fallback_note_sl": "",
+            "fallback_note_en": "",
+        }
+
+    return {
+        "intent": "chat_qa",
+        "plan": None,
+        "engine": "local",
+        "gemini_model": None,
+        "fallback_note_sl": "",
+        "fallback_note_en": "",
+    }
+
+
+def route_user_message(
+    message: str,
+    chat_history: Sequence[dict[str, Any]] | None = None,
+    last_context: dict[str, Any] | None = None,
+    *,
+    api_key: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+) -> dict[str, Any]:
+    """Route a user chat message into ``'run_analysis'`` (with validated plan) or ``'chat_qa'``."""
+    resolved_key, _ = get_active_gemini_api_key(api_key)
+    if resolved_key:
+        history_lines: list[str] = []
+        for turn in list(chat_history or [])[-6:]:
+            role_lbl = "User" if turn.get("role") == "user" else "Assistant"
+            txt = str(turn.get("content", "")).strip()
+            if txt:
+                history_lines.append(f"{role_lbl}: {txt[:400]}")
+        ctx_snippet = (
+            json.dumps(
+                {k: v for k, v in (last_context or {}).items() if k != "technical_summary"},
+                ensure_ascii=False,
+            )
+            if last_context
+            else "null"
+        )
+        user_blob = (
+            f"Today is {date.today().isoformat()}.\n"
+            f"Last executed analysis context: {ctx_snippet}\n"
+            f"Recent chat history:\n" + ("\n".join(history_lines) if history_lines else "(empty)") + "\n\n"
+            f"Latest user message: {message}"
+        )
+        payload = {
+            "systemInstruction": {"parts": [{"text": _GEMINI_ROUTER_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": user_blob}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1,
+            },
+        }
+        try:
+            raw_text, used_model, fb_sl, fb_en = _call_gemini_rest_with_fallback(
+                payload, api_key=resolved_key, model=model, timeout=18
+            )
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.DOTALL).strip()
+            parsed = json.loads(cleaned)
+            intent = str(parsed.get("intent") or "chat_qa").strip().lower()
+            if intent == "run_analysis" and isinstance(parsed.get("plan"), dict):
+                plan = validate_and_normalize_plan(parsed["plan"], engine="gemini")
+                plan["gemini_model"] = used_model
+                plan["fallback_note_sl"] = fb_sl
+                plan["fallback_note_en"] = fb_en
+                return {
+                    "intent": "run_analysis",
+                    "plan": plan,
+                    "engine": "gemini",
+                    "gemini_model": used_model,
+                    "fallback_note_sl": fb_sl,
+                    "fallback_note_en": fb_en,
+                }
+            return {
+                "intent": "chat_qa",
+                "plan": None,
+                "engine": "gemini",
+                "gemini_model": used_model,
+                "fallback_note_sl": fb_sl,
+                "fallback_note_en": fb_en,
+            }
+        except Exception:
+            pass
+
+    return _route_user_message_local(message, last_context=last_context)
+
+
+def _generate_local_conversational_reply(
+    user_message: str,
+    analysis_context: dict[str, Any] | None,
+    lang: str = "sl",
+    is_post_analysis: bool = False,
+) -> str:
+    """Generate a rich, accurate, domain-aware Slovenian/English reply without an external API."""
+    if is_post_analysis and isinstance(analysis_context, dict):
+        kind = str(analysis_context.get("kind", ""))
+        place = str(analysis_context.get("resolved_place") or analysis_context.get("place_name") or "")
+        crs = str(analysis_context.get("crs", CRS_D96TM))
+        sensor = str(analysis_context.get("sensor", ""))
+        res_m = analysis_context.get("resolution_m", 10)
+        idx = str(analysis_context.get("index_name", ""))
+
+        if kind == "disaster":
+            d_type = str(analysis_context.get("disaster_type", ""))
+            d_pre = str(analysis_context.get("date_pre", ""))
+            d_ev = str(analysis_context.get("date_event", ""))
+            ha = float(analysis_context.get("affected_area_ha", 0.0))
+            km2 = float(analysis_context.get("affected_area_km2", 0.0))
+            pct = float(analysis_context.get("affected_pct", 0.0))
+            if lang == "sl":
+                if d_type == DISASTER_FLOOD:
+                    bg = (
+                        "Za zaznavo poplav je bil uporabljen radarski senzor **Sentinel-1 SAR RTC (C-pas)**, "
+                        "ki prodira skozi nevihtne oblake in padavine ter z nizkim povratnim sipanjem (gladka vodna gladina) "
+                        "zanesljivo loči novo poplavljene površine od stalnih vodotokov."
+                    )
+                    extra = f" Stalna voda pred dogodkom je znašala **{analysis_context.get('permanent_water_ha', 0.0):,.2f} ha**."
+                    sugg = (
+                        "- *»Kaj pomeni razlika med stalno vodo in novo poplavljeno površino na tej karti?«*\n"
+                        "- *»Napiši kratek strokovni odstavek o tem rezultatu za poročilo.«*"
+                    )
+                elif d_type == DISASTER_WILDFIRE:
+                    bg = (
+                        "Analiza požarišča temelji na razliki spektralnega indeksa **dNBR (NBR_pred − NBR_po)**, "
+                        "ki izkorišča močan padec odbojnosti v bližnjem infrardečem pasu (NIR) in dvig v kratkovalovnem infrardečem pasu (SWIR) na ožganem terenu, "
+                        "klasificirano po uradni **USGS lestvici stopnje poškodovanosti**."
+                    )
+                    extra = ""
+                    sugg = (
+                        "- *»Zakaj je toliko površine v razredu visoke ali zmerne poškodovanosti?«*\n"
+                        "- *»Pokaži 5-letno časovno vrsto NDVI za isto območje, da vidimo obnovo gozda.«*"
+                    )
+                else:
+                    bg = (
+                        "Analiza poškodovanosti gozda temelji na razliki **ΔNDVI (NDVI_po − NDVI_pred)**, "
+                        "ki zazna nenaden padec klorofilne aktivnosti pri vetrolomu, sečnji, lubadarju ali hudi suši."
+                    )
+                    extra = ""
+                    sugg = (
+                        "- *»Razloži pragove ΔNDVI za zmerno in močno izgubo vegetacije.«*\n"
+                        "- *»Izračunaj še NBR za isto območje.«*"
+                    )
+                return (
+                    f"### Rezultati analize za območje **{place}**\n\n"
+                    f"{bg}\n\n"
+                    f"- **Uporabljeni podatki:** `{sensor}` ({res_m} m), datuma **PRED `{d_pre}`** → **MED/PO `{d_ev}`**, izračunano v projekciji **{crs}**.\n"
+                    f"- **Ocenjena prizadeta površina:** **{ha:,.2f} ha** (**{km2:.3f} km²**, oziroma **{pct:.2f} %** analiziranega območja).{extra}\n"
+                    f"- **Nasvet za pregled karte:** V legendi slojev na karti spodaj lahko ločeno vklapljate in izklapljate **dejanski satelitski posnetek** in **masko prizadetosti**.\n\n"
+                    f"**Predlogi za nadaljevanje:**\n{sugg}"
+                )
+            else:
+                bg = (
+                    "We used all-weather **Sentinel-1 SAR RTC** radar to penetrate storm clouds and separate newly inundated land from permanent water."
+                    if d_type == DISASTER_FLOOD
+                    else "We computed cloud-masked optical change detection (**dNBR / ΔNDVI**) to quantify severity classes."
+                )
+                return (
+                    f"### Analysis Results for **{place}**\n\n"
+                    f"{bg}\n\n"
+                    f"- **Data & CRS:** `{sensor}` ({res_m} m), **PRE `{d_pre}`** → **EVENT/POST `{d_ev}`**, projected in **{crs}**.\n"
+                    f"- **Total Affected Area:** **{ha:,.2f} ha** (**{km2:.3f} km²**, **{pct:.2f}%** of the AOI).\n"
+                    f"- **Map tip:** Use the top-right Layer Control to toggle both the **analyzed satellite image** and the **impact mask** independently.\n\n"
+                    f"**Suggested follow-ups:**\n"
+                    f"- *\"Explain the severity classes in these results.\"*\n"
+                    f"- *\"Draft a concise report paragraph summarizing these numbers.\"*"
+                )
+
+        if kind == "spectral_index":
+            st_d = analysis_context.get("stats") or {}
+            d_str = str(analysis_context.get("date_str", ""))
+            mean_v = float(st_d.get("mean", 0.0))
+            med_v = float(st_d.get("median", 0.0))
+            min_v = float(st_d.get("min", 0.0))
+            max_v = float(st_d.get("max", 0.0))
+            ha_v = float(st_d.get("valid_area_ha", 0.0))
+            if lang == "sl":
+                return (
+                    f"### Izračun indeksa **{idx}** za **{place}**\n\n"
+                    f"Analiza je bila izvedena na najčistejšem posnetku **`{d_str}`** (`{sensor}`, **{res_m} m**) v geodetski projekciji **{crs}** z oblačnim maskiranjem.\n\n"
+                    f"- **Povprečje / Mediana:** **`{mean_v:.3f}`** / **`{med_v:.3f}`** (razpon `{min_v:.3f}` do `{max_v:.3f}`)\n"
+                    f"- **Veljavna analizirana površina:** **{ha_v:,.2f} ha**\n"
+                    f"- **Interaktivna karta:** Spodaj sta pripravljena **oba sloja** — pravi barvni satelitski posnetek (RGB) in sloj indeksa **{idx}**, ki ju lahko ločeno vklapljate v legendi slojev.\n\n"
+                    f"**Predlogi za nadaljevanje:**\n"
+                    f"- *»Kaj pomeni povprečna vrednost {idx} = {mean_v:.3f} za to območje?«*\n"
+                    f"- *»Izračunaj še NDWI za isto območje.«*"
+                )
+            return (
+                f"### **{idx}** Spectral Analysis for **{place}**\n\n"
+                f"Computed on the clearest scene (**`{d_str}`**, `{sensor}` at **{res_m} m**) in **{crs}** with cloud masking applied.\n\n"
+                f"- **Mean / Median:** **`{mean_v:.3f}`** / **`{med_v:.3f}`** (range `{min_v:.3f}` to `{max_v:.3f}`)\n"
+                f"- **Valid Analyzed Area:** **{ha_v:,.2f} ha**\n"
+                f"- **Interactive Map:** Both the **True Color RGB satellite scene** and the **{idx} overlay** are toggleable in the map's Layer Control.\n\n"
+                f"**Suggested follow-ups:**\n"
+                f"- *\"What does a mean {idx} of {mean_v:.3f} indicate here?\"*\n"
+                f"- *\"Now compute NDWI for the same area.\"*"
+            )
+
+        if kind == "time_series":
+            n_d = int(analysis_context.get("n_dates", 0))
+            d1 = str(analysis_context.get("date_start", ""))
+            d2 = str(analysis_context.get("date_end", ""))
+            mean_v = analysis_context.get("mean")
+            slope = analysis_context.get("trend_slope_per_obs")
+            if lang == "sl":
+                trend_txt = (
+                    f" Linearni trend znaša **`{slope:+.4f}` na opazovanje**."
+                    if slope is not None
+                    else ""
+                )
+                return (
+                    f"### Časovna vrsta **{idx}** za **{place}** (`{d1}` – `{d2}`)\n\n"
+                    f"Iz satelitskega arhiva `{sensor}` (**{res_m} m**, **{crs}**) je bilo obdelanih **{n_d} kakovostnih datumov** (interval: `{analysis_context.get('interval', '')}`).\n\n"
+                    f"- **Povprečna vrednost v obdobju:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{trend_txt}\n\n"
+                    f"**Predlogi za nadaljevanje:**\n"
+                    f"- *»Napiši kratek povzetek tega trenda za moje poročilo.«*\n"
+                    f"- *»Zakaj je za večdesetletne časovne vrste uporabljen Landsat namesto Sentinel-2?«*"
+                )
+            return (
+                f"### **{idx}** Time Series for **{place}** (`{d1}` – `{d2}`)\n\n"
+                f"Processed **{n_d} valid dates** from `{sensor}` (**{res_m} m**, **{crs}**).\n\n"
+                f"- **Period Mean:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).\n\n"
+                f"**Suggested follow-ups:**\n"
+                f"- *\"Summarize this trend in a report paragraph.\"*\n"
+                f"- *\"Why was Landsat used instead of Sentinel-2 for multi-decade trends?\"*"
+            )
+
+        if kind == "scene_rgb":
+            d_str = str(analysis_context.get("date_str", ""))
+            if lang == "sl":
+                return (
+                    f"### Satelitski posnetek za **{place}** (`{d_str}`)\n\n"
+                    f"Naložen je najčistejši satelitski posnetek (`{sensor}`, **{res_m} m**, projekcija **{crs}**). "
+                    f"Spodaj ga lahko približate na karti, prenesete kot georeferenciran GeoTIFF ali pošljete v modul za izdelavo 300 DPI karte.\n\n"
+                    f"**Predlog:** *»Izračunaj še NDVI za isto območje.«*"
+                )
+            return (
+                f"### Satellite Scene for **{place}** (`{d_str}`)\n\n"
+                f"Loaded the clearest scene (`{sensor}`, **{res_m} m**, **{crs}**). You can inspect it interactively below, download the GeoTIFF, or send it to 300 DPI Cartography."
+            )
+
+    # General QA / follow-up fallback when no Gemini API key is configured
+    norm_q = _normalize_ascii(user_message)
+    parts: list[str] = []
+    if lang == "sl":
+        if any(k in norm_q for k in ("porocil", "odstavek", "povzetek", "seminarsk")) and analysis_context:
+            parts.append("**Predlog odstavka za poročilo (na podlagi zadnje analize):**\n")
+            parts.append(f"> {analysis_context.get('technical_summary', '').replace(chr(10), ' ')}")
+        elif any(k in norm_q for k in ("sar", "radar", "poplav")):
+            parts.append(
+                "**Sentinel-1 SAR (C-pas, 5,4 GHz)** je aktiven radarski senzor, ki oddaja lasten mikrovalovni signal in prodira skozi oblake ter dež. "
+                "Mirna vodna gladina odbija radarski žarek zrcalno stran od satelita (zelo nizke vrednosti VV dB, pod −16 dB), zato poplavljene površine na SAR sliki izstopajo kot temna območja."
+            )
+        elif "ndvi" in norm_q:
+            parts.append(
+                "**NDVI = (NIR − Red) / (NIR + Red)** meri vitalnost in gostoto vegetacije na lestvici od **−1 do +1**:\n"
+                "- `< 0,0`: voda, sneg ali oblaki\n"
+                "- `0,0 – 0,2`: gola tla, asfalt, pozidane površine\n"
+                "- `0,2 – 0,5`: redka vegetacija, travniki, sušni posevki\n"
+                "- `> 0,6`: gost zdrav gozd ali bujna vegetacija"
+            )
+        elif any(k in norm_q for k in ("dnbr", "nbr", "pozar")):
+            parts.append(
+                "**dNBR = NBR_pred − NBR_po** primerja spektralni indeks ožganosti pred požarom in po njem (`NBR = (NIR − SWIR2) / (NIR + SWIR2)`). "
+                "Pozitivne vrednosti dNBR nad `0,27` kažejo zmerno, nad `0,66` pa zelo visoko stopnjo poškodovanosti vegetacije in tal po USGS lestvici."
+            )
+        elif any(k in norm_q for k in ("landsat", "sentinel")):
+            parts.append(
+                "**Sentinel-2 (10 m)** ponuja najvišjo prostorsko ločljivost in 5-dnevno ponovljivost za obdobje od **2015 dalje**, "
+                "medtem ko **Landsat Collection 2 (30 m)** omogoča neprekinjen zgodovinski arhiv od leta **1984** ter termalni kanal za izračun površinske temperature (**LST °C**)."
+            )
+        elif analysis_context:
+            parts.append(
+                f"Trenutno aktivna analiza v pogovoru je **{analysis_context.get('task_type')} ({analysis_context.get('index_name')})** "
+                f"za **{analysis_context.get('resolved_place')}** v projekciji **{analysis_context.get('crs')}**."
+            )
+        else:
+            parts.append(
+                "Sem vaš geodetski AI pomočnik za daljinsko zaznavanje. Lahko zaženem analizo poplav (SAR), požarišč (dNBR), spektralnih indeksov (NDVI, NDWI, NDSI, LST) ali večletnih časovnih vrst — samo opišite lokacijo in obdobje!"
+            )
+
+        if analysis_context and not any(k in norm_q for k in ("porocil", "odstavek", "povzetek")):
+            if analysis_context.get("kind") == "disaster":
+                parts.append(
+                    f"\n*Kontekst zadnje analize ({analysis_context.get('resolved_place')}):* prizadeta površina **{analysis_context.get('affected_area_ha', 0):,.2f} ha** ({analysis_context.get('affected_pct', 0):.2f} % AOI)."
+                )
+            elif analysis_context.get("kind") == "spectral_index":
+                st_c = analysis_context.get("stats") or {}
+                parts.append(
+                    f"\n*Kontekst zadnje analize ({analysis_context.get('resolved_place')}):* povprečje **{analysis_context.get('index_name')} = {st_c.get('mean', 0):.3f}**, veljavna površina **{st_c.get('valid_area_ha', 0):,.2f} ha**."
+                )
+        parts.append(
+            "\n\n*ℹ️ Za popolno generativno razpravo v naravnem jeziku vnesite brezplačen Google Gemini API ključ v zgornjih nastavitvah (`⚙️ Nastavitve Gemini API`).*"
+        )
+        return "\n".join(parts)
+
+    # English offline fallback
+    if analysis_context:
+        parts.append(
+            f"Active analysis context: **{analysis_context.get('task_type')} ({analysis_context.get('index_name')})** "
+            f"for **{analysis_context.get('resolved_place')}** in **{analysis_context.get('crs')}**."
+        )
+    else:
+        parts.append(
+            "I'm your Geodetic Earth Observation assistant. Describe any location, dates, and analysis (SAR floods, dNBR wildfires, NDVI/NDWI/NDSI/LST, or time series), or add a free Gemini API key above for full conversational Q&A."
+        )
+    return "\n\n".join(parts)
+
+
+def generate_conversational_reply(
+    user_message: str,
+    chat_history: Sequence[dict[str, Any]] | None = None,
+    analysis_context: dict[str, Any] | None = None,
+    *,
+    api_key: str | None = None,
+    model: str = DEFAULT_GEMINI_MODEL,
+    lang: str = "sl",
+    is_post_analysis: bool = False,
+) -> dict[str, Any]:
+    """Generate a rich, multi-turn conversational geodetic EO reply via Gemini REST or smart local fallback."""
+    resolved_key, _ = get_active_gemini_api_key(api_key)
+    lang_name = "Slovenian" if lang == "sl" else "English"
+
+    if resolved_key:
+        if is_post_analysis:
+            sys_prompt = (
+                f"You are an expert, friendly Geodetic & Remote Sensing (Earth Observation) AI assistant. "
+                f"Respond strictly in clear, natural {lang_name} using clean Markdown.\n"
+                f"A real satellite analysis was JUST executed for the user's request, and exact geodetic results are provided below.\n"
+                f"Structure your response naturally (like Gemini Chat) to:\n"
+                f"1. Give insightful domain/background context about what was analyzed (e.g., why Sentinel-1 SAR penetrates storm clouds during floods, how dNBR captures burn severity, or what the spectral index measures),\n"
+                f"2. State clearly what satellite sensor, exact acquisition dates, resolution, and projected CRS (e.g. EPSG:3794 D96/TM or UTM) were used,\n"
+                f"3. Interpret the EXACT computed numbers (ha, km², %, min/mean/max, severity classes) in plain, helpful language — NEVER invent numbers not in the context,\n"
+                f"4. Mention briefly that on the interactive map below, both the satellite image and the analysis overlay can be toggled independently,\n"
+                f"5. End with 1–2 concise suggested follow-up questions or next analyses."
+            )
+        else:
+            sys_prompt = (
+                f"You are an expert, friendly Geodetic & Remote Sensing (Earth Observation) AI assistant. "
+                f"Respond strictly in clear, natural {lang_name} using clean Markdown.\n"
+                f"Use the provided recent analysis context (if any) to answer the user's follow-up question accurately with exact numbers, "
+                f"explain geodetic/EO concepts clearly, or draft concise report paragraphs when asked. Never fabricate metrics not present in the context."
+            )
+
+        ctx_block = (
+            json.dumps(analysis_context, ensure_ascii=False)
+            if isinstance(analysis_context, dict) and analysis_context
+            else "None (no analysis executed yet in this session)."
+        )
+        full_sys = f"{sys_prompt}\n\nCURRENT EXECUTED ANALYSIS CONTEXT (JSON):\n{ctx_block}"
+
+        contents: list[dict[str, Any]] = []
+        # Include up to last 8 prior turns for genuine multi-turn conversation memory
+        for turn in list(chat_history or [])[-8:]:
+            role = "user" if turn.get("role") == "user" else "model"
+            txt = str(turn.get("content", "")).strip()
+            if txt:
+                contents.append({"role": role, "parts": [{"text": txt[:2000]}]})
+
+        # Avoid duplicating the latest user message if already at the tail of chat_history
+        if not (
+            contents
+            and contents[-1]["role"] == "user"
+            and contents[-1]["parts"][0]["text"].strip() == user_message.strip()
+        ):
+            contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        payload = {
+            "systemInstruction": {"parts": [{"text": full_sys}]},
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.4,
+                "maxOutputTokens": 1200,
+            },
+        }
+        try:
+            reply_text, used_model, fb_sl, fb_en = _call_gemini_rest_with_fallback(
+                payload, api_key=resolved_key, model=model, timeout=25
+            )
+            if reply_text:
+                return {
+                    "text": reply_text,
+                    "engine": "gemini",
+                    "gemini_model": used_model,
+                    "fallback_note_sl": fb_sl,
+                    "fallback_note_en": fb_en,
+                }
+        except Exception:
+            pass
+
+    return {
+        "text": _generate_local_conversational_reply(
+            user_message=user_message,
+            analysis_context=analysis_context,
+            lang=lang,
+            is_post_analysis=is_post_analysis,
+        ),
+        "engine": "local",
+        "gemini_model": None,
+        "fallback_note_sl": "",
+        "fallback_note_en": "",
+    }
+

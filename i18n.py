@@ -553,6 +553,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_models_need_key": "Najprej vnesite Gemini API ključ (ali ga nastavite v Streamlit Secrets).",
         "ai_models_found_ok": "✅ Najdenih **{n}** razpoložljivih modelov (podpora za `generateContent`) na vašem Google AI Studio računu.",
         "ai_models_check_err": "Napaka pri preverjanju modelov na Gemini API: {err}",
+        "ai_models_live_select_label": "Razpoložljivi modeli na vašem API ključu (kliknite za izbiro):",
+        "ai_chat_new_btn": "🗑️ Nov pogovor",
+        "ai_chat_welcome_title": "Pozdravljeni! Sem vaš geodetski AI agent za daljinsko zaznavanje.",
+        "ai_chat_welcome_body": (
+            "Opišite želeno satelitsko analizo v naravnem jeziku (poplave SAR, požarišča dNBR, NDVI/NDWI/NDSI/LST, "
+            "večletne časovne vrste) ali pa mi postavite poljubno vprašanje o geodeziji, senzorjih in izračunanih rezultatih."
+        ),
+        "ai_chat_input_placeholder": "Vprašajte karkoli ali opišite satelitsko analizo (npr. Pokaži poplave v Celju avgusta 2023)...",
+        "ai_chat_thinking_route": "Razmišljam in določam najboljši pristop...",
+        "ai_chat_thinking_reply": "Pripravljam strokovno razlago rezultatov...",
+        "ai_layer_sat_rgb": "🛰️ Satelitski posnetek RGB ({date})",
+        "ai_layer_sat_sar": "🛰️ Sentinel-1 SAR ({date})",
+        "ai_layer_flood_mask": "🌊 Poplavljena območja (SAR)",
+        "ai_layer_fire_mask": "🔥 Požarišče (dNBR)",
+        "ai_layer_forest_mask": "🌲 Izguba vegetacije (dNDVI)",
+        "ai_layer_toggle_hint": "💡 V legendi slojev (desno zgoraj na karti) lahko ločeno vklapljate/izklapljate **satelitski posnetek** in **analizni sloj**.",
+        "ai_copy_expander": "📋 Tehnični povzetek za poročilo (kopiraj)",
         # Phase 5: GNSS Mission Planning (Tab 7)
         "tab7": "📡 Načrtovanje GNSS izmere",
         "gnss_header": "📡 Načrtovanje GNSS izmere (Skyplot, DOP & 360° maska ovir)",
@@ -1304,6 +1321,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_models_need_key": "Enter a Gemini API key first (or configure GEMINI_API_KEY in Streamlit Secrets).",
         "ai_models_found_ok": "✅ Discovered **{n}** live models supporting `generateContent` on your Google AI Studio account.",
         "ai_models_check_err": "Failed to fetch available Gemini models: {err}",
+        "ai_models_live_select_label": "Available models on your API key (click to select):",
+        "ai_chat_new_btn": "🗑️ New Chat",
+        "ai_chat_welcome_title": "Welcome! I'm your Geodetic Earth Observation AI Agent.",
+        "ai_chat_welcome_body": (
+            "Describe any satellite analysis in natural language (SAR floods, dNBR wildfires, NDVI/NDWI/NDSI/LST, "
+            "multi-decade time series) or ask follow-up questions about geodesy, sensors, and your computed results."
+        ),
+        "ai_chat_input_placeholder": "Ask anything or describe a satellite analysis (e.g., Show floods in Celje in August 2023)...",
+        "ai_chat_thinking_route": "Thinking and selecting the best approach...",
+        "ai_chat_thinking_reply": "Writing geodetic interpretation of results...",
+        "ai_layer_sat_rgb": "🛰️ Satellite Scene RGB ({date})",
+        "ai_layer_sat_sar": "🛰️ Sentinel-1 SAR ({date})",
+        "ai_layer_flood_mask": "🌊 Flooded Areas (SAR)",
+        "ai_layer_fire_mask": "🔥 Burn Severity (dNBR)",
+        "ai_layer_forest_mask": "🌲 Vegetation Loss (dNDVI)",
+        "ai_layer_toggle_hint": "💡 Use the Layer Control (top-right on the map) to independently toggle the **satellite scene** and **analysis mask** ON/OFF.",
+        "ai_copy_expander": "📋 Technical Report Summary (copy)",
         # Phase 5: GNSS Mission Planning (Tab 7)
         "tab7": "📡 GNSS Mission Planning",
         "gnss_header": "📡 GNSS Mission Planning (Skyplot, DOP & 360° Obstruction Mask)",
