@@ -123,12 +123,15 @@ from geodezija_crs import (
     EPSG_WGS84,
     bbox_from_point_d96tm,
     bbox_from_point_wgs84,
+    clamp_polygon_to_max_area,
     clip_to_aoi_polygon,
     export_to_geotiff_bytes,
     format_crs_label,
     get_auto_utm_epsg,
     get_best_metric_crs,
+    get_ram_limits,
     get_runtime_environment,
+    get_safe_processing_resolution,
     is_codespaces,
     is_in_slovenia,
     transform_coords,
@@ -4005,7 +4008,8 @@ def _resolve_active_aoi_state(
 def _sync_ws1_radius() -> None:
     val = st.session_state.get("ws1_map_radius_slider")
     if val is not None:
-        st.session_state["map_radius_m"] = int(val)
+        max_r = int(get_ram_limits()["max_radius_m"])
+        st.session_state["map_radius_m"] = min(int(val), max_r)
 
 
 def _sync_ws1_aoi_mode() -> None:
@@ -4018,10 +4022,12 @@ def _apply_slovenia_preset_ws1(preset_name: str) -> None:
     spec = SLOVENIA_PRESETS.get(preset_name)
     if spec is None:
         return
+    max_r = int(get_ram_limits()["max_radius_m"])
+    clamped_r = min(int(spec["radius_m"]), max_r)
     st.session_state["map_lat"] = float(spec["lat"])
     st.session_state["map_lon"] = float(spec["lon"])
-    st.session_state["map_radius_m"] = int(spec["radius_m"])
-    st.session_state["ws1_map_radius_slider"] = int(spec["radius_m"])
+    st.session_state["map_radius_m"] = clamped_r
+    st.session_state["ws1_map_radius_slider"] = clamped_r
     st.session_state["active_location_label"] = preset_name
     st.session_state["map_zoom"] = 12
     st.session_state["live_map_zoom"] = 12
@@ -4178,13 +4184,20 @@ def _render_interactive_aoi_section(
                 use_pills=True,
             )
         with c_aoi_ctrl:
+            ram_lims_aoi = get_ram_limits()
+            max_rad_m = int(ram_lims_aoi["max_radius_m"])
+            max_area_lim = float(ram_lims_aoi["max_area_km2"])
             if aoi_mode_key in ("map", "preset"):
-                cur_rad = int(st.session_state.get("map_radius_m", 2000))
-                st.session_state.setdefault("ws1_map_radius_slider", cur_rad)
+                cur_rad = min(int(st.session_state.get("map_radius_m", 2000)), max_rad_m)
+                st.session_state["map_radius_m"] = cur_rad
+                if "ws1_map_radius_slider" not in st.session_state:
+                    st.session_state["ws1_map_radius_slider"] = cur_rad
+                elif int(st.session_state["ws1_map_radius_slider"]) > max_rad_m:
+                    st.session_state["ws1_map_radius_slider"] = max_rad_m
                 st.slider(
                     t("radius_label"),
                     min_value=500,
-                    max_value=30000,
+                    max_value=max_rad_m,
                     step=250,
                     key="ws1_map_radius_slider",
                     on_change=_sync_ws1_radius,
@@ -4209,6 +4222,14 @@ def _render_interactive_aoi_section(
                 if uploaded_geojson is not None:
                     try:
                         gj_b4326, gj_b3794, gj_poly = _parse_geojson_aoi(uploaded_geojson)
+                        gj_poly, was_clamped_gj, _ = clamp_polygon_to_max_area(
+                            gj_poly, max_area_km2=max_area_lim
+                        )
+                        if was_clamped_gj:
+                            from shapely.geometry import shape as _shp_gj
+
+                            gj_b4326 = list(_shp_gj(gj_poly).bounds)
+                            st.session_state["aoi_clamped_notice"] = max_area_lim
                         prev_gj = st.session_state.get("uploaded_geojson_aoi")
                         if not isinstance(prev_gj, dict) or prev_gj.get("name") != uploaded_geojson.name:
                             st.session_state["uploaded_geojson_aoi"] = {
@@ -4316,6 +4337,10 @@ def _render_interactive_aoi_section(
                 pass
         extracted_poly = _extract_drawn_polygon(draw_out)
         if extracted_poly is not None:
+            ram_max_draw = float(get_ram_limits()["max_area_km2"])
+            extracted_poly, was_clamped_draw, _ = clamp_polygon_to_max_area(
+                extracted_poly, max_area_km2=ram_max_draw
+            )
             prev_poly = st.session_state.get("drawn_polygon_4326")
             if json.dumps(extracted_poly, sort_keys=True) != json.dumps(prev_poly, sort_keys=True):
                 if isinstance(draw_out, dict) and draw_out.get("zoom") is not None:
@@ -4324,7 +4349,14 @@ def _render_interactive_aoi_section(
                     except (TypeError, ValueError):
                         pass
                 st.session_state["drawn_polygon_4326"] = extracted_poly
+                if was_clamped_draw:
+                    st.session_state["aoi_clamped_notice"] = ram_max_draw
+                    st.session_state["draw_map_version"] = int(st.session_state.get("draw_map_version", 0)) + 1
                 st.rerun()
+
+        clamped_notice = st.session_state.pop("aoi_clamped_notice", None)
+        if clamped_notice is not None:
+            st.info(t("aoi_clamped_info", max_area=float(clamped_notice)))
 
     # Način 2: Velik interaktivni zemljevid (klik posodobi središče AOI)
     else:
@@ -7166,6 +7198,14 @@ def main() -> None:
     _clamp_dates_for_sensor(sensor)
 
     cur_lang_pre = str(st.session_state.get("lang", "sl"))
+    # Enforce hard RAM radius cap before resolving AOI so searches are never blocked
+    _ram_lims_main = get_ram_limits()
+    _max_rad_main = int(_ram_lims_main["max_radius_m"])
+    if int(st.session_state.get("map_radius_m", 2000)) > _max_rad_main:
+        st.session_state["map_radius_m"] = _max_rad_main
+    if int(st.session_state.get("ws1_map_radius_slider", 2000)) > _max_rad_main:
+        st.session_state["ws1_map_radius_slider"] = _max_rad_main
+
     (
         aoi_mode_key,
         bbox_4326,
@@ -7257,7 +7297,7 @@ def main() -> None:
         if bbox_4326 is not None and aoi_error is None:
             if not aoi_valid:
                 st.markdown(
-                    f'<div class="ram-pill ram-pill-err">{t("ram_status_err", area=area_km2)}</div>',
+                    f'<div class="ram-pill ram-pill-err">{t("ram_status_err", area=area_km2, max_area=float(runtime_env["max_area_km2"]))}</div>',
                     unsafe_allow_html=True,
                 )
             elif sel_res_pre < rec_res:
@@ -7299,6 +7339,12 @@ def main() -> None:
             use_pills=True,
         )
         st.session_state["selected_resolution"] = int(selected_resolution)
+        eff_res_safe, res_auto_adj = get_safe_processing_resolution(
+            int(selected_resolution), area_km2, sensor=sensor
+        )
+        if res_auto_adj:
+            selected_resolution = int(eff_res_safe)
+            st.caption(t("ram_auto_res_note", res=selected_resolution))
 
         crs_mode = _touch_selector(
             t("output_crs_label"),
@@ -7673,7 +7719,7 @@ def main() -> None:
                             use_pan_buf = bool(st.session_state.get("expand_pan_buffer", True))
                             if use_pan_buf:
                                 load_bbox = expand_bbox_for_panning(
-                                    active_bbox, buffer_factor=0.35, max_area_km2=4000.0
+                                    active_bbox, buffer_factor=0.35, max_area_km2=None
                                 )
                                 ds_display = load_scene(
                                     sensor=active_sensor,
@@ -7840,7 +7886,7 @@ def main() -> None:
                             use_pan_buf_s1 = bool(st.session_state.get("expand_pan_buffer", True))
                             if use_pan_buf_s1:
                                 s1_load_bbox = expand_bbox_for_panning(
-                                    active_bbox, buffer_factor=0.35, max_area_km2=4000.0
+                                    active_bbox, buffer_factor=0.35, max_area_km2=None
                                 )
                                 ds_vv_disp = load_scene(
                                     sensor=SENSOR_S1,
@@ -7998,7 +8044,7 @@ def main() -> None:
                             use_pan_buf_t2 = bool(st.session_state.get("expand_pan_buffer", True))
                             if use_pan_buf_t2:
                                 t2_load_bbox = expand_bbox_for_panning(
-                                    active_bbox, buffer_factor=0.35, max_area_km2=4000.0
+                                    active_bbox, buffer_factor=0.35, max_area_km2=None
                                 )
                                 ds_raw = load_scene(
                                     sensor=active_sensor,

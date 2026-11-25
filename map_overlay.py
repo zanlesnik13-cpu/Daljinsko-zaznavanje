@@ -30,7 +30,7 @@ from rasterio.enums import Resampling
 import rioxarray  # noqa: F401 - registers .rio accessor on xarray objects
 import xarray as xr
 
-from geodezija_crs import EPSG_D96TM, EPSG_WGS84, get_best_metric_crs, transform_coords, validate_aoi_size
+from geodezija_crs import EPSG_D96TM, EPSG_WGS84, get_best_metric_crs, get_ram_limits, transform_coords, validate_aoi_size
 
 # Persistent cartographic basemap definitions (mirrors app.py)
 SLIPPY_BASEMAP_SPECS: dict[str, dict[str, Any]] = {
@@ -61,12 +61,13 @@ SLIPPY_BASEMAP_SPECS: dict[str, dict[str, Any]] = {
 def expand_bbox_for_panning(
     bbox_4326: Sequence[float],
     buffer_factor: float = 0.35,
-    max_area_km2: float = 4000.0,
+    max_area_km2: float | None = None,
 ) -> list[float]:
     """Expand an EPSG:4326 AOI bounding box on each side for smooth slippy-map panning.
 
-    Caps the effective buffer automatically so the expanded download area never
-    exceeds ``max_area_km2`` (16 GB RAM safety guard).
+    Caps the effective buffer automatically against the runtime's RAM limit and skips
+    expansion when the core AOI already occupies >= 75% of the RAM cap so expanded
+    buffers never pull in half-empty swath edges over large AOIs.
     """
     if len(bbox_4326) != 4:
         raise ValueError(f"bbox_4326 must contain 4 values, got {len(bbox_4326)}.")
@@ -79,9 +80,13 @@ def expand_bbox_for_panning(
     if factor == 0.0:
         return [min_lon, min_lat, max_lon, max_lat]
 
-    cur_area, _, _ = validate_aoi_size([min_lon, min_lat, max_lon, max_lat], max_area_km2=max_area_km2)
-    safe_cap = float(max_area_km2) * 0.96
-    if cur_area <= 0.0 or cur_area >= safe_cap:
+    runtime_max = float(get_ram_limits()["max_area_km2"])
+    eff_max = min(float(max_area_km2), runtime_max) if max_area_km2 is not None else runtime_max
+
+    cur_area, _, _ = validate_aoi_size([min_lon, min_lat, max_lon, max_lat], max_area_km2=eff_max)
+    safe_cap = eff_max * 0.95
+    # Avoid pulling in distant partial-swath edges when core AOI is already large
+    if cur_area <= 0.0 or cur_area >= eff_max * 0.75:
         return [min_lon, min_lat, max_lon, max_lat]
 
     # Expanding each side by f scales width & height by (1 + 2f) and area by (1 + 2f)^2
@@ -229,6 +234,7 @@ def raster_to_map_overlay_png(
         ``(png_data_uri, [[south, west], [north, east]])`` ready for ``folium.raster_layers.ImageOverlay``.
     """
     if is_rgb:
+        is_sar_fc = False
         # Build a 3-band float32 DataArray (band, y, x) in source CRS before a single clean reprojection
         if isinstance(data_array_or_rgb, xr.Dataset):
             ds = data_array_or_rgb
@@ -236,6 +242,7 @@ def raster_to_map_overlay_png(
 
             # Special case: Sentinel-1 2-pol false color composite (VV, VH -> R=VV, G=VH, B=VV-VH)
             if len(req_bands) == 2 and set(req_bands) == {"VV", "VH"}:
+                is_sar_fc = True
                 vv = ds["VV"].astype(np.float32, copy=False)
                 vh = ds["VH"].astype(np.float32, copy=False)
                 diff = (vv - vh).astype(np.float32, copy=False)
@@ -260,12 +267,30 @@ def raster_to_map_overlay_png(
         else:
             raise TypeError(f"Expected xarray DataArray or Dataset, got {type(data_array_or_rgb).__name__}.")
 
+        # Mask optical all-zero NoData pixels to NaN BEFORE reprojection so bilinear interpolation
+        # never bleeds black (0,0,0) swath borders into adjacent valid pixels.
+        if not is_sar_fc:
+            src_vals = stacked.values.astype(np.float32, copy=True)
+            src_valid = (
+                np.isfinite(src_vals[0])
+                & np.isfinite(src_vals[1])
+                & np.isfinite(src_vals[2])
+                & ~((src_vals[0] <= 0.0) & (src_vals[1] <= 0.0) & (src_vals[2] <= 0.0))
+            )
+            src_vals[:, ~src_valid] = np.nan
+            src_crs_saved = stacked.rio.crs
+            stacked = xr.DataArray(src_vals, dims=stacked.dims, coords=stacked.coords, attrs=dict(stacked.attrs))
+            if src_crs_saved is not None:
+                stacked = stacked.rio.write_crs(src_crs_saved, inplace=False)
+
         reproj = _prepare_vis_dataarray(stacked, src_epsg=src_epsg, resampling=Resampling.bilinear, nodata=np.nan)
         west, south, east, north = reproj.rio.bounds()
         y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
 
         arr3 = reproj.values.astype(np.float32, copy=False)  # (3, H, W)
-        valid = np.isfinite(arr3[0]) & np.isfinite(arr3[1]) & np.isfinite(arr3[2])
+        valid_mask = np.isfinite(arr3[0]) & np.isfinite(arr3[1]) & np.isfinite(arr3[2])
+        if not is_sar_fc:
+            valid_mask &= ~((arr3[0] <= 0.0) & (arr3[1] <= 0.0) & (arr3[2] <= 0.0))
 
         h, w = arr3.shape[1], arr3.shape[2]
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -275,18 +300,19 @@ def raster_to_map_overlay_png(
                 if (fixed_ranges is not None and idx < len(fixed_ranges))
                 else (0.0, 0.35)
             )
+            ch_valid_only = np.where(valid_mask, arr3[idx], np.nan)
             stretched = _stretch_channel_01(
-                arr3[idx],
+                ch_valid_only,
                 use_percentile_stretch=use_percentile_stretch,
                 fixed_range=f_range,
                 gamma=gamma,
             )
             rgba[..., idx] = np.where(
-                valid,
+                valid_mask,
                 np.clip(np.round(stretched * 255.0), 0, 255),
                 0,
             ).astype(np.uint8)
-        rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
+        rgba[..., 3] = np.where(valid_mask, 255, 0).astype(np.uint8)
         rgba = _orient_north_up(rgba, y_coords)
         data_uri = _encode_rgba_to_data_uri(rgba, max_width=max_width, discrete=False)
         return data_uri, [[float(south), float(west)], [float(north), float(east)]]

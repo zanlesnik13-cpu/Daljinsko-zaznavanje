@@ -850,21 +850,25 @@ def filter_by_temporal_interval(
     return grouped_items, filtered_df
 
 
-def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
-    """Collapse a ``time`` dimension to a single 2D ``(y, x)`` mosaic slice."""
+def mosaic_tile_stack(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
+    """NoData-aware multi-tile mosaic collapsing ``time`` into a single seamless 2D ``(y, x)`` Dataset.
+
+    For optical bands (Sentinel-2 / Landsat), masks all ``<= 0`` and NoData fill values to ``np.nan``
+    per tile BEFORE combining across tiles so a tile's ``0`` swath border can NEVER overwrite valid
+    pixels from an adjacent or overlapping tile.
+    """
     if "time" not in raw_ds.dims:
         return raw_ds
-    if raw_ds.sizes["time"] == 1:
-        return raw_ds.isel(time=0)
 
-    # Fallback mosaic if same-UTC-date items ever span two solar_day bins
-    collapsed: dict[str, xr.DataArray] = {}
+    n_t = int(raw_ds.sizes["time"])
     spatial_coords = {k: v for k, v in raw_ds.coords.items() if "time" not in v.dims}
+    collapsed: dict[str, xr.DataArray] = {}
+
     for var_name in raw_ds.data_vars:
+        v_str = str(var_name)
         da = raw_ds[var_name]
-        arr_t = da.values  # (T, Y, X)
-        out = arr_t[0].copy()
         nodata_val = da.attrs.get("nodata", None)
+        is_categorical = v_str in ("SCL", "qa_pixel")
 
         def _is_valid(slice_arr: np.ndarray) -> np.ndarray:
             if sensor == SENSOR_S1:
@@ -872,29 +876,61 @@ def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
                 if nodata_val is not None and np.isfinite(nodata_val):
                     valid &= slice_arr != nodata_val
                 return valid
-            if str(var_name) == "qa_pixel":
-                return np.isfinite(slice_arr) & ((slice_arr.astype(np.uint16, copy=False) & 1) == 0)
-            nd = 0 if nodata_val is None else nodata_val
-            return np.isfinite(slice_arr) & (slice_arr != nd)
+            if v_str == "qa_pixel":
+                return np.isfinite(slice_arr) & (slice_arr > 0) & ((slice_arr.astype(np.uint16, copy=False) & 1) == 0)
+            if v_str == "SCL":
+                return np.isfinite(slice_arr) & (slice_arr > 0)
+            # Optical & thermal DN bands: 0 (and <= 0) is strictly NoData fill
+            valid = np.isfinite(slice_arr) & (slice_arr > 0)
+            if nodata_val is not None and np.isfinite(nodata_val):
+                valid &= slice_arr != nodata_val
+            return valid
 
-        filled = _is_valid(out)
-        for t_idx in range(1, arr_t.shape[0]):
-            if np.all(filled):
-                break
-            cand = arr_t[t_idx]
-            take = (~filled) & _is_valid(cand)
-            out[take] = cand[take]
-            filled |= take
+        arr_t = da.values  # (T, Y, X)
+        if not is_categorical:
+            # Convert optical/SAR to float32 with strict NaN for NoData BEFORE mosaicking
+            first = arr_t[0].astype(np.float32, copy=True)
+            filled = _is_valid(first)
+            first[~filled] = np.nan
+            for t_idx in range(1, n_t):
+                if np.all(filled):
+                    break
+                cand = arr_t[t_idx].astype(np.float32, copy=False)
+                cand_ok = _is_valid(cand)
+                take = (~filled) & cand_ok
+                if np.any(take):
+                    first[take] = cand[take]
+                    filled |= take
+            out = first
+            new_attrs = dict(da.attrs)
+            new_attrs["nodata"] = np.nan
+        else:
+            out = arr_t[0].copy()
+            filled = _is_valid(out)
+            for t_idx in range(1, n_t):
+                if np.all(filled):
+                    break
+                cand = arr_t[t_idx]
+                take = (~filled) & _is_valid(cand)
+                if np.any(take):
+                    out[take] = cand[take]
+                    filled |= take
+            new_attrs = dict(da.attrs)
 
-        collapsed[str(var_name)] = xr.DataArray(
+        collapsed[v_str] = xr.DataArray(
             out,
             dims=da.dims[1:],
             coords={d: da.coords[d] for d in da.dims[1:] if d in da.coords},
-            name=str(var_name),
-            attrs=dict(da.attrs),
+            name=v_str,
+            attrs=new_attrs,
         )
 
     return xr.Dataset(data_vars=collapsed, coords=spatial_coords, attrs=dict(raw_ds.attrs))
+
+
+def _collapse_time_dim(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
+    """Collapse a ``time`` dimension to a single 2D ``(y, x)`` mosaic slice via ``mosaic_tile_stack``."""
+    return mosaic_tile_stack(raw_ds, sensor=sensor)
 
 
 def _finalize_search_results(
@@ -1020,8 +1056,8 @@ def load_sentinel2_scene(
 
     _configure_odc_rio()
 
-    # Pass nodata=0 explicitly so overlapping same-day MGRS tiles fuse cleanly without
-    # zero-padded swath edges overwriting valid reflectance or SCL pixels.
+    # When multiple same-day MGRS tiles cover the AOI, load each tile as its own time slice
+    # (groupby="id", nodata=0) so mosaic_tile_stack masks <=0 borders to NaN BEFORE fusing tiles.
     raw_ds = odc.stac.load(
         signed_items,
         bands=band_list,
@@ -1029,10 +1065,10 @@ def load_sentinel2_scene(
         crs=crs_str,
         resolution=float(resolution),
         resampling=resampling_cfg,
-        groupby="solar_day",
+        groupby="id" if len(signed_items) > 1 else "solar_day",
         nodata=0,
     )
-    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_S2)
+    raw_ds = mosaic_tile_stack(raw_ds, sensor=SENSOR_S2)
 
     primary_item = signed_items[0]
     apply_offset = _requires_pb04_offset(primary_item)
@@ -1047,11 +1083,10 @@ def load_sentinel2_scene(
         raw_da = raw_ds[band]
         if band in OPTICAL_BANDS:
             nodata_val = raw_da.attrs.get("nodata", 0)
-            if nodata_val is None:
-                nodata_val = 0
-
             raw_vals = raw_da.values
-            valid_mask = np.isfinite(raw_vals) & (raw_vals != nodata_val)
+            valid_mask = np.isfinite(raw_vals) & (raw_vals > 0)
+            if nodata_val is not None and np.isfinite(nodata_val):
+                valid_mask &= raw_vals != nodata_val
 
             refl = raw_vals.astype(np.float32, copy=True)
             if apply_offset:
@@ -1286,9 +1321,10 @@ def load_landsat_scene(
         crs=crs_str,
         resolution=float(resolution),
         resampling=resampling_cfg,
-        groupby="solar_day",
+        groupby="id" if len(signed_items) > 1 else "solar_day",
+        nodata=0,
     )
-    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_LANDSAT)
+    raw_ds = mosaic_tile_stack(raw_ds, sensor=SENSOR_LANDSAT)
 
     # Prepare qa_pixel array first so optical/thermal bands can mask Fill bit 0 cleanly
     qa_vals_u16: np.ndarray | None = None
@@ -1473,9 +1509,10 @@ def load_sentinel1_scene(
         crs=crs_str,
         resolution=float(resolution),
         resampling="bilinear",
-        groupby="solar_day",
+        groupby="id" if len(signed_items) > 1 else "solar_day",
+        nodata=np.nan,
     )
-    raw_ds = _collapse_time_dim(raw_ds, sensor=SENSOR_S1)
+    raw_ds = mosaic_tile_stack(raw_ds, sensor=SENSOR_S1)
 
     calibrated_vars: dict[str, xr.DataArray] = {}
     for pol in available_pols:

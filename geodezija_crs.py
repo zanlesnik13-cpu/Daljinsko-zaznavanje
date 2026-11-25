@@ -68,11 +68,13 @@ SUPPORTED_CRS: dict[str, dict[str, object]] = {
 _RES_10M_MAX_KM2: float = 1200.0
 _RES_20M_MAX_KM2: float = 2500.0
 _RES_30M_MAX_KM2: float = 4000.0
+_HIGH_RAM_MAX_RADIUS_M: int = 31500
 
 # Low-RAM safety profile (Streamlit Community Cloud 1 GB container):
-_CLOUD_1GB_RES_10M_MAX_KM2: float = 60.0
-_CLOUD_1GB_RES_20M_MAX_KM2: float = 300.0
+_CLOUD_1GB_RES_10M_MAX_KM2: float = 150.0
+_CLOUD_1GB_RES_20M_MAX_KM2: float = 400.0
 _CLOUD_1GB_RES_30M_MAX_KM2: float = 900.0
+_CLOUD_1GB_MAX_RADIUS_M: int = 15000
 
 
 def is_codespaces() -> bool:
@@ -128,6 +130,7 @@ def get_runtime_environment() -> dict[str, object]:
             "high_ram": True,
             "max_workers": 4,
             "max_area_km2": _RES_30M_MAX_KM2,
+            "max_radius_m": _HIGH_RAM_MAX_RADIUS_M,
             "res_10m_max_km2": _RES_10M_MAX_KM2,
             "res_20m_max_km2": _RES_20M_MAX_KM2,
         }
@@ -137,6 +140,7 @@ def get_runtime_environment() -> dict[str, object]:
             "high_ram": True,
             "max_workers": 4,
             "max_area_km2": _RES_30M_MAX_KM2,
+            "max_radius_m": _HIGH_RAM_MAX_RADIUS_M,
             "res_10m_max_km2": _RES_10M_MAX_KM2,
             "res_20m_max_km2": _RES_20M_MAX_KM2,
         }
@@ -146,6 +150,7 @@ def get_runtime_environment() -> dict[str, object]:
             "high_ram": False,
             "max_workers": 2,
             "max_area_km2": _CLOUD_1GB_RES_30M_MAX_KM2,
+            "max_radius_m": _CLOUD_1GB_MAX_RADIUS_M,
             "res_10m_max_km2": _CLOUD_1GB_RES_10M_MAX_KM2,
             "res_20m_max_km2": _CLOUD_1GB_RES_20M_MAX_KM2,
         }
@@ -154,9 +159,75 @@ def get_runtime_environment() -> dict[str, object]:
         "high_ram": True,
         "max_workers": 4,
         "max_area_km2": _RES_30M_MAX_KM2,
+        "max_radius_m": _HIGH_RAM_MAX_RADIUS_M,
         "res_10m_max_km2": _RES_10M_MAX_KM2,
         "res_20m_max_km2": _RES_20M_MAX_KM2,
     }
+
+
+def get_ram_limits(low_ram_override: bool | None = None) -> dict[str, object]:
+    """Return hard RAM-based AOI limits (``max_area_km2``, ``max_radius_m``, resolution thresholds).
+
+    - Streamlit Community Cloud (1 GB RAM): ``max_area_km2 = 900.0``, ``max_radius_m = 15000``
+      (30 km × 30 km = 900 km² exact square cap).
+    - GitHub Codespaces / HF Spaces / Local (>= 8 GB RAM): ``max_area_km2 = 4000.0``,
+      ``max_radius_m = 31500`` (~3969 km²).
+    """
+    if low_ram_override is True:
+        return {
+            "mode": "streamlit_cloud",
+            "high_ram": False,
+            "max_area_km2": _CLOUD_1GB_RES_30M_MAX_KM2,
+            "max_radius_m": _CLOUD_1GB_MAX_RADIUS_M,
+            "res_10m_max_km2": _CLOUD_1GB_RES_10M_MAX_KM2,
+            "res_20m_max_km2": _CLOUD_1GB_RES_20M_MAX_KM2,
+            "max_workers": 2,
+        }
+    if low_ram_override is False:
+        return {
+            "mode": "high_ram",
+            "high_ram": True,
+            "max_area_km2": _RES_30M_MAX_KM2,
+            "max_radius_m": _HIGH_RAM_MAX_RADIUS_M,
+            "res_10m_max_km2": _RES_10M_MAX_KM2,
+            "res_20m_max_km2": _RES_20M_MAX_KM2,
+            "max_workers": 4,
+        }
+    return dict(get_runtime_environment())
+
+
+def get_safe_processing_resolution(
+    requested_res_m: int | float,
+    area_km2: float,
+    sensor: str | None = None,
+    low_ram_override: bool | None = None,
+) -> tuple[int, bool]:
+    """Return ``(effective_resolution_m, was_adjusted)`` so large valid AOIs never crash 1 GB RAM.
+
+    On 1 GB Streamlit Cloud:
+    - ``area_km2 > 400 km²`` -> minimum ``30 m`` (or ``60 m`` if > 900 km²)
+    - ``area_km2 > 150 km²`` -> minimum ``20 m``
+    - Landsat always minimum ``30 m``.
+    On High-RAM environments (Codespaces / HF / Local), respects the user's chosen resolution.
+    """
+    req = max(10, int(round(float(requested_res_m))))
+    is_landsat = bool(sensor and str(sensor).strip().lower() == "landsat-c2-l2")
+    if is_landsat and req < 30:
+        req = 30
+
+    limits = get_ram_limits(low_ram_override=low_ram_override)
+    if bool(limits["high_ram"]):
+        return req, False
+
+    if area_km2 > float(limits["max_area_km2"]) * 1.02:
+        safe = max(req, 60)
+    elif area_km2 > float(limits["res_20m_max_km2"]):
+        safe = max(req, 30)
+    elif area_km2 > float(limits["res_10m_max_km2"]):
+        safe = max(req, 20)
+    else:
+        safe = req
+    return int(safe), (int(safe) > int(req))
 
 
 def get_parallel_workers() -> int:
@@ -409,12 +480,12 @@ def _recommended_resolution_for_area(
     max_20m = float(env["res_20m_max_km2"])
     max_30m = float(env["max_area_km2"])
     if sensor and str(sensor).strip().lower() == "landsat-c2-l2":
-        return 30 if area_km2 <= max_30m else 60
+        return 30 if area_km2 <= max_30m * 1.02 else 60
     if area_km2 <= max_10m:
         return 10
     if area_km2 <= max_20m:
         return 20
-    if area_km2 <= max_30m:
+    if area_km2 <= max_30m * 1.02:
         return 30
     return 60
 
@@ -460,7 +531,8 @@ def validate_aoi_size(
     geom_metric = shapely_transform(transformer.transform, geom_4326)
     area_km2 = float(geom_metric.area / 1_000_000.0)
 
-    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area)
+    # Allow 2% meridian-convergence envelope tolerance so a 15 km radius (900 km²) square is never blocked
+    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area * 1.02)
     recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
@@ -492,10 +564,69 @@ def validate_aoi_geometry(
     transformer = _get_transformer(CRS_WGS84, metric_crs)
     geom_metric = shapely_transform(transformer.transform, geom_dense)
     area_km2 = float(geom_metric.area / 1_000_000.0)
-    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area)
+    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area * 1.02)
     recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)
+
+
+def clamp_polygon_to_max_area(
+    polygon_geojson_4326: dict[str, object] | BaseGeometry,
+    max_area_km2: float | None = None,
+) -> tuple[dict[str, object], bool, float]:
+    """Scale an oversized EPSG:4326 polygon symmetrically around its metric centroid to fit ``max_area_km2``.
+
+    Returns ``(geojson_dict, was_clamped, new_area_km2)`` so both the polygon and its enclosing
+    WGS84 bbox are guaranteed to stay within RAM limits.
+    """
+    from shapely.affinity import scale as shapely_scale
+
+    geom_4326 = (
+        polygon_geojson_4326
+        if isinstance(polygon_geojson_4326, BaseGeometry)
+        else shape(polygon_geojson_4326)
+    )
+    if not geom_4326.is_valid:
+        geom_4326 = geom_4326.buffer(0)
+    if geom_4326.is_empty:
+        return dict(mapping(geom_4326)), False, 0.0
+
+    eff_max = (
+        float(max_area_km2)
+        if max_area_km2 is not None
+        else float(get_ram_limits()["max_area_km2"])
+    )
+    poly_area, poly_ok, _ = validate_aoi_geometry(geom_4326, max_area_km2=eff_max)
+    min_x, min_y, max_x, max_y = geom_4326.bounds
+    bbox_area, bbox_ok, _ = validate_aoi_size([min_x, min_y, max_x, max_y], max_area_km2=eff_max)
+
+    if poly_ok and bbox_ok:
+        return dict(mapping(geom_4326)), False, poly_area
+
+    # Scale symmetrically in local metric CRS around centroid so enclosing bbox fits 0.96 * eff_max
+    c_lat = 0.5 * (min_y + max_y)
+    c_lon = 0.5 * (min_x + max_x)
+    metric_crs, _ = get_best_metric_crs(c_lat, c_lon, mode="auto")
+    fwd = _get_transformer(CRS_WGS84, metric_crs)
+    inv = _get_transformer(metric_crs, CRS_WGS84)
+
+    geom_m = shapely_transform(fwd.transform, geom_4326)
+    worst_area = max(poly_area, bbox_area, 1e-6)
+    factor = float(np.sqrt((eff_max * 0.95) / worst_area))
+    factor = min(max(factor, 0.05), 0.99)
+
+    clamped_4326 = geom_4326
+    for _ in range(3):
+        scaled_m = shapely_scale(geom_m, xfact=factor, yfact=factor, origin="centroid")
+        clamped_4326 = shapely_transform(inv.transform, scaled_m)
+        b_x0, b_y0, b_x1, b_y1 = clamped_4326.bounds
+        b_area, b_ok, _ = validate_aoi_size([b_x0, b_y0, b_x1, b_y1], max_area_km2=eff_max)
+        if b_ok and b_area <= eff_max * 1.01:
+            break
+        factor *= 0.92
+
+    new_area, _, _ = validate_aoi_geometry(clamped_4326, max_area_km2=eff_max)
+    return dict(mapping(clamped_4326)), True, new_area
 
 
 def clip_to_aoi_polygon(

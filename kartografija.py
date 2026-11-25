@@ -621,9 +621,11 @@ def _build_rgb_rgba_array(
     y_ascending: bool = False,
 ) -> tuple[np.ndarray, list[str]]:
     """Build a north-up RGBA uint8 array (H, W, 4) for 3-band optical or 2-band SAR."""
+    is_sar_fc = False
     if isinstance(raster, xr.Dataset):
         req_bands = list(bands) if bands else list(raster.data_vars)[:3]
         if len(req_bands) == 2 and set(req_bands) == {"VV", "VH"}:
+            is_sar_fc = True
             vv = np.asarray(raster["VV"].values, dtype=np.float32)
             vh = np.asarray(raster["VH"].values, dtype=np.float32)
             ch_arrays = [vv, vh, vv - vh]
@@ -646,6 +648,9 @@ def _build_rgb_rgba_array(
         raise TypeError("RGB mode requires an xarray.Dataset or 3D xarray.DataArray.")
 
     valid = np.isfinite(ch_arrays[0]) & np.isfinite(ch_arrays[1]) & np.isfinite(ch_arrays[2])
+    if not is_sar_fc:
+        valid &= ~((ch_arrays[0] <= 0.0) & (ch_arrays[1] <= 0.0) & (ch_arrays[2] <= 0.0))
+
     h, w = ch_arrays[0].shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     for idx in range(3):
@@ -654,8 +659,9 @@ def _build_rgb_rgba_array(
             if (fixed_ranges is not None and idx < len(fixed_ranges))
             else (0.0, 0.35)
         )
+        ch_valid = np.where(valid, ch_arrays[idx], np.nan)
         ch01 = _stretch_channel_01(
-            ch_arrays[idx],
+            ch_valid,
             use_percentile_stretch=use_percentile_stretch,
             fixed_range=f_rng,
             gamma=gamma,
