@@ -800,6 +800,16 @@ def compile_timelapse_gif(
     return gif_bytes
 
 
+def compile_timelapse_gif_fps(
+    frames_png_bytes: Sequence[bytes],
+    fps: float = 1.5,
+) -> bytes:
+    """Compile cached PNG frame bytes into a looping animated GIF at ``fps`` frames/sec."""
+    safe_fps = max(0.25, min(float(fps), 10.0))
+    duration_ms = int(round(1000.0 / safe_fps))
+    return compile_timelapse_gif(frames_png_bytes, duration_ms=duration_ms)
+
+
 def render_change_swipe_pair(
     da_t1: xr.DataArray,
     da_t2: xr.DataArray,
@@ -1446,6 +1456,255 @@ def render_multi_date_comparison(
         "da_first": da_first,
         "da_last": da_last,
         "diff_da": diff_da,
+    }
+
+
+def build_multidate_visual_frames(
+    item_groups: Sequence[StacItemOrGroup],
+    date_labels: Sequence[str],
+    bbox_4326: Sequence[float],
+    index_name: str = "NDVI",
+    target_epsg: int | str = "EPSG:3794",
+    resolution: float = 20,
+    sensor: str = SENSOR_S2,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    *,
+    max_frames: int = 9,
+    all_candidates: Sequence[StacItemOrGroup] | None = None,
+    candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
+    auto_cloud_fallback: bool = True,
+    min_clear_pct: float = 75.0,
+    max_thumb_width: int = 640,
+    overlay_max_width: int = 1200,
+    default_fps: float = 1.5,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Load an evenly-spaced chronological stack of clear intermediate visual frames (RGB + Index).
+
+    Designed for RAM-safe operation on both 1 GB Streamlit Cloud (``max_frames=9``) and
+    high-RAM environments (``max_frames=14``): streams each epoch ONCE via
+    ``load_clear_scene_with_fallback``, encodes compact Leaflet base64 overlays + date-stamped
+    PNG frames, immediately frees raw xarrays (``gc.collect()``), and pre-compiles both
+    RGB and Index Timelapse GIFs at ``default_fps``.
+    """
+    n_in = min(len(item_groups), len(date_labels))
+    if n_in == 0:
+        return {
+            "frames": [],
+            "timelapse_rgb_gif_bytes": None,
+            "timelapse_index_gif_bytes": None,
+            "da_first": None,
+            "da_last": None,
+            "diff_da": None,
+            "replacements": [],
+        }
+
+    # Sort chronologically oldest -> newest
+    order = sorted(range(n_in), key=lambda i: str(date_labels[i]))
+    sorted_groups = [item_groups[i] for i in order]
+    sorted_dates = [str(date_labels[i]) for i in order]
+
+    # Evenly sample up to max_frames while strictly preserving earliest & latest dates
+    cap = max(2, int(max_frames))
+    if len(sorted_groups) > cap:
+        pick_idx = sorted(set(int(v) for v in np.linspace(0, len(sorted_groups) - 1, cap, dtype=int)))
+        sorted_groups = [sorted_groups[i] for i in pick_idx]
+        sorted_dates = [sorted_dates[i] for i in pick_idx]
+
+    is_sar = sensor == SENSOR_S1
+    idx_key = str(index_name or ("VV" if is_sar else "NDVI")).strip().upper()
+    if is_sar:
+        if idx_key not in SAR_METRICS:
+            idx_key = "VV"
+        req_bands = list(SAR_METRICS[idx_key]["pols"])
+        idx_spec = SAR_METRICS[idx_key]
+    else:
+        if idx_key not in SPECTRAL_INDICES:
+            idx_key = "NDVI"
+        idx_bands = get_required_bands_for_sensor(sensor, idx_key, include_cloud_mask=True)
+        # Merge True Color RGB bands + index bands + cloud mask into ONE single STAC load per epoch
+        req_bands = list(dict.fromkeys(["B04", "B03", "B02", *idx_bands]))
+        idx_spec = SPECTRAL_INDICES[idx_key]
+
+    frames: list[dict[str, Any]] = []
+    replacements: list[dict[str, Any]] = []
+    seen_actual_dates: set[str] = set()
+    target_size: tuple[int, int] | None = None
+    da_first: xr.DataArray | None = None
+    da_last: xr.DataArray | None = None
+
+    total = len(sorted_groups)
+    for idx_i, (grp, d_lbl) in enumerate(zip(sorted_groups, sorted_dates)):
+        if progress_callback is not None:
+            progress_callback(idx_i + 1, total, d_lbl)
+
+        cand_pool: list[StacItemOrGroup] = []
+        if candidates_by_date and str(d_lbl) in candidates_by_date:
+            cand_pool.extend(candidates_by_date[str(d_lbl)])
+        if all_candidates:
+            cand_pool.extend(all_candidates)
+
+        try:
+            ds_ep, act_date, clear_pct, rep_info = load_clear_scene_with_fallback(
+                primary_item=grp,
+                requested_date=str(d_lbl),
+                candidate_items=cand_pool,
+                bbox_4326=bbox_4326,
+                bands=req_bands,
+                target_epsg=target_epsg,
+                resolution=float(resolution),
+                sensor=sensor,
+                aoi_polygon_4326=aoi_polygon_4326,
+                min_clear_pct=float(min_clear_pct),
+                auto_fallback=bool(auto_cloud_fallback and not is_sar),
+            )
+        except Exception as exc:
+            logger.warning("Skipping visual frame %s: %s", d_lbl, exc)
+            continue
+
+        if act_date in seen_actual_dates:
+            del ds_ep
+            gc.collect()
+            continue
+        seen_actual_dates.add(act_date)
+
+        if rep_info is not None:
+            replacements.append(rep_info)
+
+        plat_raw = str(ds_ep.attrs.get("platform") or "")
+        plat_lbl = _format_platform_stamp(plat_raw, sensor)
+        y_coords = np.asarray(ds_ep.coords["y"].values, dtype=np.float64)
+
+        # 1. RGB overlay & date-stamped PNG (for optical sensors)
+        rgb_uri: str | None = None
+        rgb_png: bytes | None = None
+        bounds_4326: list[list[float]] | None = None
+
+        if not is_sar and all(b in ds_ep.data_vars for b in ("B04", "B03", "B02")):
+            try:
+                rgb_uri, bounds_4326 = raster_to_map_overlay_png(
+                    ds_ep,
+                    src_epsg=target_epsg,
+                    is_rgb=True,
+                    bands=["B04", "B03", "B02"],
+                    max_width=overlay_max_width,
+                )
+                rgb_u8 = _stretch_rgb_for_pil(ds_ep, ["B04", "B03", "B02"], y_coords)
+                pil_rgb = Image.fromarray(rgb_u8, mode="RGB")
+                pil_rgb = _resize_pil_frame(pil_rgb, max_width=max_thumb_width, target_size=target_size)
+                if target_size is None:
+                    target_size = pil_rgb.size
+                pil_rgb_stamped = _stamp_banner_on_pil(pil_rgb, f"{act_date} | {plat_lbl} | RGB")
+                rgb_png = pil_to_png_bytes(pil_rgb_stamped)
+                del rgb_u8, pil_rgb, pil_rgb_stamped
+            except Exception as exc:
+                logger.warning("RGB frame render skipped for %s: %s", act_date, exc)
+
+        # 2. Spectral Index / SAR overlay, scalar mean & date-stamped PNG
+        idx_uri: str | None = None
+        idx_png: bytes | None = None
+        idx_mean: float | None = None
+        try:
+            ds_for_idx = apply_cloud_mask(ds_ep, sensor=sensor) if not is_sar else ds_ep
+            da_idx = _compute_layer(ds_for_idx, sensor=sensor, metric_name=idx_key)
+            vals_arr = np.asarray(da_idx.values, dtype=np.float32)
+            fin = vals_arr[np.isfinite(vals_arr)]
+            if fin.size > 0:
+                idx_mean = round(float(np.mean(fin)), 4)
+
+            vmin_v = float(idx_spec["vmin"])
+            vmax_v = float(idx_spec["vmax"])
+            cmap_n = str(idx_spec["cmap"])
+
+            idx_uri, idx_bnds = raster_to_map_overlay_png(
+                da_idx,
+                src_epsg=target_epsg,
+                is_rgb=False,
+                cmap_name=cmap_n,
+                vmin=vmin_v,
+                vmax=vmax_v,
+                max_width=overlay_max_width,
+            )
+            if bounds_4326 is None:
+                bounds_4326 = idx_bnds
+
+            mean_tag = f" | {idx_key}={idx_mean:.2f}" if idx_mean is not None else f" | {idx_key}"
+            pil_idx = render_dataarray_to_pil(
+                da_idx,
+                cmap_name=cmap_n,
+                vmin=vmin_v,
+                vmax=vmax_v,
+                stamp_text=f"{act_date} | {plat_lbl}{mean_tag}",
+                max_width=max_thumb_width,
+                target_size=target_size,
+            )
+            if target_size is None:
+                target_size = pil_idx.size
+            idx_png = pil_to_png_bytes(pil_idx)
+            del pil_idx
+
+            if da_first is None:
+                da_first = da_idx
+            da_last = da_idx
+        except Exception as exc:
+            logger.warning("Index frame render skipped for %s: %s", act_date, exc)
+
+        del ds_ep
+        gc.collect()
+
+        if rgb_uri or idx_uri:
+            frames.append(
+                {
+                    "date": act_date,
+                    "requested_date": str(d_lbl),
+                    "sensor": sensor,
+                    "platform": plat_lbl,
+                    "clear_pct": round(float(clear_pct), 1),
+                    "index_name": idx_key,
+                    "index_mean": idx_mean,
+                    "bounds_4326": bounds_4326,
+                    "rgb_overlay_uri": rgb_uri,
+                    "index_overlay_uri": idx_uri,
+                    "rgb_png_bytes": rgb_png,
+                    "index_png_bytes": idx_png,
+                }
+            )
+
+    # Pixel-aligned Δ between earliest and latest clear frames
+    diff_da: xr.DataArray | None = None
+    if da_first is not None and da_last is not None and len(frames) >= 2:
+        try:
+            da_l_aligned = da_last
+            if not _grids_match(da_first, da_l_aligned):
+                da_l_aligned = da_l_aligned.rio.reproject_match(da_first, resampling=Resampling.bilinear)
+            diff_vals = (da_l_aligned.values - da_first.values).astype(np.float32)
+            diff_da = xr.DataArray(
+                diff_vals,
+                dims=da_first.dims,
+                coords=da_first.coords,
+                name=f"Delta_{idx_key}",
+            )
+            if da_first.rio.crs is not None:
+                diff_da = diff_da.rio.write_crs(da_first.rio.crs, inplace=False)
+            diff_da = diff_da.rio.write_nodata(np.nan, inplace=False)
+        except Exception:
+            diff_da = None
+
+    # Pre-compile default RGB and Index Timelapse GIFs at default_fps
+    rgb_png_list = [f["rgb_png_bytes"] for f in frames if f.get("rgb_png_bytes")]
+    idx_png_list = [f["index_png_bytes"] for f in frames if f.get("index_png_bytes")]
+    gif_rgb = compile_timelapse_gif_fps(rgb_png_list, fps=default_fps) if len(rgb_png_list) >= 2 else None
+    gif_idx = compile_timelapse_gif_fps(idx_png_list, fps=default_fps) if len(idx_png_list) >= 2 else None
+
+    gc.collect()
+    return {
+        "frames": frames,
+        "timelapse_rgb_gif_bytes": gif_rgb,
+        "timelapse_index_gif_bytes": gif_idx,
+        "da_first": da_first,
+        "da_last": da_last,
+        "diff_da": diff_da,
+        "replacements": replacements,
     }
 
 

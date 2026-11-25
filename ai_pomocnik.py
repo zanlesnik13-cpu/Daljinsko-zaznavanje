@@ -39,6 +39,7 @@ from analize import (
     get_required_bands_for_sensor,
 )
 from casovne_vrste import (
+    build_multidate_visual_frames,
     compute_change_summary,
     compute_cloud_free_composite,
     extract_time_series,
@@ -49,7 +50,10 @@ from geodezija_crs import (
     bbox_from_point_wgs84,
     export_to_geotiff_bytes,
     get_auto_utm_epsg,
+    get_ram_limits,
+    get_safe_processing_resolution,
     is_in_slovenia,
+    is_low_ram_cloud,
 )
 from gnss_plan import run_gnss_mission_plan
 from kartografija import DEFAULT_LAYOUT_CONFIG, LAYOUT_PRESETS, merge_layout_config
@@ -324,6 +328,44 @@ INTERVAL_LABEL_TO_KEY: dict[str, str] = {
     "Letno": INTERVAL_YEARLY,
 }
 VALID_INTERVAL_LABELS: tuple[str, ...] = tuple(INTERVAL_LABEL_TO_KEY.keys())
+
+
+def choose_adaptive_interval(
+    start_date: date | datetime | str,
+    end_date: date | datetime | str,
+    user_requested_interval: str | None = None,
+) -> str:
+    """Choose an optimal temporal sampling interval based on date span unless explicitly requested.
+
+    Rules:
+    - If ``user_requested_interval`` is a valid interval label, return it directly.
+    - ``span_days > 730`` (> 2 years, e.g. 2018–2026) -> ``"Letno"`` (1 clear scene/year, same season)
+    - ``365 < span_days <= 730`` (1–2 years) -> ``"Sezonsko (3 mes.)"``
+    - ``60 < span_days <= 365`` (2–12 months) -> ``"Mesečno"``
+    - ``span_days <= 60`` (<= 2 months) -> ``"Vsakih 14 dni"``
+    """
+    if user_requested_interval:
+        clean_req = str(user_requested_interval).strip()
+        if clean_req in INTERVAL_LABEL_TO_KEY:
+            return clean_req
+
+    def _to_d(v: date | datetime | str) -> date:
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        return date.fromisoformat(str(v).strip()[:10])
+
+    s_d = _to_d(start_date)
+    e_d = _to_d(end_date)
+    span_days = abs((e_d - s_d).days)
+    if span_days > 730:
+        return "Letno"
+    if span_days > 365:
+        return "Sezonsko (3 mes.)"
+    if span_days > 60:
+        return "Mesečno"
+    return "Vsakih 14 dni"
 
 AI_EXAMPLE_PROMPTS: tuple[dict[str, str], ...] = (
     {
@@ -1892,10 +1934,21 @@ def execute_ai_plan(
         _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
         return base_out
 
-    # --- F. Multi-Temporal Time Series (+ Visual Before/After Swipe Comparison t1 ↔ t2) ---
+    # --- F. Multi-Temporal Time Series (+ Multi-Date Intermediate Frames, Swipe Map & Timelapse GIF) ---
     if task in ("time_series", "time_series_and_comparison"):
-        _prog(0.16, "Iščem satelitski arhiv za časovno vrsto..." if lang == "sl" else "Searching satellite archive for time series...")
-        interval_key = INTERVAL_LABEL_TO_KEY.get(plan["interval"], INTERVAL_YEARLY)
+        adaptive_interval = choose_adaptive_interval(
+            plan["start_date"],
+            plan["end_date"],
+            user_requested_interval=(plan.get("interval") if plan.get("interval_explicit") else None),
+        )
+        base_out["plan"]["interval"] = adaptive_interval
+        _prog(
+            0.14,
+            f"Iščem satelitski arhiv ({adaptive_interval})..."
+            if lang == "sl"
+            else f"Searching satellite archive ({adaptive_interval})...",
+        )
+        interval_key = INTERVAL_LABEL_TO_KEY.get(adaptive_interval, INTERVAL_YEARLY)
         max_cc = 100.0 if sensor == SENSOR_S1 else 25.0
         items, df = search_scenes(
             sensor=sensor,
@@ -1932,15 +1985,15 @@ def execute_ai_plan(
             items = [items[i] for i in pick_idx]
             df = df.iloc[pick_idx].reset_index(drop=True)
 
-        want_comparison = bool(
+        want_visuals = bool(
             task == "time_series_and_comparison"
             or plan.get("include_comparison")
             or len(items) >= 2
         )
-        ts_prog_span = 0.48 if want_comparison else 0.70
+        ts_prog_span = 0.36 if want_visuals else 0.72
 
         def _ts_cb(cur: int, total: int, d_str: str) -> None:
-            _prog(0.22 + ts_prog_span * (cur / max(total, 1)), f"{d_str} ({cur}/{total})")
+            _prog(0.18 + ts_prog_span * (cur / max(total, 1)), f"{d_str} ({cur}/{total})")
 
         eff_ts_res = max(res_m, 30 if sensor == SENSOR_LANDSAT else 10)
         ts_df = extract_time_series(
@@ -1964,15 +2017,19 @@ def execute_ai_plan(
         csv_bytes = ts_df.to_csv(index=False).encode("utf-8")
         csv_fname = f"AI_TimeSeries_{plan['index_name']}_{plan['place_name']}_{plan['start_date']}_{plan['end_date']}.csv"
 
-        # Step B: Load earliest (t1) and latest (t2) clear satellite scenes for Zoomable Swipe Comparison!
+        # Step B: Build RAM-safe chronological multi-date frame stack (RGB + Index) & Timelapse GIFs!
+        frames: list[dict[str, Any]] = []
+        gif_rgb_bytes: bytes | None = None
+        gif_idx_bytes: bytes | None = None
         comp_rgb: dict[str, Any] | None = None
         comp_idx: dict[str, Any] | None = None
         ch_summary: dict[str, Any] = {}
         diff_da = None
+        da_last = None
         tif_bytes: bytes | None = None
         tif_fname: str | None = None
 
-        if want_comparison and len(ts_df) >= 2:
+        if want_visuals and len(ts_df) >= 2:
             try:
                 raw_by_date = df.attrs.get("raw_items_by_date") or {}
                 date_to_group: dict[str, Any] = {}
@@ -1983,86 +2040,112 @@ def execute_ai_plan(
                         date_to_group.setdefault(str(dk), dv)
 
                 ts_dates_sorted = [str(d) for d in ts_df["date_str"].tolist()]
-                d_first, d_last = ts_dates_sorted[0], ts_dates_sorted[-1]
-                g_first = date_to_group.get(d_first) or items[-1]
-                g_last = date_to_group.get(d_last) or items[0]
+                matched_groups: list[Any] = []
+                matched_dates: list[str] = []
+                for d_str in ts_dates_sorted:
+                    grp = date_to_group.get(d_str)
+                    if grp is not None:
+                        matched_groups.append(grp)
+                        matched_dates.append(d_str)
+                if len(matched_groups) < 2:
+                    matched_groups = list(items)
+                    matched_dates = [str(df.iloc[i]["date_str"]) for i in range(min(len(items), len(df)))]
+
                 all_cands = list(raw_by_date.values()) if isinstance(raw_by_date, dict) and raw_by_date else list(items)
                 layer_m = str(plan["index_name"])
-                comp_res_m = float(max(res_m, 30 if sensor == SENSOR_LANDSAT else 10))
+                low_ram = is_low_ram_cloud()
+                max_vis_frames = 9 if low_ram else 14
+                area_est_km2 = ((2.0 * float(plan["radius_m"])) ** 2) / 1e6
+                safe_res, _ = get_safe_processing_resolution(res_m, area_est_km2, sensor=sensor)
+                vis_res_m = float(max(safe_res, 20 if low_ram else res_m, 30 if sensor == SENSOR_LANDSAT else 10))
 
-                if sensor != SENSOR_S1:
+                def _vis_cb(cur: int, total: int, d_str: str) -> None:
                     _prog(
-                        0.74,
-                        f"Pripravljam vizualno RGB primerjavo {d_first} ↔ {d_last}..."
+                        0.56 + 0.36 * (cur / max(total, 1)),
+                        f"Nalagam vmesni posnetek {d_str} ({cur}/{total})..."
                         if lang == "sl"
-                        else f"Building True Color RGB swipe comparison {d_first} ↔ {d_last}...",
-                    )
-                    comp_rgb = render_multi_date_comparison(
-                        item_groups=[g_first, g_last],
-                        date_labels=[d_first, d_last],
-                        bbox_4326=bbox_4326,
-                        layer_mode="RGB",
-                        target_epsg=target_epsg,
-                        resolution=comp_res_m,
-                        sensor=sensor,
-                        mask_clouds=False,
-                        all_candidates=all_cands,
-                        candidates_by_date=df.attrs.get("candidates_by_bucket"),
-                        auto_cloud_fallback=True,
-                        min_clear_pct=75.0,
+                        else f"Loading intermediate scene {d_str} ({cur}/{total})...",
                     )
 
-                _prog(
-                    0.86,
-                    f"Pripravljam primerjavo indeksa {layer_m} ({d_first} ↔ {d_last})..."
-                    if lang == "sl"
-                    else f"Building {layer_m} index comparison ({d_first} ↔ {d_last})...",
-                )
-                comp_idx = render_multi_date_comparison(
-                    item_groups=[g_first, g_last],
-                    date_labels=[d_first, d_last],
+                mf_out = build_multidate_visual_frames(
+                    item_groups=matched_groups,
+                    date_labels=matched_dates,
                     bbox_4326=bbox_4326,
-                    layer_mode=layer_m,
+                    index_name=layer_m,
                     target_epsg=target_epsg,
-                    resolution=comp_res_m,
+                    resolution=vis_res_m,
                     sensor=sensor,
-                    mask_clouds=(sensor != SENSOR_S1),
+                    max_frames=max_vis_frames,
                     all_candidates=all_cands,
                     candidates_by_date=df.attrs.get("candidates_by_bucket"),
                     auto_cloud_fallback=(sensor != SENSOR_S1),
                     min_clear_pct=75.0,
+                    max_thumb_width=640 if low_ram else 760,
+                    overlay_max_width=1100 if low_ram else 1500,
+                    default_fps=1.5,
+                    progress_callback=_vis_cb,
                 )
-                diff_da = comp_idx.get("diff_da") if isinstance(comp_idx, dict) else None
+                frames = list(mf_out.get("frames") or [])
+                gif_rgb_bytes = mf_out.get("timelapse_rgb_gif_bytes")
+                gif_idx_bytes = mf_out.get("timelapse_index_gif_bytes")
+                diff_da = mf_out.get("diff_da")
+                da_last = mf_out.get("da_last")
+                mf_reps = list(mf_out.get("replacements") or [])
+
+                if len(frames) >= 2:
+                    f0, f_last = frames[0], frames[-1]
+                    if f0.get("rgb_overlay_uri") and f_last.get("rgb_overlay_uri"):
+                        comp_rgb = {
+                            "dates": [f0["date"], f_last["date"]],
+                            "overlay_uris": [f0["rgb_overlay_uri"], f_last["rgb_overlay_uri"]],
+                            "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
+                            "replacements": mf_reps,
+                        }
+                    if f0.get("index_overlay_uri") and f_last.get("index_overlay_uri"):
+                        comp_idx = {
+                            "dates": [f0["date"], f_last["date"]],
+                            "overlay_uris": [f0["index_overlay_uri"], f_last["index_overlay_uri"]],
+                            "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
+                            "replacements": mf_reps,
+                            "diff_da": diff_da,
+                        }
+
                 if diff_da is not None:
                     ch_summary = compute_change_summary(
                         diff_da,
-                        resolution_m=comp_res_m,
+                        resolution_m=vis_res_m,
                         threshold=2.0 if sensor == SENSOR_S1 else (2.0 if layer_m == "LST" else 0.15),
                     )
                     tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
-                    r_dates = comp_idx.get("dates") or [d_first, d_last]
-                    tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_dates[0]}_to_{r_dates[-1]}_EPSG{epsg_num}.tif"
+                    r_d0 = frames[0]["date"] if frames else ts_dates_sorted[0]
+                    r_d1 = frames[-1]["date"] if frames else ts_dates_sorted[-1]
+                    tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_d0}_to_{r_d1}_EPSG{epsg_num}.tif"
             except Exception:
-                # Never fail the entire time series if optional visual swipe comparison encounters an edge error
+                # Never fail the entire time series if optional visual multi-frame stack encounters an edge error
                 pass
 
         result_kind = (
             "time_series_and_comparison"
-            if (comp_rgb is not None or comp_idx is not None)
+            if (len(frames) >= 2 or comp_rgb is not None or comp_idx is not None)
             else "time_series"
         )
         gc.collect()
         base_out.update(
             {
                 "kind": result_kind,
+                "adaptive_interval": adaptive_interval,
                 "ts_df": ts_df,
                 "csv_bytes": csv_bytes,
                 "csv_filename": csv_fname,
+                "frames": frames,
+                "timelapse_rgb_gif_bytes": gif_rgb_bytes,
+                "timelapse_index_gif_bytes": gif_idx_bytes,
                 "comparison_rgb": comp_rgb,
                 "comparison_index": comp_idx,
                 "comparison_result": comp_idx or comp_rgb,
                 "change_summary": ch_summary,
-                "index_da": diff_da,
+                "da_last": da_last,
+                "index_da": diff_da if diff_da is not None else da_last,
                 "tif_bytes": tif_bytes,
                 "tif_filename": tif_fname,
             }

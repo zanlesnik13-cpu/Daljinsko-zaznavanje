@@ -57,6 +57,8 @@ def sanitize_json_payload(obj: Any, *, depth: int = 0) -> Any:
     if isinstance(obj, (bytes, bytearray, memoryview)):
         return None
     if isinstance(obj, str):
+        if obj.startswith("data:image/"):
+            return None
         return obj if len(obj) <= _MAX_STRING_LEN else obj[:_MAX_STRING_LEN] + "…"
     # Handle NumPy scalars gracefully without hard-requiring numpy import
     if hasattr(obj, "item") and callable(obj.item) and not isinstance(obj, (dict, list, tuple)):
@@ -68,10 +70,23 @@ def sanitize_json_payload(obj: Any, *, depth: int = 0) -> Any:
         out: dict[str, Any] = {}
         for k, v in obj.items():
             ks = str(k)
-            # Skip known binary/raster keys
+            # Skip known binary/raster/frame/GIF keys
             if any(
                 tok in ks.lower()
-                for tok in ("bytes", "png", "pdf", "tif", "raster", "dataset", "dataarray", "overlay_b64")
+                for tok in (
+                    "bytes",
+                    "png",
+                    "pdf",
+                    "tif",
+                    "gif",
+                    "timelapse",
+                    "frames",
+                    "raster",
+                    "dataset",
+                    "dataarray",
+                    "overlay_b64",
+                    "overlay_uri",
+                )
             ):
                 continue
             sv = sanitize_json_payload(v, depth=depth + 1)

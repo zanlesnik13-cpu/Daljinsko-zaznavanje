@@ -135,6 +135,7 @@ from analize import (
 )
 from casovne_vrste import (
     compile_timelapse_gif,
+    compile_timelapse_gif_fps,
     compute_change_detection,
     compute_change_summary,
     compute_cloud_free_composite,
@@ -7157,10 +7158,12 @@ def _render_ai_chat_analysis_fragment(
     elif ai_kind_show in ("time_series", "time_series_and_comparison"):
         ts_ai: pd.DataFrame = ai_res_show["ts_df"]
         idx_lbl_ts = str(pl.get("index_name", "NDVI"))
+        frames_list: list[dict[str, Any]] = list(ai_res_show.get("frames") or [])
         comp_rgb = ai_res_show.get("comparison_rgb")
         comp_idx = ai_res_show.get("comparison_index")
         cs_ts = ai_res_show.get("change_summary") or {}
-        has_swipe = (
+        has_multiframe = len(frames_list) >= 2
+        has_legacy_swipe = (
             (isinstance(comp_rgb, dict) and len(comp_rgb.get("overlay_uris") or []) >= 2)
             or (isinstance(comp_idx, dict) and len(comp_idx.get("overlay_uris") or []) >= 2)
         )
@@ -7194,7 +7197,7 @@ def _render_ai_chat_analysis_fragment(
         )
         m5.metric(t("ai_plan_crs"), ai_crs_show)
 
-        def _draw_ts_plotly() -> None:
+        def _draw_ts_plotly_and_table() -> None:
             fig_ai_ts = go.Figure()
             fig_ai_ts.add_trace(
                 go.Scatter(
@@ -7228,69 +7231,299 @@ def _render_ai_chat_analysis_fragment(
                 ),
                 xaxis_title=t("col_date"),
                 yaxis_title=idx_lbl_ts,
-                height=410,
+                height=390,
                 plot_bgcolor="#FFFFFF",
                 paper_bgcolor="#FFFFFF",
                 font=dict(color="#0F172A"),
             )
             st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
+            tbl_cols = [c for c in ("date_str", "platform", "mean", "median", "std", "valid_pct") if c in ts_ai.columns]
+            if tbl_cols:
+                st.dataframe(ts_ai[tbl_cols], width="stretch", hide_index=True, height=min(240, 42 + 35 * len(ts_ai)))
+            if ai_res_show.get("csv_bytes"):
+                st.download_button(
+                    label=t("ai_mf_dl_csv", lang=lang),
+                    data=ai_res_show["csv_bytes"],
+                    file_name=ai_res_show["csv_filename"],
+                    mime="text/csv",
+                    width="stretch",
+                    key=f"ai_chat_dl_csv_tab_{result_id}",
+                )
 
-        if has_swipe:
-            tab_lbl_swipe = (
-                "🔄 Vizualna primerjava Prej / Potem (t1 ↔ t2)"
-                if lang == "sl"
-                else "🔄 Visual Before / After Comparison (t1 ↔ t2)"
+        if has_multiframe:
+            t_sw, t_tl, t_strip, t_ts = st.tabs(
+                [
+                    t("ai_mf_tab_swipe", lang=lang),
+                    t("ai_mf_tab_timelapse", lang=lang),
+                    t("ai_mf_tab_strip", lang=lang),
+                    t("ai_mf_tab_ts", lang=lang),
+                ]
             )
-            tab_lbl_ts = (
-                "📈 Časovna vrsta (Graf trenda)"
-                if lang == "sl"
-                else "📈 Time Series (Trend Chart)"
-            )
-            t_sw, t_ts = st.tabs([tab_lbl_swipe, tab_lbl_ts])
 
+            frame_dates = [str(f["date"]) for f in frames_list]
+            n_fr = len(frames_list)
+            has_rgb_frames = any(bool(f.get("rgb_overlay_uri")) for f in frames_list)
+            has_idx_frames = any(bool(f.get("index_overlay_uri")) for f in frames_list)
+
+            # --- TAB 1: Compare Any Two Dates (t1 ↔ t2) ---
             with t_sw:
-                avail_modes: list[str] = []
-                if isinstance(comp_rgb, dict) and len(comp_rgb.get("overlay_uris") or []) >= 2:
-                    avail_modes.append("rgb")
-                if isinstance(comp_idx, dict) and len(comp_idx.get("overlay_uris") or []) >= 2:
-                    avail_modes.append("index")
+                dc1, dc2 = st.columns(2, gap="small")
+                with dc1:
+                    idx_left = st.selectbox(
+                        t("ai_mf_date_left", lang=lang),
+                        options=list(range(n_fr)),
+                        index=0,
+                        format_func=lambda i: (
+                            f"{frames_list[i]['date']} ({idx_lbl_ts}={frames_list[i]['index_mean']:.2f})"
+                            if frames_list[i].get("index_mean") is not None
+                            else str(frames_list[i]["date"])
+                        ),
+                        key=f"ai_mf_left_idx_{result_id}",
+                    )
+                with dc2:
+                    idx_right = st.selectbox(
+                        t("ai_mf_date_right", lang=lang),
+                        options=list(range(n_fr)),
+                        index=n_fr - 1,
+                        format_func=lambda i: (
+                            f"{frames_list[i]['date']} ({idx_lbl_ts}={frames_list[i]['index_mean']:.2f})"
+                            if frames_list[i].get("index_mean") is not None
+                            else str(frames_list[i]["date"])
+                        ),
+                        key=f"ai_mf_right_idx_{result_id}",
+                    )
 
-                mode_labels = {
-                    "rgb": "🛰️ Resnične barve (RGB)" if lang == "sl" else "🛰️ True Color (RGB)",
-                    "index": f"📊 Indeks ({idx_lbl_ts})" if lang == "sl" else f"📊 Index ({idx_lbl_ts})",
+                avail_sw_modes: list[str] = []
+                if has_rgb_frames:
+                    avail_sw_modes.append("rgb")
+                if has_idx_frames:
+                    avail_sw_modes.append("index")
+
+                mode_lbls = {
+                    "rgb": t("ai_mf_layer_rgb", lang=lang),
+                    "index": t("ai_mf_layer_idx", lang=lang, idx=idx_lbl_ts),
                 }
-                if len(avail_modes) > 1:
-                    sw_mode = _touch_selector(
-                        "Sloj primerjave" if lang == "sl" else "Comparison Layer",
-                        options=avail_modes,
-                        default=avail_modes[0],
-                        format_func=lambda m: mode_labels[m],
-                        key=f"ai_chat_ts_sw_mode_{result_id}",
+                ctrl_c1, ctrl_c2 = st.columns([1.25, 1.0], gap="small")
+                with ctrl_c1:
+                    if len(avail_sw_modes) > 1:
+                        sw_mode = _touch_selector(
+                            t("ai_mf_layer_label", lang=lang),
+                            options=avail_sw_modes,
+                            default=avail_sw_modes[0],
+                            format_func=lambda m: mode_lbls[m],
+                            key=f"ai_chat_ts_sw_mode_{result_id}",
+                            use_pills=True,
+                        )
+                    else:
+                        sw_mode = avail_sw_modes[0]
+                with ctrl_c2:
+                    ai_op_ts_sw = st.slider(
+                        t("opacity_layer_label"),
+                        0,
+                        100,
+                        95,
+                        5,
+                        key=f"ai_chat_ts_sw_op_{result_id}",
+                    )
+
+                fr_l = frames_list[int(idx_left)]
+                fr_r = frames_list[int(idx_right)]
+                uri_key = "rgb_overlay_uri" if sw_mode == "rgb" else "index_overlay_uri"
+                uri_l = fr_l.get(uri_key) or fr_l.get("index_overlay_uri") or fr_l.get("rgb_overlay_uri")
+                uri_r = fr_r.get(uri_key) or fr_r.get("index_overlay_uri") or fr_r.get("rgb_overlay_uri")
+                bnds_l = fr_l.get("bounds_4326")
+                bnds_r = fr_r.get("bounds_4326")
+                sw_tag = "RGB" if sw_mode == "rgb" else idx_lbl_ts
+
+                if uri_l and uri_r and bnds_l and bnds_r:
+                    swipe_html = build_zoomable_swipe_map(
+                        overlay_uri_t1=uri_l,
+                        bounds_t1=bnds_l,
+                        overlay_uri_t2=uri_r,
+                        bounds_t2=bnds_r,
+                        label_t1=f"t1: {fr_l['date']} ({sw_tag})",
+                        label_t2=f"t2: {fr_r['date']} ({sw_tag})",
+                        center_lat=float(ai_res_show["lat"]),
+                        center_lon=float(ai_res_show["lon"]),
+                        basemap_mode=basemap_now,
+                        aoi_bbox_4326=ai_res_show.get("bbox_4326"),
+                        aoi_bbox_3794=ai_res_show.get("bbox_3794"),
+                        aoi_outline_label=t("slippy_aoi_outline"),
+                        height=520,
+                        opacity=float(ai_op_ts_sw) / 100.0,
+                        lang=lang,
+                    )
+                    components.html(swipe_html, height=540, scrolling=False)
+                    st.caption(t("swipe_zoom_hint"))
+
+                # Compact 1-line comparison metric bar + Send t2 to Map Composer
+                try:
+                    d_span_days = abs(
+                        (date.fromisoformat(fr_r["date"][:10]) - date.fromisoformat(fr_l["date"][:10])).days
+                    )
+                    span_txt = (
+                        f"{d_span_days / 365.25:.1f} {'let' if lang == 'sl' else 'yr'} ({d_span_days} {'dni' if lang == 'sl' else 'days'})"
+                        if d_span_days >= 365
+                        else f"{d_span_days} {'dni' if lang == 'sl' else 'days'}"
+                    )
+                except Exception:
+                    span_txt = "—"
+
+                delta_pair_txt = "—"
+                if fr_l.get("index_mean") is not None and fr_r.get("index_mean") is not None:
+                    delta_pair_txt = f"{float(fr_r['index_mean']) - float(fr_l['index_mean']):+.3f}"
+
+                bar_c1, bar_c2 = st.columns([2.2, 1.1], vertical_alignment="center")
+                with bar_c1:
+                    st.markdown(
+                        f"**Δ {idx_lbl_ts} (t2 − t1):** `{delta_pair_txt}` · "
+                        f"**{'Razmik' if lang == 'sl' else 'Span'}:** `{span_txt}` · "
+                        f"`{fr_l['date']}` ↔ `{fr_r['date']}`"
+                    )
+                with bar_c2:
+                    if st.button(
+                        t("ai_mf_send_t2_carto", lang=lang),
+                        type="primary",
+                        width="stretch",
+                        key=f"ai_mf_send_t2_{result_id}",
+                    ):
+                        st.session_state["tab6_ai_result"] = ai_res_show
+                        st.session_state["tab4_pending_source_select"] = "tab6_ai"
+                        st.session_state["tab6_sent_to_carto"] = True
+                        st.session_state["pending_workspace"] = "ws_geo"
+                        st.rerun(scope="app")
+
+            # --- TAB 2: Visual Timelapse (Animated GIF directly in Chat) ---
+            with t_tl:
+                rgb_pngs_all = [f["rgb_png_bytes"] for f in frames_list if f.get("rgb_png_bytes")]
+                idx_pngs_all = [f["index_png_bytes"] for f in frames_list if f.get("index_png_bytes")]
+                tl_modes: list[str] = []
+                if len(rgb_pngs_all) >= 2:
+                    tl_modes.append("rgb")
+                if len(idx_pngs_all) >= 2:
+                    tl_modes.append("index")
+
+                if tl_modes:
+                    tl_c1, tl_c2 = st.columns([1.0, 1.3], gap="small")
+                    with tl_c1:
+                        if len(tl_modes) > 1:
+                            tl_mode = _touch_selector(
+                                t("ai_mf_layer_label", lang=lang),
+                                options=tl_modes,
+                                default=tl_modes[0],
+                                format_func=lambda m: (
+                                    t("ai_mf_tl_rgb", lang=lang) if m == "rgb" else t("ai_mf_tl_idx", lang=lang)
+                                ),
+                                key=f"ai_mf_tl_mode_{result_id}",
+                                use_pills=True,
+                            )
+                        else:
+                            tl_mode = tl_modes[0]
+                    with tl_c2:
+                        fps_opts = [1.0, 1.5, 2.5]
+                        fps_lbls = {
+                            1.0: t("ai_mf_fps_slow", lang=lang),
+                            1.5: t("ai_mf_fps_norm", lang=lang),
+                            2.5: t("ai_mf_fps_fast", lang=lang),
+                        }
+                        sel_fps = _touch_selector(
+                            t("ai_mf_fps_label", lang=lang),
+                            options=fps_opts,
+                            default=1.5,
+                            format_func=lambda v: fps_lbls[v],
+                            key=f"ai_mf_tl_fps_{result_id}",
+                            use_pills=True,
+                        )
+
+                    gif_cache = ai_res_show.setdefault("_gif_cache", {})
+                    if abs(float(sel_fps) - 1.5) < 1e-3:
+                        if tl_mode == "rgb" and ai_res_show.get("timelapse_rgb_gif_bytes"):
+                            gif_cache[("rgb", 1.5)] = ai_res_show["timelapse_rgb_gif_bytes"]
+                        elif tl_mode == "index" and ai_res_show.get("timelapse_index_gif_bytes"):
+                            gif_cache[("index", 1.5)] = ai_res_show["timelapse_index_gif_bytes"]
+
+                    cache_k = (tl_mode, float(sel_fps))
+                    gif_bytes_show = gif_cache.get(cache_k)
+                    if gif_bytes_show is None:
+                        src_pngs = rgb_pngs_all if tl_mode == "rgb" else idx_pngs_all
+                        gif_bytes_show = compile_timelapse_gif_fps(src_pngs, fps=float(sel_fps))
+                        gif_cache[cache_k] = gif_bytes_show
+
+                    if gif_bytes_show:
+                        st.image(gif_bytes_show, width="stretch")
+                        gif_tag = "RGB" if tl_mode == "rgb" else idx_lbl_ts
+                        gif_fname = f"Timelapse_{gif_tag}_{pl['place_name']}_{frame_dates[0]}_to_{frame_dates[-1]}.gif"
+                        st.download_button(
+                            label=t("ai_mf_dl_gif", lang=lang),
+                            data=gif_bytes_show,
+                            file_name=gif_fname,
+                            mime="image/gif",
+                            width="stretch",
+                            key=f"ai_mf_dl_gif_{result_id}_{tl_mode}_{sel_fps}",
+                        )
+
+            # --- TAB 3: All Intermediate Scenes (Visual Strip Grid) ---
+            with t_strip:
+                st.caption(t("ai_mf_strip_caption", lang=lang, n=n_fr))
+                strip_modes = []
+                if any(f.get("rgb_png_bytes") for f in frames_list):
+                    strip_modes.append("rgb")
+                if any(f.get("index_png_bytes") for f in frames_list):
+                    strip_modes.append("index")
+                if len(strip_modes) > 1:
+                    st_mode = _touch_selector(
+                        t("ai_mf_layer_label", lang=lang),
+                        options=strip_modes,
+                        default=strip_modes[0],
+                        format_func=lambda m: (
+                            t("ai_mf_layer_rgb", lang=lang)
+                            if m == "rgb"
+                            else t("ai_mf_layer_idx", lang=lang, idx=idx_lbl_ts)
+                        ),
+                        key=f"ai_mf_strip_mode_{result_id}",
                         use_pills=True,
                     )
                 else:
-                    sw_mode = avail_modes[0]
+                    st_mode = strip_modes[0] if strip_modes else "rgb"
 
-                active_comp = comp_rgb if (sw_mode == "rgb" and comp_rgb is not None) else comp_idx
+                png_field = "rgb_png_bytes" if st_mode == "rgb" else "index_png_bytes"
+                for row_start in range(0, n_fr, 3):
+                    row_frames = frames_list[row_start : row_start + 3]
+                    g_cols = st.columns(3, gap="small")
+                    for gc_i, fr_item in enumerate(row_frames):
+                        with g_cols[gc_i]:
+                            raw_img = fr_item.get(png_field) or fr_item.get("rgb_png_bytes") or fr_item.get("index_png_bytes")
+                            if raw_img:
+                                cap_mean = (
+                                    f" · {idx_lbl_ts}: {fr_item['index_mean']:.3f}"
+                                    if fr_item.get("index_mean") is not None
+                                    else ""
+                                )
+                                st.image(
+                                    raw_img,
+                                    caption=f"{fr_item['date']}{cap_mean}",
+                                    width="stretch",
+                                )
+
+            # --- TAB 4: Time Series (Chart, Table & CSV) ---
+            with t_ts:
+                _draw_ts_plotly_and_table()
+
+        elif has_legacy_swipe:
+            t_sw, t_ts = st.tabs(
+                [
+                    t("ai_mf_tab_swipe", lang=lang),
+                    t("ai_mf_tab_ts", lang=lang),
+                ]
+            )
+            with t_sw:
+                active_comp = comp_rgb if comp_rgb is not None else comp_idx
                 c_dates = (active_comp or {}).get("dates") or [
                     str(ts_ai["date_str"].iloc[0]),
                     str(ts_ai["date_str"].iloc[-1]),
                 ]
                 c_uris = (active_comp or {}).get("overlay_uris") or []
                 c_bnds = (active_comp or {}).get("overlay_bounds") or []
-                sw_tag = "RGB" if sw_mode == "rgb" else idx_lbl_ts
-
-                for rep in (active_comp or {}).get("replacements") or []:
-                    st.info(
-                        t(
-                            "comp3_replaced_badge",
-                            req=rep.get("requested_date", ""),
-                            orig_pct=float(rep.get("original_clear_pct", 0.0)),
-                            act=rep.get("actual_date", ""),
-                            act_pct=float(rep.get("actual_clear_pct", 0.0)),
-                        )
-                    )
-
                 ai_op_ts_sw = st.slider(
                     t("opacity_layer_label"),
                     0,
@@ -7305,8 +7538,8 @@ def _render_ai_chat_analysis_fragment(
                         bounds_t1=c_bnds[0],
                         overlay_uri_t2=c_uris[-1],
                         bounds_t2=c_bnds[-1],
-                        label_t1=f"t1: {c_dates[0]} ({sw_tag})",
-                        label_t2=f"t2: {c_dates[-1]} ({sw_tag})",
+                        label_t1=f"t1: {c_dates[0]}",
+                        label_t2=f"t2: {c_dates[-1]}",
                         center_lat=float(ai_res_show["lat"]),
                         center_lon=float(ai_res_show["lon"]),
                         basemap_mode=basemap_now,
@@ -7319,11 +7552,10 @@ def _render_ai_chat_analysis_fragment(
                     )
                     components.html(swipe_html, height=540, scrolling=False)
                     st.caption(t("swipe_zoom_hint"))
-
             with t_ts:
-                _draw_ts_plotly()
+                _draw_ts_plotly_and_table()
         else:
-            _draw_ts_plotly()
+            _draw_ts_plotly_and_table()
 
     # 3. Export & Cartography Handoff Bar
     if ai_kind_show in ("time_series", "time_series_and_comparison", "gnss_plan"):
