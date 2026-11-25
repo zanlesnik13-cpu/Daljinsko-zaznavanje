@@ -43,6 +43,8 @@ if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
 _LOCAL_MODULES_ORDER: tuple[str, ...] = (
+    "github_sync",
+    "auth",
     "geodezija_crs",
     "map_overlay",
     "kartografija",
@@ -77,6 +79,18 @@ def _reload_stale_local_modules() -> None:
 
 _reload_stale_local_modules()
 
+from auth import (
+    authenticate_user,
+    load_user_profile,
+    register_user,
+    save_user_profile,
+    sync_user_data_to_github,
+)
+from github_sync import (
+    get_github_sync_status,
+    github_restore_all_on_startup,
+    is_github_sync_configured,
+)
 from ai_pomocnik import (
     AI_EXAMPLE_PROMPTS,
     DEFAULT_GEMINI_MODEL,
@@ -7157,8 +7171,215 @@ def _render_ai_chat_analysis_fragment(
         st.code(ai_res_show.get("technical_summary", ""), language="text")
 
 
+def _apply_user_profile_prefs_to_session(profile: dict[str, Any]) -> None:
+    """Apply saved user profile preferences into Streamlit session state before widgets instantiate."""
+    pref_lang = str(profile.get("preferred_lang") or "").strip().lower()
+    if pref_lang in ("sl", "en"):
+        st.session_state["lang"] = pref_lang
+        st.session_state["lang_selector"] = pref_lang
+
+    pref_crs = str(profile.get("preferred_crs_mode") or "").strip().lower()
+    if pref_crs in CRS_MODE_KEYS:
+        st.session_state["sidebar_crs_mode"] = pref_crs
+
+    pref_res = profile.get("preferred_resolution")
+    if pref_res is not None:
+        try:
+            res_int = int(pref_res)
+            if res_int > 0:
+                st.session_state["selected_resolution"] = res_int
+                cur_s = str(st.session_state.get("selected_sensor", SENSOR_S2))
+                if res_int in SENSOR_META.get(cur_s, {}).get("res_options", []):
+                    st.session_state[f"sidebar_res_select_{cur_s}"] = res_int
+        except (TypeError, ValueError):
+            pass
+
+    pref_model = str(profile.get("preferred_gemini_model") or "").strip()
+    if pref_model:
+        st.session_state["gemini_model"] = pref_model
+
+    st.session_state["_auth_last_saved_prefs"] = {
+        "preferred_lang": str(st.session_state.get("lang", "sl")),
+        "preferred_crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
+        "preferred_resolution": int(st.session_state.get("selected_resolution", 10)),
+        "preferred_gemini_model": str(st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)),
+    }
+
+
+def _sync_logged_in_profile_prefs() -> None:
+    """Auto-save preference changes to ``profile.json`` (and GitHub Cloud) for logged-in users."""
+    auth_user = st.session_state.get("auth_user")
+    if not isinstance(auth_user, dict) or not auth_user.get("username"):
+        return
+
+    cur_prefs = {
+        "preferred_lang": str(st.session_state.get("lang", "sl")),
+        "preferred_crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
+        "preferred_resolution": int(st.session_state.get("selected_resolution", 10)),
+        "preferred_gemini_model": str(st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)),
+    }
+    last_saved = st.session_state.get("_auth_last_saved_prefs")
+    if last_saved == cur_prefs:
+        return
+
+    try:
+        updated = save_user_profile(
+            str(auth_user["username"]),
+            cur_prefs,
+            sync=True,
+            show_toast=True,
+        )
+        st.session_state["auth_user"] = updated
+        st.session_state["_auth_last_saved_prefs"] = dict(cur_prefs)
+    except Exception:
+        pass
+
+
+def _render_sidebar_user_profile_card(lang: str) -> None:
+    """Render the compact, strictly optional User Profile card at the top of the Sidebar."""
+    auth_user = st.session_state.get("auth_user")
+    is_logged_in = isinstance(auth_user, dict) and bool(auth_user.get("username"))
+    gh_status = get_github_sync_status(lang=lang)
+
+    with st.container(border=True):
+        st.markdown(f"**{t('auth_card_title', lang=lang)}**")
+
+        flash_msg = st.session_state.pop("_auth_flash_msg", None)
+        if flash_msg:
+            st.success(str(flash_msg))
+
+        if is_logged_in:
+            uname = str(auth_user.get("username", ""))
+            dname = str(auth_user.get("display_name") or uname)
+            safe_dname = dname.replace("<", "&lt;").replace(">", "&gt;")
+            safe_uname = uname.replace("<", "&lt;").replace(">", "&gt;")
+            badge_cls = "sb-env-badge sb-env-badge-hi" if gh_status["configured"] else "sb-env-badge"
+            st.markdown(
+                f'<div style="font-size:0.86rem;font-weight:700;color:#0F172A;margin-bottom:4px;">'
+                f"👤 {safe_dname} "
+                f'<span style="font-weight:500;color:#475569;">(@{safe_uname})</span>'
+                f"</div>"
+                f'<div class="{badge_cls}" title="{gh_status["detail"]}">{gh_status["badge_text"]}</div>',
+                unsafe_allow_html=True,
+            )
+            col_sync, col_out = st.columns([1.25, 0.85], gap="small")
+            with col_sync:
+                if st.button(
+                    t("auth_btn_sync", lang=lang),
+                    key="auth_sync_github_btn",
+                    width="stretch",
+                ):
+                    if is_github_sync_configured():
+                        ok_sync = sync_user_data_to_github(uname)
+                        if ok_sync:
+                            st.success(t("auth_sync_done", lang=lang))
+                        else:
+                            st.info(t("auth_sync_local_only", lang=lang))
+                    else:
+                        st.info(t("auth_sync_local_only", lang=lang))
+            with col_out:
+                if st.button(
+                    t("auth_btn_logout", lang=lang),
+                    key="auth_logout_btn",
+                    width="stretch",
+                ):
+                    st.session_state.pop("auth_user", None)
+                    st.session_state.pop("_auth_last_saved_prefs", None)
+                    st.session_state["_auth_flash_msg"] = t("auth_logout_ok", lang=lang)
+                    st.rerun()
+        else:
+            st.caption(t("auth_guest_badge", lang=lang))
+            with st.expander(t("auth_expander_label", lang=lang), expanded=False):
+                tab_login, tab_reg = st.tabs(
+                    [t("auth_tab_login", lang=lang), t("auth_tab_register", lang=lang)]
+                )
+                with tab_login:
+                    login_u = st.text_input(
+                        t("auth_username_label", lang=lang),
+                        key="auth_login_username",
+                        placeholder="jan.novak",
+                    )
+                    login_p = st.text_input(
+                        t("auth_password_label", lang=lang),
+                        type="password",
+                        key="auth_login_password",
+                    )
+                    if st.button(
+                        t("auth_btn_login", lang=lang),
+                        type="primary",
+                        width="stretch",
+                        key="auth_login_submit",
+                    ):
+                        ok, msg_key, profile = authenticate_user(login_u, login_p)
+                        if ok and profile is not None:
+                            st.session_state["auth_user"] = profile
+                            st.session_state["_auth_pending_profile"] = profile
+                            st.session_state["_auth_flash_msg"] = t(msg_key, lang=lang)
+                            st.rerun()
+                        else:
+                            st.error(t(msg_key, lang=lang))
+
+                with tab_reg:
+                    reg_u = st.text_input(
+                        t("auth_username_label", lang=lang),
+                        key="auth_reg_username",
+                        placeholder="jan.novak",
+                    )
+                    reg_dn = st.text_input(
+                        t("auth_display_name_label", lang=lang),
+                        key="auth_reg_display_name",
+                        placeholder="Jan Novak",
+                    )
+                    reg_p1 = st.text_input(
+                        t("auth_password_label", lang=lang),
+                        type="password",
+                        key="auth_reg_password",
+                    )
+                    reg_p2 = st.text_input(
+                        t("auth_password_confirm_label", lang=lang),
+                        type="password",
+                        key="auth_reg_password_confirm",
+                    )
+                    if st.button(
+                        t("auth_btn_register", lang=lang),
+                        type="primary",
+                        width="stretch",
+                        key="auth_reg_submit",
+                    ):
+                        if reg_p1 != reg_p2:
+                            st.error(t("auth_err_password_mismatch", lang=lang))
+                        else:
+                            init_prefs = {
+                                "preferred_lang": str(st.session_state.get("lang", "sl")),
+                                "preferred_crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
+                                "preferred_resolution": int(st.session_state.get("selected_resolution", 10)),
+                                "preferred_gemini_model": str(
+                                    st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)
+                                ),
+                            }
+                            ok, msg_key, profile = register_user(
+                                reg_u,
+                                reg_p1,
+                                display_name=reg_dn,
+                                initial_prefs=init_prefs,
+                                sync=True,
+                            )
+                            if ok and profile is not None:
+                                st.session_state["auth_user"] = profile
+                                st.session_state["_auth_pending_profile"] = profile
+                                st.session_state["_auth_flash_msg"] = t(msg_key, lang=lang)
+                                st.rerun()
+                            else:
+                                st.error(t(msg_key, lang=lang))
+
+
 def main() -> None:
     _init_session_state()
+    github_restore_all_on_startup()
+
+    pending_prof = st.session_state.pop("_auth_pending_profile", None)
+    if isinstance(pending_prof, dict):
+        _apply_user_profile_prefs_to_session(pending_prof)
 
     pending_ws = st.session_state.pop("pending_workspace", None)
     if pending_ws in WORKSPACE_KEYS:
@@ -7248,6 +7469,9 @@ def main() -> None:
             key="lang_selector",
         )
         st.session_state["lang"] = lang
+
+        # --- 0. Opcijski uporabniški profil (Gost / Prijava / GitHub Cloud) ---
+        _render_sidebar_user_profile_card(lang)
 
         crs_mode_cur = str(st.session_state.get("sidebar_crs_mode", "auto"))
         if crs_mode_cur not in CRS_MODE_KEYS:
@@ -7357,6 +7581,7 @@ def main() -> None:
         target_crs, target_crs_label = get_best_metric_crs(
             float(center_lat), float(center_lon), mode=str(crs_mode)
         )
+        _sync_logged_in_profile_prefs()
 
         today = date.today()
         col_d1, col_d2 = st.columns(2)
@@ -7523,11 +7748,13 @@ def main() -> None:
         for _, row in summary_df.iterrows():
             tile_lbl = _format_tile_label(str(row["mgrs_tile"]), sensor=active_sensor)
             d_str = str(row["date_str"])
+            cov_v = float(row["coverage_pct"]) if ("coverage_pct" in row and pd.notna(row["coverage_pct"])) else 100.0
+            cov_suffix = f" · {cov_v:.0f}% AOI" if cov_v < 99.5 else ""
             if active_sensor == SENSOR_S1 or pd.isna(row["cloud_cover"]):
                 scene_labels.append(
-                    t("scene_option_sar_fmt", date=d_str, tile=tile_lbl)
+                    t("scene_option_sar_fmt", date=d_str, tile=tile_lbl) + cov_suffix
                 )
-                scene_pill_labels.append(f"{d_str} · SAR")
+                scene_pill_labels.append(f"{d_str} · SAR{cov_suffix}")
             else:
                 cld_v = float(row["cloud_cover"])
                 scene_labels.append(
@@ -7537,8 +7764,9 @@ def main() -> None:
                         cloud=cld_v,
                         tile=tile_lbl,
                     )
+                    + cov_suffix
                 )
-                scene_pill_labels.append(f"{d_str} · {cld_v:.0f}%")
+                scene_pill_labels.append(f"{d_str} · {cld_v:.0f}%{cov_suffix}")
         if active_sensor != SENSOR_S1 and summary_df["cloud_cover"].notna().any():
             cand_idx = int(summary_df["cloud_cover"].reset_index(drop=True).idxmin())
             if 0 <= cand_idx < len(items):
@@ -7687,6 +7915,11 @@ def main() -> None:
 
                     vis_spec = vis_specs[vis_code]
                     st.caption(t(vis_spec["desc_key"]))
+
+                    if 0 <= selected_idx < len(summary_df) and "coverage_pct" in summary_df.columns:
+                        _sel_cov_val = summary_df.iloc[selected_idx]["coverage_pct"]
+                        if pd.notna(_sel_cov_val) and float(_sel_cov_val) < 95.0:
+                            st.info(t("swath_partial_notice", cov=float(_sel_cov_val)))
 
                     load_clicked = st.button(
                         t("btn_load_scene"),

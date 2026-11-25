@@ -605,23 +605,25 @@ def group_items_by_date(
         empty_df.attrs["interval_mode"] = INTERVAL_ALL
         return [], empty_df
 
-    buckets: dict[str, list[pystac.Item]] = {}
+    buckets: dict[tuple[str, str], list[pystac.Item]] = {}
     for it in items:
         dt_utc = _extract_item_datetime_utc(it)
         date_str = dt_utc.strftime("%Y-%m-%d")
-        buckets.setdefault(date_str, []).append(it)
+        plat_key = str(it.properties.get("platform") or "").strip().lower()
+        buckets.setdefault((date_str, plat_key), []).append(it)
 
     aoi_geom = _build_aoi_geom_4326(bbox_4326, aoi_polygon_4326)
-    sorted_dates = sorted(buckets.keys(), reverse=True)
-    total_before_cov = len(sorted_dates)
+    sorted_keys = sorted(buckets.keys(), key=lambda kv: (kv[0], kv[1]), reverse=True)
+    total_before_cov = len(sorted_keys)
     filtered_partial = 0
 
     grouped_items: list[list[pystac.Item]] = []
     items_by_date: _NoDeepCopyDict = _NoDeepCopyDict()
+    best_cov_by_date: dict[str, float] = {}
     rows: list[dict[str, object]] = []
 
-    for date_str in sorted_dates:
-        day_items = buckets[date_str]
+    for date_str, _plat_key in sorted_keys:
+        day_items = buckets[(date_str, _plat_key)]
         cov_pct = _compute_group_aoi_coverage_pct(day_items, aoi_geom)
         if min_coverage_pct > 0.0 and cov_pct < float(min_coverage_pct):
             filtered_partial += 1
@@ -648,7 +650,9 @@ def group_items_by_date(
 
         meta = _merge_group_metadata(day_items, sensor=sensor)
         grouped_items.append(day_items)
-        items_by_date[date_str] = day_items
+        if date_str not in items_by_date or cov_pct > best_cov_by_date.get(date_str, -1.0):
+            items_by_date[date_str] = day_items
+            best_cov_by_date[date_str] = cov_pct
         rows.append(
             {
                 "id": meta["id"],
@@ -1027,6 +1031,79 @@ def search_sentinel2(
     )
 
 
+def _supplement_same_day_tiles(
+    item_list: list[pystac.Item],
+    bbox_4326: Sequence[float],
+    *,
+    collection: str,
+    sensor: str,
+) -> list[pystac.Item]:
+    """Ensure all same-day, same-platform sibling tiles touching ``bbox_4326`` are included.
+
+    Fixes partial horizontal/vertical tile cutoffs (e.g. ``T33TVL`` + ``T33TVM`` around 46.10° N)
+    that occur when:
+    1. A sibling tile on the same overpass had slightly higher ``eo:cloud_cover`` than the search cap.
+    2. ``expand_bbox_for_panning`` expanded the load bbox across an MGRS/WRS tile boundary.
+    """
+    if not item_list or len(bbox_4326) != 4:
+        return item_list
+
+    aoi_geom = _build_aoi_geom_4326(bbox_4326, None)
+    cov_pct = _compute_group_aoi_coverage_pct(item_list, aoi_geom)
+    if cov_pct >= 99.5:
+        return item_list
+
+    try:
+        dt_utc = _extract_item_datetime_utc(item_list[0])
+        date_str = dt_utc.strftime("%Y-%m-%d")
+        target_plat = str(item_list[0].properties.get("platform") or "").strip().lower()
+        catalog = _open_stac_catalog()
+        search = catalog.search(
+            collections=[collection],
+            bbox=[float(v) for v in bbox_4326],
+            datetime=f"{date_str}T00:00:00Z/{date_str}T23:59:59Z",
+            limit=50,
+            max_items=50,
+        )
+        fetched = list(search.items())
+    except Exception:
+        return item_list
+
+    if not fetched:
+        return item_list
+
+    merged: dict[str, pystac.Item] = {it.id: it for it in item_list}
+    for cand in fetched:
+        if cand.id in merged:
+            continue
+        if sensor == SENSOR_S2:
+            nd_pct = _get_s2_nodata_pct(cand)
+            if nd_pct is not None and float(nd_pct) >= S2_MAX_NODATA_PIXEL_PCT:
+                continue
+        cand_plat = str(cand.properties.get("platform") or "").strip().lower()
+        if target_plat and cand_plat and cand_plat != target_plat:
+            continue
+        merged[cand.id] = cand
+
+    combined = list(merged.values())
+    if len(combined) <= len(item_list):
+        return item_list
+
+    # Keep the original priority order for low-nodata / clearer tiles
+    def _sort_key(it: pystac.Item) -> tuple[int, float, float, str]:
+        nd_pct = _get_s2_nodata_pct(it) if sensor == SENSOR_S2 else None
+        nd_pen = 1 if (nd_pct is not None and nd_pct >= 50.0) else 0
+        raw_c = it.properties.get("eo:cloud_cover")
+        try:
+            c_val = float(raw_c) if raw_c is not None else float("inf")
+        except (TypeError, ValueError):
+            c_val = float("inf")
+        return (nd_pen, c_val, -_extract_item_datetime_utc(it).timestamp(), it.id)
+
+    combined.sort(key=_sort_key)
+    return combined
+
+
 def load_sentinel2_scene(
     item: StacItemOrGroup,
     bbox_4326: Sequence[float],
@@ -1043,6 +1120,9 @@ def load_sentinel2_scene(
         raise ValueError(f"resolution must be positive, got {resolution}.")
 
     item_list = _normalize_item_group(item)
+    item_list = _supplement_same_day_tiles(
+        item_list, bbox_4326, collection=SENTINEL2_COLLECTION, sensor=SENSOR_S2
+    )
     crs_str = _normalize_crs_str(target_epsg)
     signed_items = [planetary_computer.sign(it) for it in item_list]
 
@@ -1276,6 +1356,9 @@ def load_landsat_scene(
         raise ValueError(f"resolution must be positive, got {resolution}.")
 
     item_list = _normalize_item_group(item)
+    item_list = _supplement_same_day_tiles(
+        item_list, bbox_4326, collection=LANDSAT_COLLECTION, sensor=SENSOR_LANDSAT
+    )
     crs_str = _normalize_crs_str(target_epsg)
     signed_items = [planetary_computer.sign(it) for it in item_list]
 
