@@ -6744,16 +6744,39 @@ def _render_ai_chat_analysis_fragment(
         if pl["task_type"].startswith("disaster_") or pl["task_type"] == "gnss_plan"
         else ("Copernicus GLO-30" if pl["task_type"] == "terrain_dem" else f"{pl['start_date']} → {pl['end_date']}")
     )
+    f_mode_show = str(pl.get("fusion_mode") or "single")
+    fusion_badge_map = {
+        "temporal_landsat_s2": t("ai_fusion_badge_temporal", lang=lang),
+        "synergy_sar_optical": t("ai_fusion_badge_sar_opt", lang=lang),
+        "synergy_optical_thermal": t("ai_fusion_badge_opt_thm", lang=lang),
+        "synergy_optical_dem": t("ai_fusion_badge_opt_dem", lang=lang),
+    }
+    fusion_badge_txt = fusion_badge_map.get(f_mode_show, "")
     if ai_kind_show == "terrain_dem":
         ai_sensor_short = "Copernicus DEM 30 m"
     elif ai_kind_show == "gnss_plan":
         ai_sensor_short = "GPS + Galileo + GLONASS"
+    elif f_mode_show == "temporal_landsat_s2":
+        ai_sensor_short = "Landsat + Sentinel-2"
+    elif f_mode_show == "synergy_sar_optical":
+        ai_sensor_short = "Sentinel-1 SAR + Sentinel-2"
+    elif f_mode_show == "synergy_optical_thermal":
+        ai_sensor_short = "Sentinel-2 + Landsat Thermal"
+    elif f_mode_show == "synergy_optical_dem":
+        ai_sensor_short = f"{SENSOR_META.get(pl['sensor'], SENSOR_META[SENSOR_S2])['short_name']} + DEM"
     else:
         ai_sensor_short = SENSOR_META.get(pl["sensor"], SENSOR_META[SENSOR_S2])["short_name"]
+
+    fusion_pill_html = (
+        f'<span style="background:#FFFBEB;color:#B45309;border:1px solid #FCD34D;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">{fusion_badge_txt}</span>'
+        if fusion_badge_txt
+        else ""
+    )
 
     # 1. Compact Geodetic Plan Pills (cartographic teal & slate, zero purple)
     plan_pills_html = (
         f'<div style="display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px 0;">'
+        f"{fusion_pill_html}"
         f'<span style="background:#F0FDFA;color:#0F766E;border:1px solid #99F6E4;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📍 {t("ai_plan_place")}: {ai_res_show.get("resolved_place", pl["place_name"])} ({pl["radius_m"]} m)</span>'
         f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">🛰️ {t("ai_plan_sensor")}: {ai_sensor_short}</span>'
         f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📅 {t("ai_plan_period")}: {period_txt}</span>'
@@ -6856,6 +6879,18 @@ def _render_ai_chat_analysis_fragment(
                 "zindex": 18,
             }
         )
+        for ex_l in ai_res_show.get("extra_overlay_layers") or []:
+            if ex_l.get("image") and ex_l.get("bounds"):
+                overlay_layers.append(
+                    {
+                        "name": str(ex_l.get("name") or ex_l.get("code") or "Synergy"),
+                        "image": ex_l["image"],
+                        "bounds": ex_l["bounds"],
+                        "opacity": 0.9,
+                        "show": False,
+                        "zindex": 14,
+                    }
+                )
 
         slippy_ai = build_satellite_slippy_map(
             center_lat=float(ai_res_show["lat"]),
@@ -6886,6 +6921,16 @@ def _render_ai_chat_analysis_fragment(
         m2.metric("Povprečje" if lang == "sl" else "Mean", f"{st_ai['mean']:.3f}{unit_suf}")
         m3.metric(t("m_valid_ha"), f"{st_ai['valid_area_ha']:,.2f} ha")
         m4.metric(t("ai_plan_crs"), ai_crs_show)
+
+        # Optical + Thermal UHI Cooling KPIs when available
+        syn_m = ai_res_show.get("synergy_metrics")
+        if isinstance(syn_m, dict) and syn_m.get("uhi_cooling_delta_c") is not None:
+            u1, u2, u3, u4 = st.columns(4)
+            u1.metric(t("ai_uhi_lst_urban", lang=lang), f"{float(syn_m['lst_urban_mean_c']):.1f} °C")
+            u2.metric(t("ai_uhi_lst_veg", lang=lang), f"{float(syn_m['lst_veg_mean_c']):.1f} °C")
+            u3.metric(t("ai_uhi_cooling", lang=lang), f"−{abs(float(syn_m['uhi_cooling_delta_c'])):.1f} °C")
+            r_uhi = syn_m.get("pearson_r_ndvi_lst")
+            u4.metric(t("ai_uhi_corr", lang=lang), f"r = {float(r_uhi):+.3f}" if r_uhi is not None else "—")
 
         # NDSI Snow / Glacier + DEM Snowline KPIs when available
         snow_st = ai_res_show.get("snow_stats")
@@ -7409,16 +7454,62 @@ def _render_ai_chat_analysis_fragment(
 
         def _draw_ts_plotly_and_table() -> None:
             fig_ai_ts = go.Figure()
-            fig_ai_ts.add_trace(
-                go.Scatter(
-                    x=ts_ai["date_str"],
-                    y=ts_ai["mean"],
-                    mode="lines+markers",
-                    name=idx_lbl_ts,
-                    line=dict(color="#0F766E", width=2.5),
-                    marker=dict(size=7, color="#0F766E"),
-                )
+            is_temporal_fusion = (
+                f_mode_show == "temporal_landsat_s2"
+                and "sensor_family" in ts_ai.columns
+                and ts_ai["sensor_family"].nunique() >= 2
             )
+            if is_temporal_fusion:
+                ts_ls_sub = ts_ai[ts_ai["sensor_family"].astype(str).str.contains("Landsat", case=False, na=False)]
+                ts_s2_sub = ts_ai[ts_ai["sensor_family"].astype(str).str.contains("Sentinel-2", case=False, na=False)]
+                if not ts_ls_sub.empty:
+                    fig_ai_ts.add_trace(
+                        go.Scatter(
+                            x=ts_ls_sub["date_str"],
+                            y=ts_ls_sub["mean"],
+                            mode="lines+markers",
+                            name="Landsat (30 m)",
+                            line=dict(color="#D97706", width=2.3),
+                            marker=dict(size=7, color="#D97706", symbol="circle"),
+                        )
+                    )
+                if not ts_s2_sub.empty:
+                    fig_ai_ts.add_trace(
+                        go.Scatter(
+                            x=ts_s2_sub["date_str"],
+                            y=ts_s2_sub["mean"],
+                            mode="lines+markers",
+                            name="Sentinel-2 (10–20 m)",
+                            line=dict(color="#0F766E", width=2.5),
+                            marker=dict(size=7, color="#0F766E", symbol="diamond"),
+                        )
+                    )
+                fig_ai_ts.add_vline(
+                    x="2017-01-01",
+                    line_width=1.4,
+                    line_dash="dot",
+                    line_color="#64748B",
+                )
+                fig_ai_ts.add_annotation(
+                    x="2017-01-01",
+                    y=1.02,
+                    yref="paper",
+                    text=t("ai_fusion_transition_2017", lang=lang),
+                    showarrow=False,
+                    font=dict(size=11, color="#475569"),
+                    bgcolor="rgba(255,255,255,0.85)",
+                )
+            else:
+                fig_ai_ts.add_trace(
+                    go.Scatter(
+                        x=ts_ai["date_str"],
+                        y=ts_ai["mean"],
+                        mode="lines+markers",
+                        name=idx_lbl_ts,
+                        line=dict(color="#0F766E", width=2.5),
+                        marker=dict(size=7, color="#0F766E"),
+                    )
+                )
             if len(ts_ai) >= 3:
                 x_ord = np.arange(len(ts_ai), dtype=np.float64)
                 slope, intercept = np.polyfit(x_ord, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
@@ -7447,7 +7538,7 @@ def _render_ai_chat_analysis_fragment(
                 font=dict(color="#0F172A"),
             )
             st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
-            tbl_cols = [c for c in ("date_str", "platform", "mean", "median", "std", "valid_pct") if c in ts_ai.columns]
+            tbl_cols = [c for c in ("date_str", "sensor_family", "platform", "mean", "median", "std", "valid_pct") if c in ts_ai.columns]
             if tbl_cols:
                 st.dataframe(ts_ai[tbl_cols], width="stretch", hide_index=True, height=min(240, 42 + 35 * len(ts_ai)))
             if ai_res_show.get("csv_bytes"):
@@ -7490,6 +7581,14 @@ def _render_ai_chat_analysis_fragment(
                 ico_e = "💧" if code in ("NDWI", "MNDWI") else ("🔥" if code == "SWIR" else "🌿")
                 return f"{ico_e} {code}"
 
+            def _frame_dropdown_label(i: int) -> str:
+                fr_i = frames_list[i]
+                plat_s = str(fr_i.get("platform") or "").strip()
+                base_s = f"{fr_i['date']} · {plat_s}" if plat_s else str(fr_i["date"])
+                if fr_i.get("index_mean") is not None:
+                    return f"{base_s} ({idx_lbl_ts}={fr_i['index_mean']:.2f})"
+                return base_s
+
             # --- TAB 1: Compare Any Two Dates (t1 ↔ t2) with Multi-Index Switcher ---
             with t_sw:
                 dc1, dc2 = st.columns(2, gap="small")
@@ -7498,11 +7597,7 @@ def _render_ai_chat_analysis_fragment(
                         t("ai_mf_date_left", lang=lang),
                         options=list(range(n_fr)),
                         index=0,
-                        format_func=lambda i: (
-                            f"{frames_list[i]['date']} ({idx_lbl_ts}={frames_list[i]['index_mean']:.2f})"
-                            if frames_list[i].get("index_mean") is not None
-                            else str(frames_list[i]["date"])
-                        ),
+                        format_func=_frame_dropdown_label,
                         key=f"ai_mf_left_idx_{result_id}",
                     )
                 with dc2:
@@ -7510,11 +7605,7 @@ def _render_ai_chat_analysis_fragment(
                         t("ai_mf_date_right", lang=lang),
                         options=list(range(n_fr)),
                         index=n_fr - 1,
-                        format_func=lambda i: (
-                            f"{frames_list[i]['date']} ({idx_lbl_ts}={frames_list[i]['index_mean']:.2f})"
-                            if frames_list[i].get("index_mean") is not None
-                            else str(frames_list[i]["date"])
-                        ),
+                        format_func=_frame_dropdown_label,
                         key=f"ai_mf_right_idx_{result_id}",
                     )
 
@@ -7565,14 +7656,19 @@ def _render_ai_chat_analysis_fragment(
                 bnds_l = fr_l.get("bounds_4326")
                 bnds_r = fr_r.get("bounds_4326")
 
+                plat_l = str(fr_l.get("platform") or "").strip()
+                plat_r = str(fr_r.get("platform") or "").strip()
+                lbl_l = f"t1: {fr_l['date']}" + (f" · {plat_l}" if plat_l else "") + f" ({sw_tag})"
+                lbl_r = f"t2: {fr_r['date']}" + (f" · {plat_r}" if plat_r else "") + f" ({sw_tag})"
+
                 if uri_l and uri_r and bnds_l and bnds_r:
                     swipe_html = build_zoomable_swipe_map(
                         overlay_uri_t1=uri_l,
                         bounds_t1=bnds_l,
                         overlay_uri_t2=uri_r,
                         bounds_t2=bnds_r,
-                        label_t1=f"t1: {fr_l['date']} ({sw_tag})",
-                        label_t2=f"t2: {fr_r['date']} ({sw_tag})",
+                        label_t1=lbl_l,
+                        label_t2=lbl_r,
                         center_lat=float(ai_res_show["lat"]),
                         center_lon=float(ai_res_show["lon"]),
                         basemap_mode=basemap_now,

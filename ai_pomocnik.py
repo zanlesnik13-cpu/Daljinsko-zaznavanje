@@ -39,7 +39,9 @@ from analize import (
     get_required_bands_for_sensor,
 )
 from casovne_vrste import (
+    align_and_compute_delta,
     build_multidate_visual_frames,
+    compile_timelapse_gif_fps,
     compute_change_summary,
     compute_cloud_free_composite,
     extract_time_series,
@@ -216,6 +218,20 @@ VALID_TASKS: tuple[str, ...] = (
 )
 VALID_INDICES: tuple[str, ...] = ("NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "NDSI", "LST", "VV")
 VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60)
+
+FUSION_SINGLE: str = "single"
+FUSION_TEMPORAL_LANDSAT_S2: str = "temporal_landsat_s2"
+FUSION_SYNERGY_SAR_OPTICAL: str = "synergy_sar_optical"
+FUSION_SYNERGY_OPTICAL_THERMAL: str = "synergy_optical_thermal"
+FUSION_SYNERGY_OPTICAL_DEM: str = "synergy_optical_dem"
+VALID_FUSION_MODES: tuple[str, ...] = (
+    FUSION_SINGLE,
+    FUSION_TEMPORAL_LANDSAT_S2,
+    FUSION_SYNERGY_SAR_OPTICAL,
+    FUSION_SYNERGY_OPTICAL_THERMAL,
+    FUSION_SYNERGY_OPTICAL_DEM,
+)
+SENSOR_DEM: str = "cop-dem-glo-30"
 
 # Global landmarks & common typos -> (canonical_name, lat, lon)
 # Prevents ambiguous place names (e.g. "Boca Chica" -> Dominican Republic instead of SpaceX Starbase Texas!)
@@ -621,7 +637,117 @@ def _coerce_valid_lat_lon(raw_lat: Any, raw_lon: Any) -> tuple[float | None, flo
     return None, None
 
 
-def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local") -> dict[str, Any]:
+def detect_fusion_mode(
+    *,
+    task_type: str,
+    sensor: str,
+    index_name: str,
+    start_d: date,
+    end_d: date,
+    query: str = "",
+    requested_mode: str | None = None,
+) -> tuple[str, list[str], str, str]:
+    """Determine optimal multi-sensor satellite fusion mode, sensor list, and bilingual rationale.
+
+    Returns ``(fusion_mode, sensors, rationale_sl, rationale_en)``.
+    """
+    norm_q = _normalize_ascii(query)
+    req_m = str(requested_mode or "").strip().lower()
+    y1, y2 = start_d.year, end_d.year
+
+    # 1. Multi-Decade Temporal Fusion: Landsat (1984–2016) + Sentinel-2 (2017–present)
+    is_temporal_task = task_type in ("time_series", "time_series_and_comparison", "change_comparison")
+    spans_s2_boundary = start_d < date(2017, 1, 1) and end_d >= date(2017, 1, 1)
+    if (
+        (is_temporal_task and spans_s2_boundary and index_name not in ("VV", "LST"))
+        or req_m == FUSION_TEMPORAL_LANDSAT_S2
+    ):
+        r_sl = (
+            f"Za obdobje {y1}–2016 je bil uporabljen **Landsat Collection 2 L2 (30 m)**, ker Sentinel-2 takrat še ni deloval; "
+            f"od leta 2017 do {y2} pa **Sentinel-2 L2A (10–20 m)** zaradi bistveno višje prostorske ločljivosti in ostrejših podrobnosti."
+        )
+        r_en = (
+            f"**Landsat Collection 2 L2 (30 m)** covers the historical {y1}–2016 period before Sentinel-2 existed, "
+            f"seamlessly transitioning to **Sentinel-2 L2A (10–20 m)** from 2017 to {y2} for sharper spatial detail."
+        )
+        return FUSION_TEMPORAL_LANDSAT_S2, [SENSOR_LANDSAT, SENSOR_S2], r_sl, r_en
+
+    # 2. All-Weather Radar + Optical Synergy: Sentinel-1 SAR + Sentinel-2 L2A
+    has_radar_cue = any(k in norm_q for k in ("radar", "sar", "sentinel-1", "sentinel 1"))
+    has_optical_cue = any(k in norm_q for k in ("optic", "rgb", "sentinel-2", "sentinel 2", "barvn", "ndvi", "ndwi"))
+    has_metallic_cue = any(k in norm_q for k in ("starbase", "pristanisc", "luka", "port", "tovarn", "factory", "most", "bridge"))
+    if (
+        req_m == FUSION_SYNERGY_SAR_OPTICAL
+        or task_type == "disaster_flood"
+        or (has_radar_cue and has_optical_cue)
+        or (has_radar_cue and has_metallic_cue)
+    ):
+        r_sl = (
+            "**Sentinel-1 SAR RTC** (C-pasovni radar) prodira skozi nevihtne oblake in zanesljivo zaznava poplavno vodo "
+            "ter kovinske strukture, najbližji jasen posnetek **Sentinel-2 L2A (10 m)** pa na isti karti dodaja barvni optični RGB "
+            "in kontekst pokrovnosti tal (NDWI/NDVI)."
+        )
+        r_en = (
+            "**Sentinel-1 SAR RTC** (C-band radar) penetrates storm clouds to reliably detect floodwater and metallic structures, "
+            "while the nearest clear **Sentinel-2 L2A (10 m)** scene adds True Color RGB and optical land-cover context (NDWI/NDVI) on the same map."
+        )
+        return FUSION_SYNERGY_SAR_OPTICAL, [SENSOR_S1, SENSOR_S2], r_sl, r_en
+
+    # 3. High-Res Optical + Thermal Synergy: Sentinel-2 L2A (10 m) + Landsat ST_B10 LST (30 m)
+    has_thermal_cue = (
+        index_name == "LST"
+        or any(k in norm_q for k in ("toplotni otok", "heat island", "uhi", "temperat", "vrocin", "toplot", "thermal", "lst"))
+    )
+    has_uhi_or_cooling_cue = any(
+        k in norm_q
+        for k in ("toplotni otok", "heat island", "uhi", "park", "hlajenj", "cooling", "susa", "drought", "drobir", "debris", "gozd", "vegetacij", "mesto")
+    )
+    if (
+        req_m == FUSION_SYNERGY_OPTICAL_THERMAL
+        or (has_thermal_cue and has_uhi_or_cooling_cue and end_d >= date(2017, 1, 1))
+        or (index_name == "LST" and task_type == "spectral_index" and end_d >= date(2017, 1, 1))
+    ):
+        r_sl = (
+            "**Sentinel-2 L2A (10 m)** zagotavlja oster optični prikaz (RGB in NDVI/NDSI) parkov, gozdov in pozidave, "
+            "**Landsat Collection 2 L2 (termalni kanal ST_B10, 30 m)** pa meri dejansko temperaturo površja (LST v °C), "
+            "kar omogoča kvantitativno oceno toplotnega otoka in hladilnega učinka vegetacije."
+        )
+        r_en = (
+            "**Sentinel-2 L2A (10 m)** provides sharp optical detail (RGB and NDVI/NDSI) of parks, forests, and built-up surfaces, "
+            "while **Landsat Collection 2 L2 (thermal ST_B10, 30 m)** measures Land Surface Temperature (LST in °C) to quantify "
+            "Urban Heat Island intensity and vegetation cooling."
+        )
+        return FUSION_SYNERGY_OPTICAL_THERMAL, [SENSOR_S2, SENSOR_LANDSAT], r_sl, r_en
+
+    # 4. Optical + Relief Synergy: Sentinel-2/Landsat + Copernicus DEM 30 m
+    has_dem_synergy_cue = any(
+        k in norm_q
+        for k in ("snezna meja", "snowline", "plaz", "landslide", "strm", "gorski gozd", "mountain", "visinsk")
+    )
+    if (
+        req_m == FUSION_SYNERGY_OPTICAL_DEM
+        or (task_type == "spectral_index" and (index_name == "NDSI" or has_dem_synergy_cue))
+    ):
+        opt_lbl = "Landsat (30 m)" if sensor == SENSOR_LANDSAT else "Sentinel-2 L2A (10–20 m)"
+        r_sl = (
+            f"Optični posnetek **{opt_lbl}** je združen s **Copernicus DEM 30 m** za izračun nadmorskih višin, "
+            f"naklonov terena in snežne meje [m n.v.] na istem metričnem koordinatnem sistemu."
+        )
+        r_en = (
+            f"Optical **{opt_lbl}** imagery is fused with **Copernicus DEM 30 m** to quantify elevation, "
+            f"terrain slope, and snowline altitude [m a.s.l.] in the same metric projection."
+        )
+        return FUSION_SYNERGY_OPTICAL_DEM, [sensor, SENSOR_DEM], r_sl, r_en
+
+    # 5. Standard single-sensor mode
+    return FUSION_SINGLE, [sensor], "", ""
+
+
+def validate_and_normalize_plan(
+    raw_plan: dict[str, Any],
+    engine: str = "local",
+    query: str = "",
+) -> dict[str, Any]:
     """Validate and enforce strict geodetic/sensor rules on any parsed JSON plan."""
     today = date.today()
     raw_place = str(raw_plan.get("place_name") or raw_plan.get("location") or "Ljubljana").strip()
@@ -720,6 +846,20 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
 
     target_crs_hint = resolve_ai_metric_crs(lat_val, lon_val) if (lat_val is not None and lon_val is not None) else None
 
+    fusion_mode, sensors_list, rat_sl, rat_en = detect_fusion_mode(
+        task_type=task_type,
+        sensor=sensor,
+        index_name=index_name,
+        start_d=start_d,
+        end_d=end_d,
+        query=query or str(raw_plan.get("original_query") or ""),
+        requested_mode=raw_plan.get("fusion_mode"),
+    )
+    if str(raw_plan.get("fusion_rationale_sl") or "").strip() and fusion_mode != FUSION_SINGLE:
+        rat_sl = str(raw_plan["fusion_rationale_sl"]).strip()
+    if str(raw_plan.get("fusion_rationale_en") or "").strip() and fusion_mode != FUSION_SINGLE:
+        rat_en = str(raw_plan["fusion_rationale_en"]).strip()
+
     return {
         "place_name": place_name,
         "location": place_name,
@@ -728,6 +868,11 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
         "target_epsg": target_crs_hint,
         "radius_m": radius_m,
         "sensor": sensor,
+        "sensors": sensors_list,
+        "fusion_mode": fusion_mode,
+        "fusion_rationale": rat_sl,
+        "fusion_rationale_sl": rat_sl,
+        "fusion_rationale_en": rat_en,
         "task_type": task_type,
         "include_comparison": include_comparison,
         "index_name": index_name,
@@ -1213,6 +1358,7 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
             "explanation_en": expl_en,
         },
         engine="local",
+        query=query,
     )
 
 
@@ -1448,6 +1594,10 @@ def build_analysis_context_dict(
         "radius_m": int(plan.get("radius_m", 4000)),
         "crs": str(result.get("crs", CRS_D96TM)),
         "sensor": str(plan.get("sensor", SENSOR_S2)),
+        "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_S2)]),
+        "fusion_mode": str(plan.get("fusion_mode") or FUSION_SINGLE),
+        "fusion_rationale_sl": str(plan.get("fusion_rationale_sl") or ""),
+        "fusion_rationale_en": str(plan.get("fusion_rationale_en") or ""),
         "resolution_m": int(plan.get("resolution_m", 10)),
         "task_type": str(plan.get("task_type", "")),
         "index_name": str(plan.get("index_name", "")),
@@ -1456,6 +1606,8 @@ def build_analysis_context_dict(
         "event_date": str(plan.get("event_date", "")),
         "technical_summary": str(result.get("technical_summary", "")),
     }
+    if isinstance(result.get("synergy_metrics"), dict) and result["synergy_metrics"]:
+        ctx["synergy_metrics"] = dict(result["synergy_metrics"])
 
     if kind == "disaster" and isinstance(result.get("disaster_result"), dict):
         dis = result["disaster_result"]
@@ -1617,6 +1769,614 @@ def resolve_plan_coordinates(
         if lang == "sl"
         else f"Could not geocode '{place_name}'. Try a nearby town name or coordinates."
     )
+
+
+def execute_temporal_fusion(
+    plan: dict[str, Any],
+    *,
+    base_out: dict[str, Any],
+    bbox_4326: Sequence[float],
+    target_epsg: str,
+    lang: str = "sl",
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Engine A — Unified Multi-Decade Temporal Fusion: Landsat C2 L2 (1984–2016) + Sentinel-2 L2A (2017–present).
+
+    Harmonizes historical 30 m Landsat and modern 10–20 m Sentinel-2 into ONE chronological DataFrame,
+    ONE RAM-safe visual frame stack (<= 10 frames on 1 GB cloud, <= 14 on High-RAM), ONE cross-resolution
+    pixel-aligned Δ change map (``t2_S2 - t1_Landsat``), and ONE multi-decade Timelapse GIF.
+    """
+    def _prog(pct: float, msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(pct, msg)
+
+    epsg_num = str(target_epsg).split(":")[-1]
+    layer_m = str(plan.get("index_name") or "NDVI").upper()
+    start_s = str(plan["start_date"])
+    end_s = str(plan["end_date"])
+    hist_end = "2016-12-31"
+    mod_start = "2017-01-01"
+
+    adaptive_interval = choose_adaptive_interval(
+        start_s,
+        end_s,
+        user_requested_interval=(plan.get("interval") if plan.get("interval_explicit") else None),
+    )
+    interval_key = INTERVAL_LABEL_TO_KEY.get(adaptive_interval, INTERVAL_YEARLY)
+    relevant_layers = get_relevant_indices(layer_m, str(plan.get("task_type") or "time_series"))
+    extra_idx_list = [c for c in relevant_layers if c not in ("RGB", "SAR", layer_m)]
+
+    low_ram = is_low_ram_cloud()
+    max_ls_frames = 5 if low_ram else 7
+    max_s2_frames = 5 if low_ram else 7
+    vis_res_s2 = max(int(plan.get("resolution_m", 10)), 20 if low_ram else 10)
+
+    # 1. Search historical Landsat (start_date .. 2016-12-31)
+    _prog(
+        0.14,
+        f"Iščem zgodovinske Landsat posnetke ({start_s[:4]}–2016)..."
+        if lang == "sl"
+        else f"Searching historical Landsat archive ({start_s[:4]}–2016)...",
+    )
+    ls_items, ls_df_search = search_scenes(
+        sensor=SENSOR_LANDSAT,
+        bbox_4326=bbox_4326,
+        start_date=start_s,
+        end_date=hist_end,
+        max_cloud_cover=25.0,
+        exclude_l7_slc_off=True,
+        min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
+        interval_mode=interval_key,
+        target_season=SEASON_SUMMER,
+    )
+    if not ls_items or ls_df_search.empty:
+        ls_items, ls_df_search = search_scenes(
+            sensor=SENSOR_LANDSAT,
+            bbox_4326=bbox_4326,
+            start_date=start_s,
+            end_date=hist_end,
+            max_cloud_cover=45.0,
+            exclude_l7_slc_off=True,
+            min_coverage_pct=65.0,
+            interval_mode=interval_key,
+            target_season=SEASON_SUMMER,
+        )
+    if len(ls_items) > 12:
+        p_idx = np.linspace(0, len(ls_items) - 1, 12, dtype=int)
+        ls_items = [ls_items[i] for i in p_idx]
+        ls_df_search = ls_df_search.iloc[p_idx].reset_index(drop=True)
+
+    # 2. Search modern Sentinel-2 (2017-01-01 .. end_date)
+    _prog(
+        0.22,
+        f"Iščem sodobne Sentinel-2 posnetke (2017–{end_s[:4]})..."
+        if lang == "sl"
+        else f"Searching modern Sentinel-2 archive (2017–{end_s[:4]})...",
+    )
+    s2_items, s2_df_search = search_scenes(
+        sensor=SENSOR_S2,
+        bbox_4326=bbox_4326,
+        start_date=mod_start,
+        end_date=end_s,
+        max_cloud_cover=25.0,
+        exclude_l7_slc_off=False,
+        min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
+        interval_mode=interval_key,
+        target_season=SEASON_SUMMER,
+    )
+    if not s2_items or s2_df_search.empty:
+        s2_items, s2_df_search = search_scenes(
+            sensor=SENSOR_S2,
+            bbox_4326=bbox_4326,
+            start_date=mod_start,
+            end_date=end_s,
+            max_cloud_cover=45.0,
+            exclude_l7_slc_off=False,
+            min_coverage_pct=65.0,
+            interval_mode=interval_key,
+            target_season=SEASON_SUMMER,
+        )
+    if len(s2_items) > 12:
+        p_idx = np.linspace(0, len(s2_items) - 1, 12, dtype=int)
+        s2_items = [s2_items[i] for i in p_idx]
+        s2_df_search = s2_df_search.iloc[p_idx].reset_index(drop=True)
+
+    # 3. Extract harmonized time series from both archives
+    ts_parts: list[pd.DataFrame] = []
+    if ls_items:
+        _prog(0.30, "Računam zgodovinsko časovno vrsto (Landsat 30 m)..." if lang == "sl" else "Extracting historical Landsat (30 m) time series...")
+        ts_ls = extract_time_series(
+            items=ls_items,
+            bbox_4326=bbox_4326,
+            index_name=layer_m,
+            target_epsg=target_epsg,
+            resolution=30,
+            mask_clouds=True,
+            sensor=SENSOR_LANDSAT,
+            candidates_by_date=ls_df_search.attrs.get("candidates_by_bucket"),
+        )
+        if not ts_ls.empty:
+            ts_ls = ts_ls.copy()
+            ts_ls["sensor_family"] = "Landsat (30 m)"
+            ts_ls["resolution_m"] = 30
+            ts_parts.append(ts_ls)
+
+    if s2_items:
+        _prog(0.46, "Računam sodobno časovno vrsto (Sentinel-2 10–20 m)..." if lang == "sl" else "Extracting modern Sentinel-2 (10–20 m) time series...")
+        ts_s2 = extract_time_series(
+            items=s2_items,
+            bbox_4326=bbox_4326,
+            index_name=layer_m,
+            target_epsg=target_epsg,
+            resolution=vis_res_s2,
+            mask_clouds=True,
+            sensor=SENSOR_S2,
+            candidates_by_date=s2_df_search.attrs.get("candidates_by_bucket"),
+        )
+        if not ts_s2.empty:
+            ts_s2 = ts_s2.copy()
+            ts_s2["sensor_family"] = "Sentinel-2 (10–20 m)"
+            ts_s2["resolution_m"] = vis_res_s2
+            ts_parts.append(ts_s2)
+
+    if not ts_parts:
+        raise RuntimeError(
+            "Za izbrano obdobje ni bilo najdenih čistih posnetkov Landsat ali Sentinel-2."
+            if lang == "sl"
+            else "No cloud-free Landsat or Sentinel-2 scenes found for the requested period."
+        )
+
+    ts_df = pd.concat(ts_parts, ignore_index=True)
+    ts_df = ts_df.sort_values("date_str", ascending=True).reset_index(drop=True)
+    csv_bytes = ts_df.to_csv(index=False).encode("utf-8")
+    csv_fname = f"AI_Fusion_Landsat_S2_{layer_m}_{plan['place_name']}_{start_s}_{end_s}.csv"
+
+    # 4. Build unified RAM-safe chronological visual frames (Landsat + Sentinel-2)
+    frames: list[dict[str, Any]] = []
+    da_first = None
+    da_last = None
+
+    if ls_items:
+        _prog(0.60, "Pripravljam zgodovinske satelitske posnetke (Landsat)..." if lang == "sl" else "Rendering historical Landsat frames...")
+        ls_dates = [str(d) for d in ls_df_search["date_str"].tolist()]
+        ls_bundle = build_multidate_visual_frames(
+            item_groups=ls_items,
+            date_labels=ls_dates,
+            bbox_4326=bbox_4326,
+            index_name=layer_m,
+            target_epsg=target_epsg,
+            resolution=30,
+            sensor=SENSOR_LANDSAT,
+            extra_indices=extra_idx_list,
+            max_frames=max_ls_frames,
+            candidates_by_date=ls_df_search.attrs.get("candidates_by_bucket"),
+            auto_cloud_fallback=True,
+            min_clear_pct=70.0,
+            max_thumb_width=560 if low_ram else 680,
+            overlay_max_width=1000 if low_ram else 1300,
+            default_fps=1.5,
+        )
+        frames.extend(ls_bundle.get("frames") or [])
+        if ls_bundle.get("da_first") is not None:
+            da_first = ls_bundle["da_first"]
+        if ls_bundle.get("da_last") is not None:
+            da_last = ls_bundle["da_last"]
+        gc.collect()
+
+    if s2_items:
+        _prog(0.76, "Pripravljam sodobne satelitske posnetke (Sentinel-2)..." if lang == "sl" else "Rendering modern Sentinel-2 frames...")
+        s2_dates = [str(d) for d in s2_df_search["date_str"].tolist()]
+        s2_bundle = build_multidate_visual_frames(
+            item_groups=s2_items,
+            date_labels=s2_dates,
+            bbox_4326=bbox_4326,
+            index_name=layer_m,
+            target_epsg=target_epsg,
+            resolution=vis_res_s2,
+            sensor=SENSOR_S2,
+            extra_indices=extra_idx_list,
+            max_frames=max_s2_frames,
+            candidates_by_date=s2_df_search.attrs.get("candidates_by_bucket"),
+            auto_cloud_fallback=True,
+            min_clear_pct=75.0,
+            max_thumb_width=560 if low_ram else 680,
+            overlay_max_width=1000 if low_ram else 1300,
+            default_fps=1.5,
+        )
+        frames.extend(s2_bundle.get("frames") or [])
+        if da_first is None and s2_bundle.get("da_first") is not None:
+            da_first = s2_bundle["da_first"]
+        if s2_bundle.get("da_last") is not None:
+            da_last = s2_bundle["da_last"]
+        gc.collect()
+
+    frames = sorted(frames, key=lambda fr: str(fr.get("date") or ""))
+
+    # 5. Cross-resolution pixel-aligned Δ change map (t2_S2 - t1_Landsat)
+    diff_da = None
+    ch_summary: dict[str, Any] = {}
+    delta_uri = None
+    delta_bnds = None
+    delta_vmin = -0.5
+    delta_vmax = 0.5
+    delta_cmap = "RdBu"
+    tif_bytes = None
+    tif_fname = None
+
+    if da_first is not None and da_last is not None and len(frames) >= 2:
+        _prog(0.88, "Usklajujem rastrski mreži (Landsat 30 m ↔ Sentinel-2) za karto sprememb Δ..." if lang == "sl" else "Aligning Landsat 30 m & Sentinel-2 grids for Δ change map...")
+        delta_out = align_and_compute_delta(
+            da_first,
+            da_last,
+            target_epsg=target_epsg,
+            index_name=layer_m,
+            threshold=0.15,
+            max_width=1000 if low_ram else 1300,
+        )
+        diff_da = delta_out["diff_da"]
+        ch_summary = delta_out["change_summary"]
+        delta_uri = delta_out["delta_overlay_uri"]
+        delta_bnds = delta_out["delta_overlay_bounds"]
+        delta_vmin = delta_out["delta_vmin"]
+        delta_vmax = delta_out["delta_vmax"]
+        delta_cmap = delta_out["delta_cmap"]
+        tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
+        tif_fname = f"AI_Fusion_Delta_{layer_m}_{plan['place_name']}_{frames[0]['date']}_to_{frames[-1]['date']}_EPSG{epsg_num}.tif"
+
+    # 6. Unified Multi-Decade Timelapse GIFs
+    rgb_pngs = [f["rgb_png_bytes"] for f in frames if f.get("rgb_png_bytes")]
+    idx_pngs = [f["index_png_bytes"] for f in frames if f.get("index_png_bytes")]
+    gif_rgb = compile_timelapse_gif_fps(rgb_pngs, fps=1.5) if len(rgb_pngs) >= 2 else None
+    gif_idx = compile_timelapse_gif_fps(idx_pngs, fps=1.5) if len(idx_pngs) >= 2 else None
+
+    n_ls_obs = int((ts_df["sensor_family"] == "Landsat (30 m)").sum()) if "sensor_family" in ts_df.columns else 0
+    n_s2_obs = int((ts_df["sensor_family"] == "Sentinel-2 (10–20 m)").sum()) if "sensor_family" in ts_df.columns else 0
+    synergy_metrics = {
+        "fusion_type": FUSION_TEMPORAL_LANDSAT_S2,
+        "landsat_obs": n_ls_obs,
+        "sentinel2_obs": n_s2_obs,
+        "transition_year": 2017,
+        "total_frames": len(frames),
+    }
+
+    gc.collect()
+    base_out.update(
+        {
+            "kind": "time_series_and_comparison" if len(frames) >= 2 else "time_series",
+            "adaptive_interval": adaptive_interval,
+            "relevant_layers": relevant_layers,
+            "extra_indices": extra_idx_list,
+            "ts_df": ts_df,
+            "csv_bytes": csv_bytes,
+            "csv_filename": csv_fname,
+            "frames": frames,
+            "timelapse_rgb_gif_bytes": gif_rgb,
+            "timelapse_index_gif_bytes": gif_idx,
+            "comparison_rgb": None,
+            "comparison_index": None,
+            "comparison_result": None,
+            "change_summary": ch_summary,
+            "delta_overlay_uri": delta_uri,
+            "delta_overlay_bounds": delta_bnds,
+            "delta_vmin": delta_vmin,
+            "delta_vmax": delta_vmax,
+            "delta_cmap": delta_cmap,
+            "da_last": da_last,
+            "index_da": diff_da if diff_da is not None else da_last,
+            "tif_bytes": tif_bytes,
+            "tif_filename": tif_fname,
+            "synergy_metrics": synergy_metrics,
+        }
+    )
+    base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+    base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
+    _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
+    return base_out
+
+
+def _attach_sar_optical_synergy(
+    *,
+    bbox_4326: Sequence[float],
+    ref_date: date,
+    target_epsg: str,
+    lang: str = "sl",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Engine B1 — Fetch the nearest clear Sentinel-2 L2A optical scene (RGB + NDWI) to pair with Sentinel-1 SAR."""
+    extra_layers: list[dict[str, Any]] = []
+    syn_metrics: dict[str, Any] = {"fusion_type": FUSION_SYNERGY_SAR_OPTICAL}
+    try:
+        s_start = (ref_date - timedelta(days=45)).isoformat()
+        s_end = (ref_date + timedelta(days=45)).isoformat()
+        s2_items, s2_df = search_scenes(
+            sensor=SENSOR_S2,
+            bbox_4326=bbox_4326,
+            start_date=s_start,
+            end_date=s_end,
+            max_cloud_cover=25.0,
+            min_coverage_pct=70.0,
+            interval_mode=INTERVAL_ALL,
+        )
+        if not s2_items or s2_df.empty:
+            s2_items, s2_df = search_scenes(
+                sensor=SENSOR_S2,
+                bbox_4326=bbox_4326,
+                start_date=s_start,
+                end_date=s_end,
+                max_cloud_cover=50.0,
+                min_coverage_pct=60.0,
+                interval_mode=INTERVAL_ALL,
+            )
+        if s2_items and not s2_df.empty:
+            cc_vals = s2_df["cloud_cover"].fillna(50.0).to_numpy()
+            best_i = int(np.argmin(cc_vals))
+            s2_date = str(s2_df.iloc[best_i]["date_str"])
+            s2_res = 20 if is_low_ram_cloud() else 10
+            ds_s2 = load_scene(
+                sensor=SENSOR_S2,
+                item=s2_items[best_i],
+                bbox_4326=bbox_4326,
+                bands=["B04", "B03", "B02", "B08", "SCL"],
+                target_epsg=target_epsg,
+                resolution=s2_res,
+            )
+            if all(b in ds_s2.data_vars for b in ("B04", "B03", "B02")):
+                rgb_u, rgb_b = raster_to_map_overlay_png(
+                    ds_s2,
+                    src_epsg=target_epsg,
+                    is_rgb=True,
+                    bands=["B04", "B03", "B02"],
+                    use_percentile_stretch=True,
+                    max_width=1400,
+                )
+                extra_layers.append(
+                    {
+                        "code": "S2_RGB",
+                        "name": f"🛰️ Sentinel-2 RGB ({s2_date})",
+                        "image": rgb_u,
+                        "bounds": rgb_b,
+                    }
+                )
+            ds_m, _ = apply_cloud_mask(ds_s2, sensor=SENSOR_S2)
+            ndwi_da = compute_index(ds_m, "NDWI")
+            ndwi_spec = SPECTRAL_INDICES["NDWI"]
+            ndwi_u, ndwi_b = raster_to_map_overlay_png(
+                ndwi_da,
+                src_epsg=target_epsg,
+                is_rgb=False,
+                cmap_name=str(ndwi_spec["cmap"]),
+                vmin=float(ndwi_spec["vmin"]),
+                vmax=float(ndwi_spec["vmax"]),
+                max_width=1400,
+            )
+            extra_layers.append(
+                {
+                    "code": "S2_NDWI",
+                    "name": f"💧 Sentinel-2 NDWI ({s2_date})",
+                    "image": ndwi_u,
+                    "bounds": ndwi_b,
+                }
+            )
+            ndwi_vals = np.asarray(ndwi_da.values, dtype=np.float32)
+            fin_w = ndwi_vals[np.isfinite(ndwi_vals)]
+            syn_metrics["s2_optical_date"] = s2_date
+            syn_metrics["s2_resolution_m"] = s2_res
+            if fin_w.size > 0:
+                syn_metrics["s2_ndwi_mean"] = round(float(np.mean(fin_w)), 4)
+            del ds_s2, ds_m, ndwi_da
+            gc.collect()
+    except Exception:
+        pass
+    return extra_layers, syn_metrics
+
+
+def _execute_optical_thermal_synergy(
+    plan: dict[str, Any],
+    *,
+    base_out: dict[str, Any],
+    bbox_4326: Sequence[float],
+    target_epsg: str,
+    lang: str = "sl",
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Engine B2 — Fuse Sentinel-2 L2A (10 m RGB + NDVI) with Landsat C2 L2 Thermal (ST_B10 LST °C, 30 m).
+
+    Computes quantitative Urban Heat Island cooling delta (LST_urban - LST_veg) and Pearson r(NDVI, LST).
+    """
+    def _prog(pct: float, msg: str) -> None:
+        if progress_cb is not None:
+            progress_cb(pct, msg)
+
+    epsg_num = str(target_epsg).split(":")[-1]
+    start_s = str(plan["start_date"])
+    end_s = str(plan["end_date"])
+
+    # 1. Load clearest Landsat C2 L2 thermal scene (ST_B10 -> LST °C)
+    _prog(0.22, "Prenašam termalni posnetek Landsat (ST_B10 → LST °C)..." if lang == "sl" else "Streaming Landsat thermal scene (ST_B10 → LST °C)...")
+    ls_items, ls_df = search_scenes(
+        sensor=SENSOR_LANDSAT,
+        bbox_4326=bbox_4326,
+        start_date=start_s,
+        end_date=end_s,
+        max_cloud_cover=25.0,
+        exclude_l7_slc_off=True,
+        min_coverage_pct=70.0,
+        interval_mode=INTERVAL_ALL,
+    )
+    if not ls_items or ls_df.empty:
+        ls_items, ls_df = search_scenes(
+            sensor=SENSOR_LANDSAT,
+            bbox_4326=bbox_4326,
+            start_date=start_s,
+            end_date=end_s,
+            max_cloud_cover=50.0,
+            exclude_l7_slc_off=True,
+            min_coverage_pct=60.0,
+            interval_mode=INTERVAL_ALL,
+        )
+    if not ls_items or ls_df.empty:
+        raise RuntimeError(
+            f"Ni najdenega termalnega posnetka Landsat za {plan['place_name']} v obdobju {start_s} – {end_s}."
+            if lang == "sl"
+            else f"No Landsat thermal scene found for {plan['place_name']} between {start_s} and {end_s}."
+        )
+
+    best_ls_i = int(np.argmin(ls_df["cloud_cover"].fillna(50.0).to_numpy()))
+    ls_date = str(ls_df.iloc[best_ls_i]["date_str"])
+    ls_tile = str(ls_df.iloc[best_ls_i].get("mgrs_tile", ""))
+    ls_bands = get_required_bands_for_sensor(SENSOR_LANDSAT, "LST", include_cloud_mask=True)
+    ds_ls = load_scene(
+        sensor=SENSOR_LANDSAT,
+        item=ls_items[best_ls_i],
+        bbox_4326=bbox_4326,
+        bands=list(dict.fromkeys([*ls_bands, "B04", "B03", "B02"])),
+        target_epsg=target_epsg,
+        resolution=30,
+    )
+    ds_ls_m, _ = apply_cloud_mask(ds_ls, sensor=SENSOR_LANDSAT)
+    lst_da = compute_index(ds_ls_m, "LST")
+    lst_spec = SPECTRAL_INDICES["LST"]
+    lst_uri, lst_bnds = raster_to_map_overlay_png(
+        lst_da,
+        src_epsg=target_epsg,
+        is_rgb=False,
+        cmap_name=str(lst_spec["cmap"]),
+        vmin=float(lst_spec["vmin"]),
+        vmax=float(lst_spec["vmax"]),
+        max_width=1600,
+    )
+    lst_stats = compute_index_stats(lst_da, resolution_m=30.0)
+
+    # 2. Load clearest Sentinel-2 L2A (10 m RGB + NDVI) for crisp optical & vegetation context
+    _prog(0.55, "Prenašam visokoločljivi Sentinel-2 (10 m RGB + NDVI) za korelacijo z LST..." if lang == "sl" else "Streaming Sentinel-2 (10 m RGB + NDVI) for LST correlation...")
+    sat_uri: str | None = None
+    sat_bnds: list[list[float]] | None = None
+    extra_layers: list[dict[str, Any]] = []
+    syn_metrics: dict[str, Any] = {
+        "fusion_type": FUSION_SYNERGY_OPTICAL_THERMAL,
+        "landsat_thermal_date": ls_date,
+        "lst_mean_c": round(float(lst_stats.get("mean", 0.0)), 2),
+        "lst_min_c": round(float(lst_stats.get("min", 0.0)), 2),
+        "lst_max_c": round(float(lst_stats.get("max", 0.0)), 2),
+    }
+
+    s2_items, s2_df = search_scenes(
+        sensor=SENSOR_S2,
+        bbox_4326=bbox_4326,
+        start_date=start_s,
+        end_date=end_s,
+        max_cloud_cover=25.0,
+        min_coverage_pct=70.0,
+        interval_mode=INTERVAL_ALL,
+    )
+    if s2_items and not s2_df.empty:
+        best_s2_i = int(np.argmin(s2_df["cloud_cover"].fillna(50.0).to_numpy()))
+        s2_date = str(s2_df.iloc[best_s2_i]["date_str"])
+        s2_res = 20 if is_low_ram_cloud() else 10
+        ds_s2 = load_scene(
+            sensor=SENSOR_S2,
+            item=s2_items[best_s2_i],
+            bbox_4326=bbox_4326,
+            bands=["B04", "B03", "B02", "B08", "SCL"],
+            target_epsg=target_epsg,
+            resolution=s2_res,
+        )
+        if all(b in ds_s2.data_vars for b in ("B04", "B03", "B02")):
+            sat_uri, sat_bnds = raster_to_map_overlay_png(
+                ds_s2,
+                src_epsg=target_epsg,
+                is_rgb=True,
+                bands=["B04", "B03", "B02"],
+                use_percentile_stretch=True,
+                max_width=1600,
+            )
+        ds_s2_m, _ = apply_cloud_mask(ds_s2, sensor=SENSOR_S2)
+        ndvi_da = compute_index(ds_s2_m, "NDVI")
+        ndvi_spec = SPECTRAL_INDICES["NDVI"]
+        ndvi_u, ndvi_b = raster_to_map_overlay_png(
+            ndvi_da,
+            src_epsg=target_epsg,
+            is_rgb=False,
+            cmap_name=str(ndvi_spec["cmap"]),
+            vmin=float(ndvi_spec["vmin"]),
+            vmax=float(ndvi_spec["vmax"]),
+            max_width=1400,
+        )
+        extra_layers.append(
+            {
+                "code": "S2_NDVI",
+                "name": f"🌿 Sentinel-2 NDVI ({s2_res} m, {s2_date})",
+                "image": ndvi_u,
+                "bounds": ndvi_b,
+            }
+        )
+        syn_metrics["s2_optical_date"] = s2_date
+        syn_metrics["s2_resolution_m"] = s2_res
+
+        # Cross-sensor quantitative UHI cooling correlation (align 10 m NDVI -> 30 m LST grid)
+        try:
+            ndvi_aligned = ndvi_da.rio.reproject_match(lst_da)
+            n_arr = np.asarray(ndvi_aligned.values, dtype=np.float32)
+            t_arr = np.asarray(lst_da.values, dtype=np.float32)
+            valid = np.isfinite(n_arr) & np.isfinite(t_arr)
+            if int(np.sum(valid)) >= 25:
+                nv = n_arr[valid]
+                tv = t_arr[valid]
+                veg_mask = nv > 0.5
+                urb_mask = nv < 0.2
+                if int(np.sum(veg_mask)) >= 10:
+                    syn_metrics["lst_veg_mean_c"] = round(float(np.mean(tv[veg_mask])), 2)
+                if int(np.sum(urb_mask)) >= 10:
+                    syn_metrics["lst_urban_mean_c"] = round(float(np.mean(tv[urb_mask])), 2)
+                if "lst_veg_mean_c" in syn_metrics and "lst_urban_mean_c" in syn_metrics:
+                    syn_metrics["uhi_cooling_delta_c"] = round(
+                        float(syn_metrics["lst_urban_mean_c"] - syn_metrics["lst_veg_mean_c"]), 2
+                    )
+                if float(np.std(nv)) > 1e-5 and float(np.std(tv)) > 1e-5:
+                    r_val = float(np.corrcoef(nv, tv)[0, 1])
+                    if np.isfinite(r_val):
+                        syn_metrics["pearson_r_ndvi_lst"] = round(r_val, 3)
+            del ndvi_aligned
+        except Exception:
+            pass
+        del ds_s2, ds_s2_m, ndvi_da
+    elif all(b in ds_ls.data_vars for b in ("B04", "B03", "B02")):
+        sat_uri, sat_bnds = raster_to_map_overlay_png(
+            ds_ls,
+            src_epsg=target_epsg,
+            is_rgb=True,
+            bands=["B04", "B03", "B02"],
+            use_percentile_stretch=True,
+            max_width=1600,
+        )
+
+    tif_bytes = export_to_geotiff_bytes(lst_da, target_epsg=target_epsg)
+    tif_fname = f"AI_Fusion_LST_S2_{plan['place_name']}_{ls_date}_EPSG{epsg_num}.tif"
+    del ds_ls, ds_ls_m
+    gc.collect()
+
+    base_out.update(
+        {
+            "kind": "spectral_index",
+            "index_da": lst_da,
+            "stats": lst_stats,
+            "snow_stats": None,
+            "date_str": ls_date,
+            "sat_date_str": syn_metrics.get("s2_optical_date", ls_date),
+            "tile": ls_tile,
+            "sat_overlay_uri": sat_uri,
+            "sat_overlay_bounds": sat_bnds,
+            "analysis_overlay_uri": lst_uri,
+            "analysis_overlay_bounds": lst_bnds,
+            "extra_overlay_layers": extra_layers,
+            "synergy_metrics": syn_metrics,
+            "tif_bytes": tif_bytes,
+            "tif_filename": tif_fname,
+        }
+    )
+    base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+    base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
+    _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
+    return base_out
 
 
 def execute_ai_plan(
@@ -1790,6 +2550,19 @@ def execute_ai_plan(
             discrete_rgba_map=build_slippy_rgba_map(dt_k),
             max_width=1800,
         )
+        extra_syn_layers: list[dict[str, Any]] = []
+        syn_metrics_dis: dict[str, Any] = {}
+        if str(plan.get("fusion_mode") or "") == FUSION_SYNERGY_SAR_OPTICAL:
+            _prog(0.92, "Dodajam najbližji jasen optični posnetek Sentinel-2 (RGB + NDWI)..." if lang == "sl" else "Attaching nearest clear Sentinel-2 optical scene (RGB + NDWI)...")
+            extra_syn_layers, syn_metrics_dis = _attach_sar_optical_synergy(
+                bbox_4326=bbox_4326,
+                ref_date=ev_date,
+                target_epsg=target_epsg,
+                lang=lang,
+            )
+            syn_metrics_dis["sar_event_date"] = str(dis_out.get("date_event", ""))
+            syn_metrics_dis["affected_area_ha"] = round(float((dis_out.get("summary") or {}).get("affected_area_ha", 0.0)), 2)
+
         base_out.update(
             {
                 "kind": "disaster",
@@ -1801,6 +2574,8 @@ def execute_ai_plan(
                 "sat_date_str": str(dis_out.get("date_event", "")),
                 "analysis_overlay_uri": analysis_uri,
                 "analysis_overlay_bounds": analysis_bnds,
+                "extra_overlay_layers": extra_syn_layers,
+                "synergy_metrics": syn_metrics_dis,
                 "tif_bytes": dis_out["tif_bytes"],
                 "tif_filename": dis_out["tif_filename"],
             }
@@ -1966,7 +2741,18 @@ def execute_ai_plan(
         return base_out
 
     # --- F. Multi-Temporal Time Series (+ Multi-Date Intermediate Frames, Swipe Map & Timelapse GIF) ---
-    if task in ("time_series", "time_series_and_comparison"):
+    if task in ("time_series", "time_series_and_comparison") or (
+        task == "change_comparison" and str(plan.get("fusion_mode") or "") == FUSION_TEMPORAL_LANDSAT_S2
+    ):
+        if str(plan.get("fusion_mode") or "") == FUSION_TEMPORAL_LANDSAT_S2:
+            return execute_temporal_fusion(
+                plan,
+                base_out=base_out,
+                bbox_4326=bbox_4326,
+                target_epsg=target_epsg,
+                lang=lang,
+                progress_cb=progress_cb,
+            )
         adaptive_interval = choose_adaptive_interval(
             plan["start_date"],
             plan["end_date"],
@@ -2226,6 +3012,16 @@ def execute_ai_plan(
         return base_out
 
     # --- G. Single-Date Spectral Index (incl. NDSI+DEM Snowline & LST °C) or RGB Scene ---
+    if str(plan.get("fusion_mode") or "") == FUSION_SYNERGY_OPTICAL_THERMAL:
+        return _execute_optical_thermal_synergy(
+            plan,
+            base_out=base_out,
+            bbox_4326=bbox_4326,
+            target_epsg=target_epsg,
+            lang=lang,
+            progress_cb=progress_cb,
+        )
+
     _prog(0.22, "Iščem najčistejši satelitski posnetek..." if lang == "sl" else "Searching for the clearest satellite scene...")
     max_cc = 100.0 if sensor == SENSOR_S1 else 20.0
     items, df = search_scenes(
@@ -2358,16 +3154,55 @@ def execute_ai_plan(
                         del c_da
                 except Exception:
                     pass
-            if plan["index_name"] == "NDSI":
+            synergy_metrics_sp: dict[str, Any] = {}
+            if plan["index_name"] == "NDSI" or str(plan.get("fusion_mode") or "") == FUSION_SYNERGY_OPTICAL_DEM:
                 try:
                     dem_sn = load_copernicus_dem(bbox_4326=bbox_4326, target_epsg=target_epsg, resolution=30.0)
-                    _, sn_dict = compute_snow_glacier_stats(ds_masked, dem_da=dem_sn, resolution_m=float(res_m))
-                    snow_stats = {
-                        k: (None if isinstance(v, float) and not np.isfinite(v) else v)
-                        for k, v in sn_dict.items()
+                    dem_deriv = compute_terrain_derivatives(dem_sn)
+                    d_st = dem_deriv["stats"]
+                    synergy_metrics_sp = {
+                        "fusion_type": FUSION_SYNERGY_OPTICAL_DEM,
+                        "dem_min_m": round(float(d_st.get("min_h", 0.0)), 1),
+                        "dem_mean_m": round(float(d_st.get("mean_h", 0.0)), 1),
+                        "dem_max_m": round(float(d_st.get("max_h", 0.0)), 1),
+                        "dem_mean_slope_deg": round(float(d_st.get("mean_slope", 0.0)), 1),
                     }
+                    hs_u, hs_b = raster_to_map_overlay_png(
+                        dem_deriv["hillshade"],
+                        src_epsg=target_epsg,
+                        is_rgb=False,
+                        cmap_name="Greys_r",
+                        vmin=0.0,
+                        vmax=255.0,
+                        max_width=1400,
+                    )
+                    extra_overlay_layers.append(
+                        {"code": "DEM_HS", "name": "🏔️ Copernicus DEM Hillshade (30 m)", "image": hs_u, "bounds": hs_b}
+                    )
+                    if plan["index_name"] == "NDSI":
+                        _, sn_dict = compute_snow_glacier_stats(ds_masked, dem_da=dem_sn, resolution_m=float(res_m))
+                        snow_stats = {
+                            k: (None if isinstance(v, float) and not np.isfinite(v) else v)
+                            for k, v in sn_dict.items()
+                        }
+                        if snow_stats.get("snowline_m") is not None:
+                            synergy_metrics_sp["snowline_m"] = snow_stats["snowline_m"]
                 except Exception:
                     snow_stats = None
+        if sensor == SENSOR_S1:
+            extra_overlay_layers = []
+            synergy_metrics_sp = {}
+            if str(plan.get("fusion_mode") or "") == FUSION_SYNERGY_SAR_OPTICAL:
+                try:
+                    ref_d = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                except Exception:
+                    ref_d = date.today()
+                extra_overlay_layers, synergy_metrics_sp = _attach_sar_optical_synergy(
+                    bbox_4326=bbox_4326,
+                    ref_date=ref_d,
+                    target_epsg=target_epsg,
+                    lang=lang,
+                )
 
         idx_key = str(plan["index_name"])
         spec_ai = (
@@ -2401,7 +3236,8 @@ def execute_ai_plan(
                 "sat_overlay_bounds": sat_bnds,
                 "analysis_overlay_uri": analysis_uri,
                 "analysis_overlay_bounds": analysis_bnds,
-                "extra_overlay_layers": extra_overlay_layers if sensor != SENSOR_S1 else [],
+                "extra_overlay_layers": extra_overlay_layers,
+                "synergy_metrics": synergy_metrics_sp,
                 "tif_bytes": tif_bytes,
                 "tif_filename": tif_fname,
             }
@@ -2565,6 +3401,10 @@ Return STRICT JSON ONLY (no markdown fences) with this exact schema:
     "lon": number | null (exact WGS84 longitude whenever you know the landmark/place, e.g. -97.1561 for SpaceX Starbase, 14.5058 for Ljubljana),
     "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
     "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
+    "sensors": ["sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc" | "cop-dem-glo-30"],
+    "fusion_mode": "single" | "temporal_landsat_s2" | "synergy_sar_optical" | "synergy_optical_thermal" | "synergy_optical_dem",
+    "fusion_rationale_sl": string (why these satellite systems were combined, empty if single),
+    "fusion_rationale_en": string (why these satellite systems were combined, empty if single),
     "task_type": "scene_rgb" | "spectral_index" | "cloud_free_composite" | "time_series" | "time_series_and_comparison" | "change_comparison" | "disaster_flood" | "disaster_fire" | "disaster_forest" | "terrain_dem" | "gnss_plan",
     "include_comparison": boolean (true whenever user asks about spatial growth, expansion, shrinking, construction, deforestation, glacier retreat, or change over the years),
     "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "NDSI" | "LST" | "VV",
@@ -3289,6 +4129,9 @@ def _route_user_message_local(
             "action": "run_analysis",
             "intent": "run_analysis",
             "plan": plan,
+            "fusion_mode": plan.get("fusion_mode", FUSION_SINGLE),
+            "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_S2)]),
+            "fusion_rationale": plan.get("fusion_rationale_en" if lang == "en" else "fusion_rationale_sl", ""),
             "layout_overrides": None,
             "target_layer": "latest_ai",
             "reset_layout": False,
@@ -3395,7 +4238,7 @@ def route_user_message(
                 ):
                     raw_pl["task_type"] = "time_series_and_comparison"
                     raw_pl["include_comparison"] = True
-                plan = validate_and_normalize_plan(raw_pl, engine="gemini")
+                plan = validate_and_normalize_plan(raw_pl, engine="gemini", query=message)
                 plan["gemini_model"] = used_model
                 plan["fallback_note_sl"] = fb_sl
                 plan["fallback_note_en"] = fb_en
@@ -3403,6 +4246,9 @@ def route_user_message(
                     "action": "run_analysis",
                     "intent": "run_analysis",
                     "plan": plan,
+                    "fusion_mode": plan.get("fusion_mode", FUSION_SINGLE),
+                    "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_S2)]),
+                    "fusion_rationale": plan.get("fusion_rationale_en" if lang == "en" else "fusion_rationale_sl", ""),
                     "layout_overrides": None,
                     "target_layer": "latest_ai",
                     "reset_layout": False,
@@ -3814,6 +4660,80 @@ def _generate_local_conversational_reply(
     return "\n\n".join(parts)
 
 
+def _format_fusion_rationale_section(analysis_context: dict[str, Any] | None, lang: str = "sl") -> str:
+    """Format a clear, educational Markdown subsection explaining why multiple satellite systems were combined."""
+    if not isinstance(analysis_context, dict):
+        return ""
+    f_mode = str(analysis_context.get("fusion_mode") or FUSION_SINGLE)
+    if f_mode == FUSION_SINGLE:
+        return ""
+
+    rationale = str(
+        analysis_context.get("fusion_rationale_en" if lang == "en" else "fusion_rationale_sl") or ""
+    ).strip()
+    syn = analysis_context.get("synergy_metrics") if isinstance(analysis_context.get("synergy_metrics"), dict) else {}
+
+    extra_bullets: list[str] = []
+    if f_mode == FUSION_TEMPORAL_LANDSAT_S2:
+        n_ls = syn.get("landsat_obs")
+        n_s2 = syn.get("sentinel2_obs")
+        if n_ls is not None and n_s2 is not None:
+            extra_bullets.append(
+                f"- **Število uporabljenih posnetkov:** `{n_ls}` zgodovinskih posnetkov Landsat (30 m) + `{n_s2}` sodobnih posnetkov Sentinel-2 (10–20 m)."
+                if lang == "sl"
+                else f"- **Harmonized observations:** `{n_ls}` historical Landsat (30 m) scenes + `{n_s2}` modern Sentinel-2 (10–20 m) scenes."
+            )
+        extra_bullets.append(
+            "- **Znanstveno opozorilo (opomba k fuziji):** Zaradi razlike v prostorski ločljivosti (30 m vs. 10–20 m) in manjših razlik v spektralnih pasovih senzorjev OLI/TM in MSI sta rastrski mreži za karto sprememb Δ samodejno usklajeni v isti metrični projekciji."
+            if lang == "sl"
+            else "- **Scientific caveat:** Due to pixel-size differences (30 m vs. 10–20 m) and slight spectral bandpass differences between Landsat OLI/TM and Sentinel-2 MSI, grids are co-registered in the same metric projection for pixel-wise Δ maps."
+        )
+    elif f_mode == FUSION_SYNERGY_OPTICAL_THERMAL:
+        if syn.get("lst_urban_mean_c") is not None and syn.get("lst_veg_mean_c") is not None:
+            delta_c = syn.get("uhi_cooling_delta_c", round(syn["lst_urban_mean_c"] - syn["lst_veg_mean_c"], 2))
+            extra_bullets.append(
+                f"- **Kvantitativni učinek toplotnega otoka (UHI):** Povprečna temperatura pozidanih/golih površin (`NDVI < 0,2`) znaša **{syn['lst_urban_mean_c']:.1f} °C**, v gostih parkih/gozdovih (`NDVI > 0,5`) pa **{syn['lst_veg_mean_c']:.1f} °C** → hladilni učinek vegetacije: **−{abs(delta_c):.1f} °C**."
+                if lang == "sl"
+                else f"- **Quantitative Urban Heat Island (UHI) cooling:** Built-up/bare areas (`NDVI < 0.2`) average **{syn['lst_urban_mean_c']:.1f} °C** vs. dense vegetation/parks (`NDVI > 0.5`) at **{syn['lst_veg_mean_c']:.1f} °C** → vegetation cooling effect: **−{abs(delta_c):.1f} °C**."
+            )
+        if syn.get("pearson_r_ndvi_lst") is not None:
+            extra_bullets.append(
+                f"- **Korelacija NDVI ↔ LST:** Pearsonov koeficient `r = {syn['pearson_r_ndvi_lst']:+.3f}`."
+                if lang == "sl"
+                else f"- **NDVI ↔ LST correlation:** Pearson `r = {syn['pearson_r_ndvi_lst']:+.3f}`."
+            )
+        extra_bullets.append(
+            "- **Znanstveno opozorilo:** Termalni kanal Landsat `ST_B10` ima 30 m (izvorno 100 m) ločljivost, medtem ko Sentinel-2 zagotavlja 10 m optični kontekst; za statistično korelacijo je NDVI prevzorčen na termalno mrežo."
+            if lang == "sl"
+            else "- **Scientific caveat:** Landsat `ST_B10` thermal imagery is provided at 30 m (native 100 m TIR) while Sentinel-2 provides 10 m optical detail; NDVI is aligned to the 30 m thermal grid for correlation."
+        )
+    elif f_mode == FUSION_SYNERGY_SAR_OPTICAL:
+        if syn.get("s2_optical_date"):
+            extra_bullets.append(
+                f"- **Optični kontekst:** Na isto karto je dodan najbližji jasen posnetek Sentinel-2 L2A z dne `{syn['s2_optical_date']}` (RGB + NDWI)."
+                if lang == "sl"
+                else f"- **Optical context:** Paired with the nearest clear Sentinel-2 L2A scene from `{syn['s2_optical_date']}` (RGB + NDWI) on the same map."
+            )
+    elif f_mode == FUSION_SYNERGY_OPTICAL_DEM:
+        if syn.get("dem_mean_m") is not None:
+            extra_bullets.append(
+                f"- **Reliefni kontekst (Copernicus DEM 30 m):** Nadmorska višina `{syn.get('dem_min_m')}–{syn.get('dem_max_m')} m` (povprečje `{syn.get('dem_mean_m')} m`), povprečni naklon `{syn.get('dem_mean_slope_deg')}°`."
+                if lang == "sl"
+                else f"- **Terrain context (Copernicus DEM 30 m):** Elevation `{syn.get('dem_min_m')}–{syn.get('dem_max_m')} m` (mean `{syn.get('dem_mean_m')} m`), mean slope `{syn.get('dem_mean_slope_deg')}°`."
+            )
+
+    heading = (
+        "### 🛰️ Zakaj je bila uporabljena kombinacija več satelitskih sistemov"
+        if lang == "sl"
+        else "### 🛰️ Why Multiple Satellite Systems Were Combined"
+    )
+    body_lines = [heading, "", rationale]
+    if extra_bullets:
+        body_lines.append("")
+        body_lines.extend(extra_bullets)
+    return "\n\n" + "\n".join(body_lines)
+
+
 def generate_conversational_reply(
     user_message: str,
     chat_history: Sequence[dict[str, Any]] | None = None,
@@ -3827,6 +4747,10 @@ def generate_conversational_reply(
     """Generate a rich, thorough, non-truncated multi-turn conversational geodetic EO reply."""
     resolved_key, _ = get_active_gemini_api_key(api_key)
     lang_name = "Slovenian" if lang == "sl" else "English"
+    is_multi_sensor = bool(
+        isinstance(analysis_context, dict)
+        and str(analysis_context.get("fusion_mode") or FUSION_SINGLE) != FUSION_SINGLE
+    )
 
     if resolved_key:
         if is_post_analysis and isinstance(analysis_context, dict) and analysis_context.get("kind") == "carto_map":
@@ -3839,15 +4763,26 @@ def generate_conversational_reply(
                 f"and warmly invite the user to ask for any further layout tweaks in natural language (e.g., moving elements, switching theme, changing grid spacing, or adding a caption)."
             )
         elif is_post_analysis:
+            fusion_instruction = (
+                "\n- **MANDATORY MULTI-SENSOR SUBSECTION**: Because `fusion_mode != 'single'`, you MUST include a dedicated subsection titled "
+                + (
+                    "**🛰️ Zakaj je bila uporabljena kombinacija več satelitskih sistemov**"
+                    if lang == "sl"
+                    else "**🛰️ Why Multiple Satellite Systems Were Combined**"
+                )
+                + " clearly explaining which satellite systems were fused, WHY each was chosen (e.g., Landsat 30 m for pre-2017 history + Sentinel-2 10–20 m for 2017+, Sentinel-1 SAR penetrating clouds + Sentinel-2 optical RGB/NDWI, or Sentinel-2 10 m optical + Landsat ST_B10 LST °C for Urban Heat Island cooling), all quantitative cross-sensor metrics from `synergy_metrics`, and honest scientific caveats (pixel size / bandpass differences)."
+                if is_multi_sensor
+                else ""
+            )
             sys_prompt = (
                 f"You are an expert, insightful Geodetic & Remote Sensing (Earth Observation) AI specialist. "
                 f"Write a thorough, complete, well-structured report in clear, natural {lang_name} using clean Markdown.\n"
                 f"A real geodetic / satellite analysis was JUST executed for the user's request. Exact computed results are provided in JSON below.\n"
                 f"Organize your response into these 4 clear sections (with crisp headings in {lang_name}):\n"
                 f"1. **Ozadje dogodka in območja** (or Background & Geographic Context in EN): Concise, insightful geographic/historical context about the analyzed place or event (e.g., Mežiška dolina / Črna na Koroškem during the catastrophic August 2023 floods, Kras karst terrain during July 2022 wildfires, Triglav alpine glaciology, etc.).\n"
-                f"2. **Metodologija in podatki** (Methodology & Data): Exact sensor/dataset used, WHY it was chosen (e.g., Sentinel-1 SAR radar penetrates storm clouds; Sentinel-2 10 m optical; Landsat thermal ST_B10; Copernicus DEM 30 m; GNSS multi-constellation with 360° DEM+S2 obstruction mask), exact acquisition dates, spatial resolution, and projected metric CRS (`EPSG:3794` / local UTM).\n"
-                f"3. **Podrobna interpretacija rezultatov** (Detailed Interpretation of Results): Thoroughly explain EVERY key computed number from the JSON (`ha`, `km²`, `%`, min/mean/median/max, severity classes, snowline altitude, slope/relief, or PDOP/satellite visibility & optimal windows), what those values physically mean on the ground, AND important scientific limitations/caveats (for example, SAR layover/foreshortening/shadow in steep narrow valleys like Koroška can underestimate flooded area in deep gorges, or cloud/phenology effects in optical indices). NEVER invent numbers not present in the JSON.\n"
-                f"4. **Predlogi za nadaljevanje** (Suggested Next Steps): 2–3 concrete follow-up analyses or questions the user can ask next in this chat (e.g., comparing with another period, running a multi-year time series, generating a Copernicus DEM terrain profile, or planning a GNSS survey)."
+                f"2. **Metodologija in podatki** (Methodology & Data): Exact sensor/dataset used, WHY it was chosen (e.g., Sentinel-1 SAR radar penetrates storm clouds; Sentinel-2 10 m optical; Landsat thermal ST_B10; Copernicus DEM 30 m; GNSS multi-constellation with 360° DEM+S2 obstruction mask), exact acquisition dates, spatial resolution, and projected metric CRS (`EPSG:3794` / local UTM).{fusion_instruction}\n"
+                f"3. **Podrobna interpretacija rezultatov** (Detailed Interpretation of Results): Thoroughly explain EVERY key computed number from the JSON (`ha`, `km²`, `%`, min/mean/median/max, severity classes, snowline altitude, slope/relief, UHI cooling delta °C, or PDOP/satellite visibility & optimal windows), what those values physically mean on the ground, AND important scientific limitations/caveats. NEVER invent numbers not present in the JSON.\n"
+                f"4. **Predlogi za nadaljevanje** (Suggested Next Steps): 2–3 concrete follow-up analyses or questions the user can ask next in this chat."
             )
         else:
             sys_prompt = (
@@ -3901,13 +4836,16 @@ def generate_conversational_reply(
         except Exception:
             pass
 
+    local_txt = _generate_local_conversational_reply(
+        user_message=user_message,
+        analysis_context=analysis_context,
+        lang=lang,
+        is_post_analysis=is_post_analysis,
+    )
+    if is_post_analysis and is_multi_sensor:
+        local_txt = local_txt + _format_fusion_rationale_section(analysis_context, lang=lang)
     return {
-        "text": _generate_local_conversational_reply(
-            user_message=user_message,
-            analysis_context=analysis_context,
-            lang=lang,
-            is_post_analysis=is_post_analysis,
-        ),
+        "text": local_txt,
         "engine": "local",
         "gemini_model": None,
         "fallback_note_sl": "",

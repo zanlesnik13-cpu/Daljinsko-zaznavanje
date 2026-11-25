@@ -572,6 +572,75 @@ def compute_change_summary(
     }
 
 
+def align_and_compute_delta(
+    da_t1: xr.DataArray,
+    da_t2: xr.DataArray,
+    *,
+    target_epsg: int | str = "EPSG:3794",
+    index_name: str = "NDVI",
+    threshold: float = 0.15,
+    max_width: int = 1200,
+) -> dict[str, Any]:
+    """Align two metric-CRS DataArrays of potentially different resolutions (e.g. 30 m Landsat & 10 m S2)
+    and compute pixel-wise ``Δ = t2 - t1``, area statistics, and a diverging RGBA overlay.
+    """
+    ref_da = da_t1
+    other_da = da_t2
+
+    # Ensure both arrays carry CRS metadata for rioxarray reproject_match
+    if ref_da.rio.crs is None:
+        ref_da = ref_da.rio.write_crs(target_epsg, inplace=False)
+    if other_da.rio.crs is None:
+        other_da = other_da.rio.write_crs(target_epsg, inplace=False)
+
+    if not _grids_match(ref_da, other_da):
+        other_aligned = other_da.rio.reproject_match(ref_da, resampling=Resampling.bilinear)
+    else:
+        other_aligned = other_da
+
+    diff_vals = (
+        np.asarray(other_aligned.values, dtype=np.float32)
+        - np.asarray(ref_da.values, dtype=np.float32)
+    )
+    diff_da = xr.DataArray(
+        diff_vals,
+        dims=ref_da.dims,
+        coords=ref_da.coords,
+        name=f"Delta_{str(index_name or 'IDX').upper()}",
+    )
+    diff_da = diff_da.rio.write_crs(ref_da.rio.crs, inplace=False)
+    diff_da = diff_da.rio.write_nodata(np.nan, inplace=False)
+
+    # Infer exact metric pixel resolution from reference x coordinates
+    x_vals = np.asarray(ref_da.coords["x"].values, dtype=np.float64)
+    if x_vals.size >= 2:
+        aligned_res_m = float(abs(x_vals[1] - x_vals[0]))
+    else:
+        aligned_res_m = 30.0
+
+    ch_summary = compute_change_summary(
+        diff_da,
+        resolution_m=aligned_res_m,
+        threshold=float(threshold),
+    )
+    delta_uri, delta_bnds, delta_vmin, delta_vmax, delta_cmap = render_diverging_change_overlay(
+        diff_da,
+        src_epsg=target_epsg,
+        index_name=str(index_name or "NDVI").upper(),
+        max_width=max_width,
+    )
+    return {
+        "diff_da": diff_da,
+        "change_summary": ch_summary,
+        "delta_overlay_uri": delta_uri,
+        "delta_overlay_bounds": delta_bnds,
+        "delta_vmin": delta_vmin,
+        "delta_vmax": delta_vmax,
+        "delta_cmap": delta_cmap,
+        "aligned_resolution_m": round(aligned_res_m, 2),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Visual Timelapse (PIL + Animated GIF) & Before/After Swipe Frame Rendering
 # ---------------------------------------------------------------------------
@@ -1595,6 +1664,8 @@ def build_multidate_visual_frames(
 
         plat_raw = str(ds_ep.attrs.get("platform") or fb_info.get("platform") or "")
         plat_lbl = _format_platform_stamp(plat_raw, sensor)
+        res_int = int(round(float(resolution)))
+        plat_banner = f"{plat_lbl} ({res_int} m)"
         y_coords = np.asarray(ds_ep.coords["y"].values, dtype=np.float64)
 
         # 1. True Color RGB overlay & date-stamped PNG (always for optical sensors)
@@ -1616,7 +1687,7 @@ def build_multidate_visual_frames(
                 pil_rgb = _resize_pil_frame(pil_rgb, max_width=max_thumb_width, target_size=target_size)
                 if target_size is None:
                     target_size = pil_rgb.size
-                pil_rgb_stamped = _stamp_banner_on_pil(pil_rgb, f"{act_date} | {plat_lbl} | RGB")
+                pil_rgb_stamped = _stamp_banner_on_pil(pil_rgb, f"{act_date} | {plat_banner} | RGB")
                 rgb_png = pil_to_png_bytes(pil_rgb_stamped)
                 del rgb_u8, pil_rgb, pil_rgb_stamped
             except Exception as exc:
@@ -1748,12 +1819,19 @@ def build_multidate_visual_frames(
         gc.collect()
 
         if rgb_uri or idx_uri:
+            sensor_fam = (
+                "Landsat (30 m)"
+                if sensor == SENSOR_LANDSAT
+                else ("Sentinel-1 SAR" if sensor == SENSOR_S1 else "Sentinel-2 (10–20 m)")
+            )
             frames.append(
                 {
                     "date": act_date,
                     "requested_date": str(d_lbl),
                     "sensor": sensor,
+                    "sensor_family": sensor_fam,
                     "platform": plat_lbl,
+                    "resolution_m": res_int,
                     "clear_pct": round(float(clear_pct), 1),
                     "index_name": idx_key,
                     "index_mean": idx_mean,

@@ -967,6 +967,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_turn_edit_cancel": "Prekliči",
         "ai_chat_show_all_turns": "Prikaži vse pogovore ({n} starejših skritih)",
         "ai_chat_map_badge": "Karta",
+        "ai_fusion_badge_temporal": "🛰️ Fuzija: Landsat + Sentinel-2",
+        "ai_fusion_badge_sar_opt": "🛰️ Fuzija: Sentinel-1 SAR + Sentinel-2",
+        "ai_fusion_badge_opt_thm": "🛰️ Fuzija: Sentinel-2 + Landsat Thermal",
+        "ai_fusion_badge_opt_dem": "🛰️ Fuzija: Optika + Copernicus DEM",
+        "ai_fusion_transition_2017": "Prehod Landsat → Sentinel-2",
+        "ai_uhi_lst_urban": "🏙️ LST (pozidano/golo)",
+        "ai_uhi_lst_veg": "🌳 LST (parki/gozd)",
+        "ai_uhi_cooling": "❄️ Hladilni učinek vegetacije",
+        "ai_uhi_corr": "📈 Korelacija NDVI ↔ LST",
     },
     "en": {
         # App chrome & header
@@ -1930,6 +1939,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_turn_edit_cancel": "Cancel",
         "ai_chat_show_all_turns": "Show all turns ({n} older collapsed)",
         "ai_chat_map_badge": "Map",
+        "ai_fusion_badge_temporal": "🛰️ Fusion: Landsat + Sentinel-2",
+        "ai_fusion_badge_sar_opt": "🛰️ Fusion: Sentinel-1 SAR + Sentinel-2",
+        "ai_fusion_badge_opt_thm": "🛰️ Fusion: Sentinel-2 + Landsat Thermal",
+        "ai_fusion_badge_opt_dem": "🛰️ Fusion: Optical + Copernicus DEM",
+        "ai_fusion_transition_2017": "Landsat → Sentinel-2 transition",
+        "ai_uhi_lst_urban": "🏙️ LST (built-up/bare)",
+        "ai_uhi_lst_veg": "🌳 LST (parks/forest)",
+        "ai_uhi_cooling": "❄️ Vegetation cooling effect",
+        "ai_uhi_corr": "📈 NDVI ↔ LST correlation",
     },
 }
 
