@@ -7996,6 +7996,12 @@ def main() -> None:
     _init_session_state()
     github_restore_all_on_startup()
 
+    # Apply any queued widget-bound state updates strictly BEFORE any sidebar/workspace widgets instantiate
+    pending_w_state = st.session_state.pop("_pending_widget_state", None)
+    if isinstance(pending_w_state, dict):
+        for _wk, _wv in pending_w_state.items():
+            st.session_state[_wk] = _wv
+
     pending_prof = st.session_state.pop("_auth_pending_profile", None)
     if isinstance(pending_prof, dict):
         _apply_user_profile_prefs_to_session(pending_prof)
@@ -11215,16 +11221,25 @@ def main() -> None:
                         st.session_state["tab6_ai_result"] = ai_out
                         st.session_state["tab6_sent_to_carto"] = False
 
-                        # Sinhroniziraj geokodiran AOI & lokalni auto-UTM CRS v globalno sejo
+                        # Sinhroniziraj geokodiran AOI & lokalni auto-UTM CRS (brez pisanja v že ustvarjene widget ključe!)
                         st.session_state["map_lat"] = round(float(ai_out["lat"]), 6)
                         st.session_state["map_lon"] = round(float(ai_out["lon"]), 6)
                         st.session_state["map_radius_m"] = int(parsed_plan["radius_m"])
-                        st.session_state["ws1_map_radius_slider"] = int(parsed_plan["radius_m"])
                         st.session_state["active_location_label"] = str(
                             ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""
                         )
-                        if not is_in_slovenia(float(ai_out["lat"]), float(ai_out["lon"])):
-                            st.session_state["sidebar_crs_mode"] = "auto"
+                        st.session_state["active_epsg"] = str(ai_out.get("crs") or "")
+                        st.session_state["active_crs_label"] = format_crs_label(
+                            str(ai_out.get("crs") or CRS_D96TM), short=True
+                        )
+                        pending_w = dict(st.session_state.get("_pending_widget_state") or {})
+                        pending_w["ws1_map_radius_slider"] = int(parsed_plan["radius_m"])
+                        if (
+                            not is_in_slovenia(float(ai_out["lat"]), float(ai_out["lon"]))
+                            and str(st.session_state.get("sidebar_crs_mode", "auto")) != "auto"
+                        ):
+                            pending_w["sidebar_crs_mode"] = "auto"
+                        st.session_state["_pending_widget_state"] = pending_w
 
                         fb_note_str = (
                             reply_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")
