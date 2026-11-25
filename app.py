@@ -6694,6 +6694,47 @@ def _snapshot_active_thread_to_store(username: str | None, *, sync_cloud: bool =
             st.session_state["ai_chat_threads"] = saved
 
 
+def _bump_ws5_scroll_nonce() -> None:
+    """Increment one-shot scroll nonce so Workspace 5 smoothly scrolls to the latest turn once."""
+    st.session_state["_ws5_scroll_nonce"] = int(st.session_state.get("_ws5_scroll_nonce", 0)) + 1
+
+
+def get_turn_expanded_state(
+    expanded_map: dict[str, bool] | None,
+    thread_id: str,
+    turn_idx: int,
+    total_turns: int,
+    *,
+    keep_expanded: int = KEEP_EXPANDED_TURNS,
+) -> bool:
+    """Return whether a given Q&A turn should render expanded (defaults: latest 2 True, older False)."""
+    key = f"{thread_id}_{int(turn_idx)}"
+    if isinstance(expanded_map, dict) and key in expanded_map:
+        return bool(expanded_map[key])
+    return int(turn_idx) >= max(0, int(total_turns) - int(keep_expanded))
+
+
+def toggle_turn_expanded_state(
+    expanded_map: dict[str, bool] | None,
+    thread_id: str,
+    turn_idx: int,
+    total_turns: int,
+    *,
+    keep_expanded: int = KEEP_EXPANDED_TURNS,
+) -> dict[str, bool]:
+    """Return an updated copy of ``expanded_map`` with the specified turn manually toggled."""
+    updated = dict(expanded_map or {})
+    cur_val = get_turn_expanded_state(
+        updated,
+        thread_id,
+        turn_idx,
+        total_turns,
+        keep_expanded=keep_expanded,
+    )
+    updated[f"{thread_id}_{int(turn_idx)}"] = not cur_val
+    return updated
+
+
 def _activate_ai_chat_thread(thread_id: str, username: str | None) -> None:
     """Switch active conversation to ``thread_id``, restoring in-session visuals instantaneously when cached."""
     _snapshot_active_thread_to_store(username, sync_cloud=False)
@@ -6724,11 +6765,14 @@ def _activate_ai_chat_thread(thread_id: str, username: str | None) -> None:
     st.session_state["ai_pending_rerun_turn"] = None
     st.session_state["ai_editing_turn_idx"] = None
     st.session_state["ai_show_all_turns"] = False
+    if target.get("messages"):
+        _bump_ws5_scroll_nonce()
 
 
 def _start_new_ai_chat_thread(username: str | None) -> None:
     """Create and activate a fresh empty chat thread WITHOUT deleting the current conversation."""
-    _snapshot_active_thread_to_store(username, sync_cloud=False)
+    has_active_msgs = bool(st.session_state.get("ai_chat_messages"))
+    _snapshot_active_thread_to_store(username, sync_cloud=bool(username and has_active_msgs))
     threads: list[dict[str, Any]] = list(st.session_state.get("ai_chat_threads") or [])
     # Reuse an existing empty draft at the top if present so clicking 'New chat' twice doesn't spam drafts
     existing_empty = next((th for th in threads if not th.get("messages")), None)
@@ -6746,23 +6790,32 @@ def _render_ai_chat_turn(
     *,
     target_crs: str,
     lang: str,
+    thread_id: str = "",
+    total_turns: int = 1,
+    is_expanded: bool = True,
+    chat_results: dict[str, Any] | None = None,
 ) -> None:
-    """Render a single AI Q&A turn with inline Edit & Resend controls on the user message."""
+    """Render a single AI Q&A turn with inline Edit, Resend, and manual Collapse/Expand controls."""
     t_idx = int(turn.get("turn_idx", 0))
     user_msg = turn.get("user_msg")
     user_msg_idx = turn.get("user_msg_idx")
     asst_msg = turn.get("assistant_msg")
+    has_asst = isinstance(asst_msg, dict)
 
     if isinstance(user_msg, dict):
         user_text = str(user_msg.get("content") or "")
         with st.chat_message("user"):
             st.markdown(user_text)
             if user_msg_idx is not None:
-                _sp_u, col_edit, col_resend = st.columns([6.4, 1.3, 1.3], gap="small")
+                if has_asst:
+                    _sp_u, col_edit, col_resend, col_tog = st.columns([4.6, 1.25, 1.25, 1.9], gap="small")
+                else:
+                    _sp_u, col_edit, col_resend = st.columns([6.4, 1.3, 1.3], gap="small")
+                    col_tog = None
                 with col_edit:
                     if st.button(
                         t("ai_turn_edit_btn", lang=lang),
-                        key=f"edit_btn_{t_idx}",
+                        key=f"edit_btn_{thread_id}_{t_idx}",
                         width="stretch",
                     ):
                         st.session_state["ai_editing_turn_idx"] = t_idx
@@ -6770,7 +6823,7 @@ def _render_ai_chat_turn(
                 with col_resend:
                     if st.button(
                         t("ai_turn_resend_btn", lang=lang),
-                        key=f"resend_btn_{t_idx}",
+                        key=f"resend_btn_{thread_id}_{t_idx}",
                         width="stretch",
                     ):
                         st.session_state["ai_editing_turn_idx"] = None
@@ -6779,12 +6832,32 @@ def _render_ai_chat_turn(
                             "prompt": user_text,
                         }
                         st.rerun()
+                if col_tog is not None:
+                    with col_tog:
+                        tog_lbl = (
+                            t("ai_turn_collapse_btn", lang=lang)
+                            if is_expanded
+                            else t("ai_turn_expand_btn", lang=lang)
+                        )
+                        if st.button(
+                            tog_lbl,
+                            key=f"tog_turn_btn_{thread_id}_{t_idx}",
+                            width="stretch",
+                        ):
+                            cur_map = st.session_state.get("ws5_turn_expanded") or {}
+                            st.session_state["ws5_turn_expanded"] = toggle_turn_expanded_state(
+                                cur_map,
+                                thread_id,
+                                t_idx,
+                                total_turns,
+                            )
+                            st.rerun()
 
                 if st.session_state.get("ai_editing_turn_idx") == t_idx:
                     edited_val = st.text_area(
                         t("ai_turn_edit_label", lang=lang),
                         value=user_text,
-                        key=f"edit_ta_{t_idx}",
+                        key=f"edit_ta_{thread_id}_{t_idx}",
                         height=90,
                     )
                     ec_send, ec_cancel, _ec_sp = st.columns([2.2, 1.3, 4.5], gap="small")
@@ -6792,7 +6865,7 @@ def _render_ai_chat_turn(
                         if st.button(
                             t("ai_turn_edit_send", lang=lang),
                             type="primary",
-                            key=f"edit_submit_{t_idx}",
+                            key=f"edit_submit_{thread_id}_{t_idx}",
                             width="stretch",
                         ):
                             clean_ed = str(edited_val or "").strip()
@@ -6806,25 +6879,34 @@ def _render_ai_chat_turn(
                     with ec_cancel:
                         if st.button(
                             t("ai_turn_edit_cancel", lang=lang),
-                            key=f"edit_cancel_{t_idx}",
+                            key=f"edit_cancel_{thread_id}_{t_idx}",
                             width="stretch",
                         ):
                             st.session_state["ai_editing_turn_idx"] = None
                             st.rerun()
 
-    if isinstance(asst_msg, dict):
-        with st.chat_message("assistant"):
-            st.markdown(str(asst_msg.get("content") or ""))
-            fb_chat = str(asst_msg.get("fallback_note") or "").strip()
-            if fb_chat:
-                st.caption(f"ℹ️ {fb_chat}")
-            res_id = asst_msg.get("result_id")
-            if res_id:
-                _render_ai_chat_analysis_fragment(
-                    result_id=str(res_id),
-                    target_crs=target_crs,
-                    lang=lang,
-                )
+    if has_asst:
+        if is_expanded:
+            with st.chat_message("assistant"):
+                st.markdown(str(asst_msg.get("content") or ""))
+                fb_chat = str(asst_msg.get("fallback_note") or "").strip()
+                if fb_chat:
+                    st.caption(f"ℹ️ {fb_chat}")
+                res_id = asst_msg.get("result_id")
+                if res_id:
+                    _render_ai_chat_analysis_fragment(
+                        result_id=str(res_id),
+                        target_crs=target_crs,
+                        lang=lang,
+                    )
+        else:
+            collapsed_lbl = build_collapsed_turn_label(
+                turn,
+                chat_results=chat_results or {},
+                lang=lang,
+            )
+            with st.chat_message("assistant"):
+                st.caption(t("ai_turn_collapsed_card", lang=lang, summary=collapsed_lbl))
 
 
 @st.fragment
@@ -8065,7 +8147,7 @@ def _render_ai_chat_analysis_fragment(
                             "image": dyn_g_uri,
                             "bounds": dyn_g_bnds,
                             "opacity": float(ai_op_delta) / 100.0,
-                            "show": False,
+                            "show": idx_lbl_ts == "NDSI",
                             "zindex": 22,
                         }
                     )
@@ -8721,6 +8803,8 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                         if ok and profile is not None:
                             st.session_state["auth_user"] = profile
                             st.session_state["_auth_pending_profile"] = profile
+                            st.session_state["_ai_threads_loaded_for"] = None
+                            st.session_state["_ws5_entered_once"] = False
                             last_sess = load_last_session(str(profile.get("username", "")))
                             if last_sess is not None:
                                 st.session_state["_pending_restore_last_session"] = last_sess
@@ -12227,30 +12311,76 @@ def main() -> None:
                 if has_cloud_only_analysis:
                     st.info(t("ai_hist_cloud_regen_hint", lang=lang))
 
-                # Izris zgodovine večkrožnega pogovora (starejši krogi samodejno strnjeni, zadnja 2 odprta)
+                # Prvi vstop v Delovni prostor 5 z obstoječim pogovorom -> enkratni gladek pomik na zadnji odgovor
+                if not st.session_state.get("_ws5_entered_once"):
+                    st.session_state["_ws5_entered_once"] = True
+                    _bump_ws5_scroll_nonce()
+
+                # Izris zgodovine večkrožnega pogovora (vsak krog ima ročni gumb Skrči/Razširi; privzeto: zadnja 2 odprta, starejši skrčeni)
                 chat_turns = group_ai_chat_turns(chat_messages)
                 total_turns = len(chat_turns)
-                older_count = max(0, total_turns - KEEP_EXPANDED_TURNS)
-                show_all_turns = False
-                if older_count > 0:
-                    show_all_turns = st.toggle(
-                        t("ai_chat_show_all_turns", lang=lang, n=older_count),
-                        key="ai_show_all_turns",
-                    )
+                if total_turns >= 2:
+                    bc1, bc2, _bc_sp = st.columns([1.45, 1.55, 5.0], gap="small")
+                    with bc1:
+                        if st.button(
+                            t("ai_turns_expand_all_btn", lang=lang),
+                            key=f"ws5_bulk_exp_all_{active_tid}",
+                            width="stretch",
+                        ):
+                            cur_m = dict(st.session_state.get("ws5_turn_expanded") or {})
+                            for _ti in range(total_turns):
+                                cur_m[f"{active_tid}_{_ti}"] = True
+                            st.session_state["ws5_turn_expanded"] = cur_m
+                            st.rerun()
+                    with bc2:
+                        if st.button(
+                            t("ai_turns_collapse_older_btn", lang=lang),
+                            key=f"ws5_bulk_col_old_{active_tid}",
+                            width="stretch",
+                        ):
+                            cur_m = dict(st.session_state.get("ws5_turn_expanded") or {})
+                            for _ti in range(total_turns):
+                                cur_m[f"{active_tid}_{_ti}"] = _ti >= max(0, total_turns - KEEP_EXPANDED_TURNS)
+                            st.session_state["ws5_turn_expanded"] = cur_m
+                            st.rerun()
 
+                exp_map = st.session_state.get("ws5_turn_expanded") or {}
                 editing_turn_idx = st.session_state.get("ai_editing_turn_idx")
                 for turn in chat_turns:
                     t_idx = int(turn["turn_idx"])
-                    if t_idx < total_turns - KEEP_EXPANDED_TURNS:
-                        exp_lbl = build_collapsed_turn_label(
-                            turn,
-                            chat_results=chat_results_map,
-                            lang=lang,
-                        )
-                        with st.expander(exp_lbl, expanded=bool(show_all_turns or editing_turn_idx == t_idx)):
-                            _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
-                    else:
-                        _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+                    if t_idx == total_turns - 1:
+                        st.markdown('<div id="ws5-latest-turn-anchor"></div>', unsafe_allow_html=True)
+                    is_turn_exp = bool(
+                        editing_turn_idx == t_idx
+                        or get_turn_expanded_state(exp_map, active_tid, t_idx, total_turns)
+                    )
+                    _render_ai_chat_turn(
+                        turn,
+                        target_crs=target_crs,
+                        lang=lang,
+                        thread_id=active_tid,
+                        total_turns=total_turns,
+                        is_expanded=is_turn_exp,
+                        chat_results=chat_results_map,
+                    )
+
+                # Enkratni samodejni pomik do zadnjega odgovora (samo ob odprtju/preklopu pogovora ali novem odgovoru)
+                cur_scroll_nonce = int(st.session_state.get("_ws5_scroll_nonce", 0))
+                last_scrolled_nonce = int(st.session_state.get("_ws5_last_scrolled_nonce", -1))
+                if cur_scroll_nonce != last_scrolled_nonce:
+                    st.session_state["_ws5_last_scrolled_nonce"] = cur_scroll_nonce
+                    components.html(
+                        f"""<script>
+                        // scroll_nonce={cur_scroll_nonce}
+                        setTimeout(function() {{
+                            try {{
+                                var el = window.parent.document.getElementById('ws5-latest-turn-anchor');
+                                if (el) {{ el.scrollIntoView({{ behavior: 'smooth', block: 'start' }}); }}
+                            }} catch (e) {{}}
+                        }}, 180);
+                        </script>""",
+                        height=0,
+                    )
 
         # --- 3. Spodnje pripeto vnosno polje za klepet (st.chat_input) + obdelava Uredi/Ponovi ---
         typed_prompt = st.chat_input(
@@ -12530,6 +12660,7 @@ def main() -> None:
                     ai_status.empty()
                     _snapshot_active_thread_to_store(_ws5_uname, sync_cloud=bool(_ws5_logged_in))
                     _maybe_auto_save_session()
+                    _bump_ws5_scroll_nonce()
                     gc.collect()
                     st.rerun()
                 except Exception as exc:
@@ -12547,6 +12678,7 @@ def main() -> None:
                         }
                     )
                     _snapshot_active_thread_to_store(_ws5_uname, sync_cloud=bool(_ws5_logged_in))
+                    _bump_ws5_scroll_nonce()
                     st.error(err_msg)
                     st.rerun()
 

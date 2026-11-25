@@ -35,6 +35,7 @@ from analize import (
     compute_index,
     compute_index_stats,
     compute_water_cleaned_ndsi,
+    detect_new_proglacial_lake_mask,
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
@@ -730,6 +731,11 @@ def compute_dynamic_frame_delta(
         clean_1 = compute_water_cleaned_ndsi(da1, ndwi=w1_da, nir=r1_da)
         clean_2 = compute_water_cleaned_ndsi(da2_al, ndwi=w2_da, nir=r2_da)
         diff_vals = (clean_2 - clean_1).astype(np.float32)
+
+        # Direct ΔNDWI proglacial lake gain detection (catches turbid glacial-milk lakes & debris-ice -> lake)
+        new_lake_mask = detect_new_proglacial_lake_mask(w1_da, w2_da)
+        if new_lake_mask is not None:
+            diff_vals = np.where(new_lake_mask, np.float32(-0.60), diff_vals).astype(np.float32)
 
         cls_u8, gl_stats = classify_glacier_change(
             da1,

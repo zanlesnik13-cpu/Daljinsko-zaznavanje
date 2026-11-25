@@ -1006,6 +1006,23 @@ def compute_water_cleaned_ndsi(
     return np.where(is_water, np.float32(-0.5), ndsi_arr).astype(np.float32)
 
 
+def detect_new_proglacial_lake_mask(
+    ndwi_t1: np.ndarray | xr.DataArray | None,
+    ndwi_t2: np.ndarray | xr.DataArray | None,
+) -> np.ndarray | None:
+    """Detect newly formed proglacial lakes directly via NDWI water gain.
+
+    Catches turbid glacial-milk lakes and ``Debris-Covered Ice -> Proglacial Lake``
+    transitions without requiring ultra-low NIR reflectance.
+    """
+    if ndwi_t1 is None or ndwi_t2 is None:
+        return None
+    w1 = np.asarray(ndwi_t1.values if isinstance(ndwi_t1, xr.DataArray) else ndwi_t1, dtype=np.float32)
+    w2 = np.asarray(ndwi_t2.values if isinstance(ndwi_t2, xr.DataArray) else ndwi_t2, dtype=np.float32)
+    valid = np.isfinite(w1) & np.isfinite(w2)
+    return valid & (w2 > np.float32(0.02)) & ((w2 - w1) > np.float32(0.12)) & (w1 < np.float32(0.15))
+
+
 def classify_glacier_change(
     ndsi_t1: np.ndarray | xr.DataArray,
     ndsi_t2: np.ndarray | xr.DataArray,
@@ -1022,7 +1039,7 @@ def classify_glacier_change(
     Class codes (``uint8``):
     - ``0``: Unchanged / NoData (transparent)
     - ``1``: Ice -> Rock / Moraine (Retreat on land)
-    - ``2``: Ice -> New Proglacial Lake
+    - ``2``: Ice / Debris-Ice -> New Proglacial Lake (GLIMS water OR ΔNDWI water gain)
     - ``3``: Snow / Ice Gain
     """
     n1 = np.asarray(ndsi_t1.values if isinstance(ndsi_t1, xr.DataArray) else ndsi_t1, dtype=np.float32)
@@ -1035,14 +1052,17 @@ def classify_glacier_change(
     valid = np.isfinite(n1) & np.isfinite(n2)
     water_1 = _detect_glims_water_mask(n1, ndwi_arr=w1, nir_arr=r1)
     water_2 = _detect_glims_water_mask(n2, ndwi_arr=w2, nir_arr=r2)
+    new_lake_ndwi = detect_new_proglacial_lake_mask(w1, w2)
 
     ice_1 = valid & (n1 >= np.float32(ice_thresh)) & (~water_1)
     ice_2 = valid & (n2 >= np.float32(ice_thresh)) & (~water_2)
 
     cls = np.zeros(n1.shape, dtype=np.uint8)
-    loss_land = ice_1 & (~ice_2) & (~water_2)
     loss_lake = ice_1 & water_2
-    gain_ice = valid & (~ice_1) & ice_2
+    if new_lake_ndwi is not None:
+        loss_lake = loss_lake | (valid & new_lake_ndwi)
+    loss_land = ice_1 & (~ice_2) & (~water_2) & (~loss_lake)
+    gain_ice = valid & (~ice_1) & ice_2 & (~loss_lake)
 
     cls[loss_land] = 1
     cls[loss_lake] = 2
