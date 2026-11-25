@@ -4353,7 +4353,7 @@ def _render_interactive_aoi_section(
             draw_map,
             center=(center_lat, center_lon),
             zoom=draw_zoom,
-            height=580,
+            height=470,
             use_container_width=True,
             returned_objects=["last_active_drawing", "all_drawings", "zoom"],
             key=f"aoi_draw_map_{draw_ver}_{jump_ver}_{selected_basemap}",
@@ -4408,7 +4408,7 @@ def _render_interactive_aoi_section(
             main_map,
             center=(center_lat, center_lon),
             zoom=zoom_val,
-            height=580,
+            height=470,
             use_container_width=True,
             returned_objects=returned_objs,
             key=f"main_interactive_aoi_map_{jump_ver}_{selected_basemap}",
@@ -4685,7 +4685,7 @@ def _render_relief_and_profile_section(
     )
     st_folium(
         slippy_rel,
-        height=540,
+        height=470,
         use_container_width=True,
         returned_objects=[],
         key=f"{key_prefix}_slippy_{r_layer_key}_{r_opacity}_{pr_preset}_{st.session_state.get('map_basemap', 'satellite')}",
@@ -4938,7 +4938,7 @@ def _render_tab1_scene_viewer_fragment(
         )
         st_folium(
             slippy_t1,
-            height=620,
+            height=470,
             use_container_width=True,
             returned_objects=[],
             key=(
@@ -5133,7 +5133,7 @@ def _render_tab2_sar_viewer_fragment(
         )
         st_folium(
             slippy_s1,
-            height=620,
+            height=470,
             use_container_width=True,
             returned_objects=[],
             key=(
@@ -5397,7 +5397,7 @@ def _render_tab2_index_viewer_fragment(
         )
         st_folium(
             slippy_t2,
-            height=620,
+            height=470,
             use_container_width=True,
             returned_objects=[],
             key=(
@@ -5559,11 +5559,11 @@ def _render_comp3_swipe_fragment(
             aoi_polygon_geojson=active_polygon,
             aoi_bbox_3794=bbox_3794,
             aoi_outline_label=t("slippy_aoi_outline"),
-            height=620,
+            height=470,
             opacity=float(swipe_opacity_pct) / 100.0,
             lang=lang,
         )
-        components.html(swipe_html, height=640, scrolling=False)
+        components.html(swipe_html, height=480, scrolling=False)
     else:
         _render_before_after_swipe_html(
             png_t1_bytes=c_swipes[i_a],
@@ -6679,7 +6679,7 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+        components.html(slippy_ai.get_root().render(), height=475, scrolling=False)
         st.caption(t("ai_layer_toggle_hint"))
 
     elif ai_kind_show == "spectral_index":
@@ -6806,7 +6806,7 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+        components.html(slippy_ai.get_root().render(), height=475, scrolling=False)
         st.caption(t("ai_layer_toggle_hint"))
 
     elif ai_kind_show == "scene_rgb":
@@ -6854,7 +6854,7 @@ def _render_ai_chat_analysis_fragment(
             aoi_outline_label=t("slippy_aoi_outline"),
             lang=lang,
         )
-        components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+        components.html(slippy_ai.get_root().render(), height=475, scrolling=False)
 
     elif ai_kind_show == "cloud_free_composite":
         cm = ai_res_show.get("composite_meta") or {}
@@ -6897,7 +6897,7 @@ def _render_ai_chat_analysis_fragment(
                 aoi_outline_label=t("slippy_aoi_outline"),
                 lang=lang,
             )
-            components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+            components.html(slippy_ai.get_root().render(), height=475, scrolling=False)
 
     elif ai_kind_show == "change_comparison":
         comp_r = ai_res_show.get("comparison_result") or {}
@@ -6952,11 +6952,11 @@ def _render_ai_chat_analysis_fragment(
                 aoi_bbox_4326=ai_res_show.get("bbox_4326"),
                 aoi_bbox_3794=ai_res_show.get("bbox_3794"),
                 aoi_outline_label=t("slippy_aoi_outline"),
-                height=520,
+                height=470,
                 opacity=float(ai_op_chg) / 100.0,
                 lang=lang,
             )
-            components.html(swipe_html, height=540, scrolling=False)
+            components.html(swipe_html, height=480, scrolling=False)
 
     elif ai_kind_show == "terrain_dem":
         ds_t = ai_res_show.get("dem_stats") or {}
@@ -7041,7 +7041,7 @@ def _render_ai_chat_analysis_fragment(
                 aoi_outline_label=t("slippy_aoi_outline"),
                 lang=lang,
             )
-            components.html(slippy_ai.get_root().render(), height=540, scrolling=False)
+            components.html(slippy_ai.get_root().render(), height=475, scrolling=False)
             st.caption(t("ai_layer_toggle_hint"))
 
         prof_df = ai_res_show.get("profile_df")
@@ -7169,8 +7169,13 @@ def _render_ai_chat_analysis_fragment(
 
     elif ai_kind_show in ("time_series", "time_series_and_comparison"):
         ts_ai: pd.DataFrame = ai_res_show["ts_df"]
+        if isinstance(ts_ai, pd.DataFrame) and "date_str" in ts_ai.columns and not ts_ai.empty:
+            ts_ai = ts_ai.sort_values("date_str", ascending=True).reset_index(drop=True)
         idx_lbl_ts = str(pl.get("index_name", "NDVI"))
-        frames_list: list[dict[str, Any]] = list(ai_res_show.get("frames") or [])
+        frames_list: list[dict[str, Any]] = sorted(
+            list(ai_res_show.get("frames") or []),
+            key=lambda f: str(f.get("date") or ""),
+        )
         comp_rgb = ai_res_show.get("comparison_rgb")
         comp_idx = ai_res_show.get("comparison_index")
         cs_ts = ai_res_show.get("change_summary") or {}
@@ -7196,18 +7201,23 @@ def _render_ai_chat_analysis_fragment(
             else f"{ts_ai['mean'].mean():.3f}"
         )
 
+        d_start_s = str(ts_ai["date_str"].iloc[0])
+        d_end_s = str(ts_ai["date_str"].iloc[-1])
+        period_kpi = (
+            f"{d_start_s[:4]} → {d_end_s[:4]}"
+            if (len(d_start_s) >= 4 and len(d_end_s) >= 4 and d_start_s[:4] != d_end_s[:4])
+            else f"{d_start_s} → {d_end_s}"
+        )
+
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Št. datumov" if lang == "sl" else "Valid Dates", f"{len(ts_ai)}")
-        m2.metric(
-            "Obdobje t1 → t2" if lang == "sl" else "Period t1 → t2",
-            f"{ts_ai['date_str'].iloc[0]} → {ts_ai['date_str'].iloc[-1]}",
-        )
+        m2.metric("Obdobje t1 → t2" if lang == "sl" else "Period t1 → t2", period_kpi)
         m3.metric("Trend", trend_str)
         m4.metric(
             (f"Δ {idx_lbl_ts}" if cs_ts else ("Povprečje" if lang == "sl" else "Mean")),
             delta_str,
         )
-        m5.metric(t("ai_plan_crs"), ai_crs_show)
+        m5.metric(t("ai_plan_crs"), format_crs_label(ai_crs_show, short=True))
 
         def _draw_ts_plotly_and_table() -> None:
             fig_ai_ts = go.Figure()
@@ -7381,11 +7391,11 @@ def _render_ai_chat_analysis_fragment(
                         aoi_bbox_4326=ai_res_show.get("bbox_4326"),
                         aoi_bbox_3794=ai_res_show.get("bbox_3794"),
                         aoi_outline_label=t("slippy_aoi_outline"),
-                        height=520,
+                        height=470,
                         opacity=float(ai_op_ts_sw) / 100.0,
                         lang=lang,
                     )
-                    components.html(swipe_html, height=540, scrolling=False)
+                    components.html(swipe_html, height=480, scrolling=False)
                     st.caption(t("swipe_zoom_hint"))
 
                 try:
@@ -7404,25 +7414,11 @@ def _render_ai_chat_analysis_fragment(
                 if fr_l.get("index_mean") is not None and fr_r.get("index_mean") is not None:
                     delta_pair_txt = f"{float(fr_r['index_mean']) - float(fr_l['index_mean']):+.3f}"
 
-                bar_c1, bar_c2 = st.columns([2.2, 1.1], vertical_alignment="center")
-                with bar_c1:
-                    st.markdown(
-                        f"**Δ {idx_lbl_ts} (t2 − t1):** `{delta_pair_txt}` · "
-                        f"**{'Razmik' if lang == 'sl' else 'Span'}:** `{span_txt}` · "
-                        f"`{fr_l['date']}` ↔ `{fr_r['date']}`"
-                    )
-                with bar_c2:
-                    if st.button(
-                        t("ai_mf_send_t2_carto", lang=lang),
-                        type="primary",
-                        width="stretch",
-                        key=f"ai_mf_send_t2_{result_id}",
-                    ):
-                        st.session_state["tab6_ai_result"] = ai_res_show
-                        st.session_state["tab4_pending_source_select"] = "tab6_ai"
-                        st.session_state["tab6_sent_to_carto"] = True
-                        st.session_state["pending_workspace"] = "ws_geo"
-                        st.rerun(scope="app")
+                st.markdown(
+                    f"**Δ {idx_lbl_ts} (t2 − t1):** `{delta_pair_txt}` · "
+                    f"**{'Razmik' if lang == 'sl' else 'Span'}:** `{span_txt}` · "
+                    f"`{fr_l['date']}` ↔ `{fr_r['date']}`"
+                )
 
             # --- TAB 2: Spatial Change Map (Δ = t2 - t1) & All Toggleable Layers ---
             with t_delta:
@@ -7524,20 +7520,8 @@ def _render_ai_chat_analysis_fragment(
                         aoi_outline_label=t("slippy_aoi_outline"),
                         lang=lang,
                     )
-                    components.html(slippy_delta.get_root().render(), height=540, scrolling=False)
+                    components.html(slippy_delta.get_root().render(), height=475, scrolling=False)
                     st.caption(t("ai_layer_toggle_hint"))
-
-                if st.button(
-                    t("ai_mf_delta_send_carto", lang=lang),
-                    type="primary",
-                    width="stretch",
-                    key=f"ai_mf_delta_send_carto_{result_id}",
-                ):
-                    st.session_state["tab6_ai_result"] = ai_res_show
-                    st.session_state["tab4_pending_source_select"] = "tab6_ai"
-                    st.session_state["tab6_sent_to_carto"] = True
-                    st.session_state["pending_workspace"] = "ws_geo"
-                    st.rerun(scope="app")
 
             # --- TAB 3: Visual Timelapse (Animated GIF directly in Chat) ---
             with t_tl:
@@ -7697,11 +7681,11 @@ def _render_ai_chat_analysis_fragment(
                         aoi_bbox_4326=ai_res_show.get("bbox_4326"),
                         aoi_bbox_3794=ai_res_show.get("bbox_3794"),
                         aoi_outline_label=t("slippy_aoi_outline"),
-                        height=520,
+                        height=470,
                         opacity=float(ai_op_ts_sw) / 100.0,
                         lang=lang,
                     )
-                    components.html(swipe_html, height=540, scrolling=False)
+                    components.html(swipe_html, height=480, scrolling=False)
                     st.caption(t("swipe_zoom_hint"))
             with t_ts:
                 _draw_ts_plotly_and_table()
@@ -7721,6 +7705,12 @@ def _render_ai_chat_analysis_fragment(
             )
     elif ai_kind_show in ("time_series", "time_series_and_comparison"):
         if ai_res_show.get("tif_bytes"):
+            _crs_btn_lbl = format_crs_label(ai_crs_show, short=True)
+            _send_carto_lbl = (
+                f"🗺️ Pošlji v Izdelavo karte ({_crs_btn_lbl})"
+                if lang == "sl"
+                else f"🗺️ Send to Map Composer ({_crs_btn_lbl})"
+            )
             ac1, ac2 = st.columns(2)
             with ac1:
                 st.download_button(
@@ -7733,7 +7723,7 @@ def _render_ai_chat_analysis_fragment(
                 )
             with ac2:
                 if st.button(
-                    t("ai_btn_send_carto"),
+                    _send_carto_lbl,
                     type="primary",
                     width="stretch",
                     key=f"ai_chat_send_carto_{result_id}",
@@ -7746,6 +7736,12 @@ def _render_ai_chat_analysis_fragment(
     else:
         has_tif = bool(ai_res_show.get("tif_bytes"))
         if has_tif:
+            _crs_btn_lbl = format_crs_label(ai_crs_show, short=True)
+            _send_carto_lbl = (
+                f"🗺️ Pošlji v Izdelavo karte ({_crs_btn_lbl})"
+                if lang == "sl"
+                else f"🗺️ Send to Map Composer ({_crs_btn_lbl})"
+            )
             ac1, ac2 = st.columns(2)
             with ac1:
                 st.download_button(
@@ -7758,7 +7754,7 @@ def _render_ai_chat_analysis_fragment(
                 )
             with ac2:
                 if st.button(
-                    t("ai_btn_send_carto"),
+                    _send_carto_lbl,
                     type="primary",
                     width="stretch",
                     key=f"ai_chat_send_carto_{result_id}",
@@ -8365,8 +8361,47 @@ def _render_sidebar_projects_manager(
                     st.error(t("proj_import_err", lang=lang, err=exc))
 
 
+def _inject_tablet_readonly_dropdowns() -> None:
+    """Prevent tablet virtual keyboard popups & text editing on all Streamlit ``st.selectbox`` dropdowns."""
+    components.html(
+        """
+        <script>
+        (function () {
+          try {
+            const doc = window.parent && window.parent.document;
+            if (!doc) return;
+            function lockSelectInputs(root) {
+              const inputs = (root || doc).querySelectorAll('[data-baseweb="select"] input');
+              inputs.forEach(function (el) {
+                if (el.getAttribute('readonly') !== 'true') {
+                  el.setAttribute('readonly', 'true');
+                }
+                if (el.getAttribute('inputmode') !== 'none') {
+                  el.setAttribute('inputmode', 'none');
+                }
+                el.style.caretColor = 'transparent';
+                el.style.cursor = 'pointer';
+              });
+            }
+            lockSelectInputs(doc);
+            if (!window.parent.__dzSelectReadonlyObserver) {
+              const obs = new MutationObserver(function () {
+                lockSelectInputs(doc);
+              });
+              obs.observe(doc.body, { childList: true, subtree: true });
+              window.parent.__dzSelectReadonlyObserver = obs;
+            }
+          } catch (_err) {}
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def main() -> None:
     _init_session_state()
+    _inject_tablet_readonly_dropdowns()
     github_restore_all_on_startup()
 
     # Apply any queued widget-bound state updates strictly BEFORE any sidebar/workspace widgets instantiate
@@ -9902,7 +9937,7 @@ def main() -> None:
                             )
                             st_folium(
                                 slippy_comp,
-                                height=620,
+                                height=470,
                                 use_container_width=True,
                                 returned_objects=[],
                                 key=(
@@ -9994,7 +10029,7 @@ def main() -> None:
                             )
                             st_folium(
                                 slippy_ci,
-                                height=620,
+                                height=470,
                                 use_container_width=True,
                                 returned_objects=[],
                                 key=(
@@ -11117,7 +11152,7 @@ def main() -> None:
                 )
                 st_folium(
                     slippy_dis,
-                    height=580,
+                    height=470,
                     use_container_width=True,
                     returned_objects=[],
                     key=(
@@ -11154,11 +11189,11 @@ def main() -> None:
                             aoi_bbox_4326=d_bbox,
                             aoi_polygon_geojson=dis_res_show.get("polygon_4326"),
                             aoi_outline_label=t("slippy_aoi_outline"),
-                            height=620,
+                            height=470,
                             opacity=1.0,
                             lang=lang,
                         )
-                        components.html(dis_swipe_html, height=640, scrolling=False)
+                        components.html(dis_swipe_html, height=480, scrolling=False)
                     else:
                         _render_before_after_swipe_html(
                             png_t1_bytes=dis_res_show["swipe_png_pre"],

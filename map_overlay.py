@@ -22,7 +22,7 @@ import math
 from typing import Any, Sequence
 
 import folium
-from folium.plugins import MeasureControl, MousePosition
+from folium.plugins import Fullscreen, MeasureControl, MousePosition
 import matplotlib
 import numpy as np
 from PIL import Image
@@ -537,6 +537,7 @@ def build_satellite_slippy_map(
     aoi_metric_crs: int | str | None = None,
     aoi_outline_label: str = "AOI (meja analize)",
     transect_latlon: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    height: int = 470,
     lang: str = "sl",
 ) -> folium.Map:
     """Build a full-width interactive Folium slippy map with satellite/index overlays & QGIS LayerControl.
@@ -564,6 +565,8 @@ def build_satellite_slippy_map(
         tiles=None,
         control_scale=True,
         max_zoom=19,
+        scroll_wheel_zoom=False,
+        height=f"{int(height)}px",
     )
 
     # Add persistent basemap as active base layer plus alternatives inside LayerControl
@@ -682,6 +685,14 @@ def build_satellite_slippy_map(
         secondary_area_unit="sqkilometers",
     ).add_to(fmap)
 
+    # Fullscreen toggle button (touch-friendly, 1-tap full screen on tablet/desktop)
+    Fullscreen(
+        position="topleft",
+        title="Celozaslonski način" if lang == "sl" else "Fullscreen",
+        title_cancel="Izhod iz celozaslonskega načina" if lang == "sl" else "Exit Fullscreen",
+        force_separate_button=True,
+    ).add_to(fmap)
+
     # QGIS-style always-visible layer control
     folium.LayerControl(collapsed=False).add_to(fmap)
     return fmap
@@ -703,7 +714,7 @@ def build_zoomable_swipe_map(
     aoi_bbox_3794: Sequence[float] | None = None,
     aoi_metric_crs: int | str | None = None,
     aoi_outline_label: str = "AOI",
-    height: int = 620,
+    height: int = 470,
     opacity: float = 1.0,
     lang: str = "sl",
 ) -> str:
@@ -909,6 +920,45 @@ def build_zoomable_swipe_map(
       background: #115E59;
       transform: translate(-50%, -50%) scale(1.06);
     }}
+    #swipe-wrapper:fullscreen, #swipe-wrapper:-webkit-full-screen {{
+      width: 100vw !important;
+      height: 100vh !important;
+      border-radius: 0 !important;
+      border: none !important;
+    }}
+    #swipe-wrapper.is-maximized {{
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      z-index: 99999 !important;
+      border-radius: 0 !important;
+    }}
+    #swipe-fs-btn {{
+      position: absolute;
+      top: 82px;
+      left: 10px;
+      z-index: 1002;
+      width: 34px;
+      height: 34px;
+      border-radius: 6px;
+      border: 2px solid rgba(15, 23, 42, 0.25);
+      background: #FFFFFF;
+      color: #0F172A;
+      font-size: 17px;
+      font-weight: 700;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.25);
+    }}
+    #swipe-fs-btn:hover {{
+      background: #F0FDFA;
+      color: #0F766E;
+      border-color: #0F766E;
+    }}
     #swipe-coords {{
       position: absolute;
       left: 12px;
@@ -928,6 +978,7 @@ def build_zoomable_swipe_map(
 <body>
   <div id="swipe-wrapper">
     <div id="swipe-map"></div>
+    <button id="swipe-fs-btn" type="button" title="{_html.escape('Celozaslonski način' if lang == 'sl' else 'Fullscreen')}" aria-label="Fullscreen">⛶</button>
     <div id="swipe-badge-t1" class="swipe-badge">◀ {safe_t1}</div>
     <div id="swipe-badge-t2" class="swipe-badge">{safe_t2} ▶</div>
     <div id="swipe-divider" title="↔">
@@ -955,6 +1006,7 @@ def build_zoomable_swipe_map(
         center: initCenter,
         zoom: 12,
         zoomControl: true,
+        scrollWheelZoom: false,
         preferCanvas: true,
         maxZoom: 19
       }});
@@ -1133,6 +1185,52 @@ def build_zoomable_swipe_map(
         map.invalidateSize();
         updateClip();
       }});
+
+      const fsBtn = document.getElementById('swipe-fs-btn');
+      function syncFsIcon() {{
+        const inFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement || wrapper.classList.contains('is-maximized'));
+        if (fsBtn) fsBtn.textContent = inFs ? '✕' : '⛶';
+        setTimeout(function () {{
+          map.invalidateSize();
+          updateClip();
+        }}, 120);
+      }}
+      if (fsBtn) {{
+        L.DomEvent.disableClickPropagation(fsBtn);
+        fsBtn.addEventListener('click', function (ev) {{
+          ev.preventDefault();
+          ev.stopPropagation();
+          const inNativeFs = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+          if (inNativeFs) {{
+            if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          }} else if (wrapper.classList.contains('is-maximized')) {{
+            wrapper.classList.remove('is-maximized');
+            syncFsIcon();
+          }} else {{
+            const req = wrapper.requestFullscreen || wrapper.webkitRequestFullscreen;
+            if (req) {{
+              try {{
+                const p = req.call(wrapper);
+                if (p && typeof p.catch === 'function') {{
+                  p.catch(function () {{
+                    wrapper.classList.add('is-maximized');
+                    syncFsIcon();
+                  }});
+                }}
+              }} catch (_e) {{
+                wrapper.classList.add('is-maximized');
+                syncFsIcon();
+              }}
+            }} else {{
+              wrapper.classList.add('is-maximized');
+              syncFsIcon();
+            }}
+          }}
+        }});
+      }}
+      document.addEventListener('fullscreenchange', syncFsIcon);
+      document.addEventListener('webkitfullscreenchange', syncFsIcon);
     }})();
   </script>
 </body>
