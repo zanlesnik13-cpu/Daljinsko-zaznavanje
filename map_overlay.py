@@ -431,7 +431,7 @@ def render_diverging_change_overlay(
         else:
             fin_abs = np.abs(vals[finite])
             p96 = float(np.percentile(fin_abs, 96.0)) if fin_abs.size > 0 else 0.5
-            lim = float(np.clip(max(p96, 0.25), 0.25, 1.0))
+            lim = float(np.clip(max(p96, 0.30), 0.30, 0.60))
         eff_vmin = -lim if vmin is None else float(vmin)
         eff_vmax = lim if vmax is None else float(vmax)
     else:
@@ -443,17 +443,17 @@ def render_diverging_change_overlay(
     rgba_f = cmap(norm)
     rgba = np.clip(np.round(rgba_f * 255.0), 0, 255).astype(np.uint8)
 
-    # Smoothly fade near-zero unchanged pixels while keeping strong changes vivid
+    # Keep moderate changes (|Δ| >= 0.08) vivid while keeping unchanged pixels transparent
     thr = float(
         neutral_threshold
         if neutral_threshold is not None
-        else (1.0 if idx_u in ("LST", "VV", "VH") else 0.06)
+        else (1.0 if idx_u in ("LST", "VV", "VH") else 0.08)
     )
     abs_v = np.abs(np.nan_to_num(vals, nan=0.0))
     alpha_f = np.where(
         ~finite,
         0.0,
-        np.where(abs_v < thr, 0.18 + 0.60 * (abs_v / max(thr, 1e-6)), 0.92),
+        np.where(abs_v < thr, 0.0, 0.92),
     )
     rgba[..., 3] = np.clip(np.round(alpha_f * 255.0), 0, 255).astype(np.uint8)
     rgba = _orient_north_up(rgba, y_coords)

@@ -944,3 +944,121 @@ def compute_snow_glacier_stats(
     return snow_mask_da, stats
 
 
+# ---------------------------------------------------------------------------
+# Water-Aware GLIMS Glacier Change Detection (Terminus -> Proglacial Lake)
+# ---------------------------------------------------------------------------
+GLACIER_CHANGE_RGBA_MAP: dict[int, tuple[int, int, int, int]] = {
+    1: (220, 38, 38, 225),   # Crimson #DC2626 — Ice -> Rock/Moraine (Retreat)
+    2: (147, 51, 234, 235),  # Vivid Purple #9333EA — Ice -> New Proglacial Lake
+    3: (37, 99, 235, 220),   # Royal Blue #2563EB — Snow/Ice Gain
+}
+
+
+def _detect_glims_water_mask(
+    ndsi_arr: np.ndarray,
+    ndwi_arr: np.ndarray | None = None,
+    nir_arr: np.ndarray | None = None,
+) -> np.ndarray:
+    """Identify water / proglacial lake pixels that mimic snow/ice in raw NDSI.
+
+    Water strongly absorbs NIR (``NIR < 0.11``) and exhibits positive ``NDWI > 0.10``,
+    whereas bright snow/ice reflects NIR strongly.
+    """
+    fin_ndsi = np.isfinite(ndsi_arr)
+    water = np.zeros(ndsi_arr.shape, dtype=bool)
+    if ndwi_arr is not None and nir_arr is not None:
+        fin_w = np.isfinite(ndwi_arr)
+        fin_n = np.isfinite(nir_arr)
+        water = fin_ndsi & (
+            (fin_w & (ndwi_arr > 0.15))
+            | (fin_w & fin_n & (ndsi_arr > 0.20) & (ndwi_arr > 0.10) & (nir_arr < 0.15))
+            | (fin_n & (ndsi_arr > 0.20) & (nir_arr < 0.11))
+        )
+    elif ndwi_arr is not None:
+        water = fin_ndsi & np.isfinite(ndwi_arr) & (ndwi_arr > 0.15)
+    elif nir_arr is not None:
+        water = fin_ndsi & np.isfinite(nir_arr) & (ndsi_arr > 0.20) & (nir_arr < 0.11)
+    return water
+
+
+def compute_water_cleaned_ndsi(
+    ndsi: np.ndarray | xr.DataArray,
+    ndwi: np.ndarray | xr.DataArray | None = None,
+    nir: np.ndarray | xr.DataArray | None = None,
+) -> np.ndarray:
+    """Return a float32 water-cleaned NDSI ice score where proglacial lake water is set to ``-0.5``.
+
+    Eliminates the classic glacier-terminus blind spot where Ice (``+0.65``) melting into a
+    proglacial lake (``+0.55`` raw NDSI) previously produced ``Δ NDSI ≈ 0``.
+    """
+    ndsi_arr = np.asarray(ndsi.values if isinstance(ndsi, xr.DataArray) else ndsi, dtype=np.float32)
+    ndwi_arr = (
+        np.asarray(ndwi.values if isinstance(ndwi, xr.DataArray) else ndwi, dtype=np.float32)
+        if ndwi is not None
+        else None
+    )
+    nir_arr = (
+        np.asarray(nir.values if isinstance(nir, xr.DataArray) else nir, dtype=np.float32)
+        if nir is not None
+        else None
+    )
+    is_water = _detect_glims_water_mask(ndsi_arr, ndwi_arr=ndwi_arr, nir_arr=nir_arr)
+    return np.where(is_water, np.float32(-0.5), ndsi_arr).astype(np.float32)
+
+
+def classify_glacier_change(
+    ndsi_t1: np.ndarray | xr.DataArray,
+    ndsi_t2: np.ndarray | xr.DataArray,
+    *,
+    ndwi_t1: np.ndarray | xr.DataArray | None = None,
+    ndwi_t2: np.ndarray | xr.DataArray | None = None,
+    nir_t1: np.ndarray | xr.DataArray | None = None,
+    nir_t2: np.ndarray | xr.DataArray | None = None,
+    resolution_m: float = 30.0,
+    ice_thresh: float = 0.40,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Classify pixel-wise glacier retreat into categorical classes and exact metric areas.
+
+    Class codes (``uint8``):
+    - ``0``: Unchanged / NoData (transparent)
+    - ``1``: Ice -> Rock / Moraine (Retreat on land)
+    - ``2``: Ice -> New Proglacial Lake
+    - ``3``: Snow / Ice Gain
+    """
+    n1 = np.asarray(ndsi_t1.values if isinstance(ndsi_t1, xr.DataArray) else ndsi_t1, dtype=np.float32)
+    n2 = np.asarray(ndsi_t2.values if isinstance(ndsi_t2, xr.DataArray) else ndsi_t2, dtype=np.float32)
+    w1 = np.asarray(ndwi_t1.values if isinstance(ndwi_t1, xr.DataArray) else ndwi_t1, dtype=np.float32) if ndwi_t1 is not None else None
+    w2 = np.asarray(ndwi_t2.values if isinstance(ndwi_t2, xr.DataArray) else ndwi_t2, dtype=np.float32) if ndwi_t2 is not None else None
+    r1 = np.asarray(nir_t1.values if isinstance(nir_t1, xr.DataArray) else nir_t1, dtype=np.float32) if nir_t1 is not None else None
+    r2 = np.asarray(nir_t2.values if isinstance(nir_t2, xr.DataArray) else nir_t2, dtype=np.float32) if nir_t2 is not None else None
+
+    valid = np.isfinite(n1) & np.isfinite(n2)
+    water_1 = _detect_glims_water_mask(n1, ndwi_arr=w1, nir_arr=r1)
+    water_2 = _detect_glims_water_mask(n2, ndwi_arr=w2, nir_arr=r2)
+
+    ice_1 = valid & (n1 >= np.float32(ice_thresh)) & (~water_1)
+    ice_2 = valid & (n2 >= np.float32(ice_thresh)) & (~water_2)
+
+    cls = np.zeros(n1.shape, dtype=np.uint8)
+    loss_land = ice_1 & (~ice_2) & (~water_2)
+    loss_lake = ice_1 & water_2
+    gain_ice = valid & (~ice_1) & ice_2
+
+    cls[loss_land] = 1
+    cls[loss_lake] = 2
+    cls[gain_ice] = 3
+
+    px_ha = (float(resolution_m) ** 2) / 10_000.0
+    land_ha = round(int(np.count_nonzero(loss_land)) * px_ha, 2)
+    lake_ha = round(int(np.count_nonzero(loss_lake)) * px_ha, 2)
+    gain_ha = round(int(np.count_nonzero(gain_ice)) * px_ha, 2)
+    stats = {
+        "ice_loss_land_ha": land_ha,
+        "new_proglacial_lake_ha": lake_ha,
+        "total_ice_loss_ha": round(land_ha + lake_ha, 2),
+        "ice_gain_ha": gain_ha,
+    }
+    return cls, stats
+
+
+

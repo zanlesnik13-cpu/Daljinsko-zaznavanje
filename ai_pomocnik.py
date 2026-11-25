@@ -44,6 +44,7 @@ from casovne_vrste import (
     compile_timelapse_gif_fps,
     compute_change_summary,
     compute_cloud_free_composite,
+    compute_dynamic_frame_delta,
     extract_time_series,
     render_multi_date_comparison,
 )
@@ -81,6 +82,7 @@ from stac_loader import (
     INTERVAL_MONTHLY,
     INTERVAL_SEASONAL,
     INTERVAL_YEARLY,
+    SEASON_GLACIER_ABLATION,
     SEASON_SUMMER,
     SENSOR_LANDSAT,
     SENSOR_S1,
@@ -1717,6 +1719,9 @@ def build_analysis_context_dict(
             ctx["delta_mean"] = round(float(cs_ts.get("mean", 0.0)), 4)
             ctx["pos_area_ha"] = round(float(cs_ts.get("pos_area_ha", 0.0)), 2)
             ctx["neg_area_ha"] = round(float(cs_ts.get("neg_area_ha", 0.0)), 2)
+        g_stats = result.get("glacier_change_stats")
+        if isinstance(g_stats, dict) and g_stats:
+            ctx["glacier_change_stats"] = dict(g_stats)
     return ctx
 
 
@@ -1771,6 +1776,22 @@ def resolve_plan_coordinates(
     )
 
 
+def _resolve_ai_target_season(plan: dict[str, Any]) -> str:
+    """Select late-summer glacier ablation window (Jul 15 – Sep 15) for glacier/NDSI analyses, else Summer."""
+    idx_u = str(plan.get("index_name") or "").strip().upper()
+    blob = _normalize_ascii(
+        " ".join(
+            str(plan.get(k) or "")
+            for k in ("place_name", "location", "explanation_sl", "explanation_en")
+        )
+    )
+    if idx_u == "NDSI" or any(
+        k in blob for k in ("ledenik", "glacier", "pasterz", "grossglockner", "grosglockner", "triglavski ledenik", "krcenj", "umikanj")
+    ):
+        return SEASON_GLACIER_ABLATION
+    return SEASON_SUMMER
+
+
 def execute_temporal_fusion(
     plan: dict[str, Any],
     *,
@@ -1796,6 +1817,7 @@ def execute_temporal_fusion(
     end_s = str(plan["end_date"])
     hist_end = "2016-12-31"
     mod_start = "2017-01-01"
+    ai_target_season = _resolve_ai_target_season(plan)
 
     adaptive_interval = choose_adaptive_interval(
         start_s,
@@ -1827,7 +1849,7 @@ def execute_temporal_fusion(
         exclude_l7_slc_off=True,
         min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
         interval_mode=interval_key,
-        target_season=SEASON_SUMMER,
+        target_season=ai_target_season,
     )
     if not ls_items or ls_df_search.empty:
         ls_items, ls_df_search = search_scenes(
@@ -1839,7 +1861,7 @@ def execute_temporal_fusion(
             exclude_l7_slc_off=True,
             min_coverage_pct=65.0,
             interval_mode=interval_key,
-            target_season=SEASON_SUMMER,
+            target_season=ai_target_season,
         )
     if len(ls_items) > 12:
         p_idx = np.linspace(0, len(ls_items) - 1, 12, dtype=int)
@@ -1862,7 +1884,7 @@ def execute_temporal_fusion(
         exclude_l7_slc_off=False,
         min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
         interval_mode=interval_key,
-        target_season=SEASON_SUMMER,
+        target_season=ai_target_season,
     )
     if not s2_items or s2_df_search.empty:
         s2_items, s2_df_search = search_scenes(
@@ -1874,7 +1896,7 @@ def execute_temporal_fusion(
             exclude_l7_slc_off=False,
             min_coverage_pct=65.0,
             interval_mode=interval_key,
-            target_season=SEASON_SUMMER,
+            target_season=ai_target_season,
         )
     if len(s2_items) > 12:
         p_idx = np.linspace(0, len(s2_items) - 1, 12, dtype=int)
@@ -1992,36 +2014,59 @@ def execute_temporal_fusion(
 
     frames = sorted(frames, key=lambda fr: str(fr.get("date") or ""))
 
-    # 5. Cross-resolution pixel-aligned Δ change map (t2_S2 - t1_Landsat)
+    # 5. Cross-resolution pixel-aligned Δ change map (water-aware for NDSI -> detects terminus-to-lake retreat!)
     diff_da = None
     ch_summary: dict[str, Any] = {}
     delta_uri = None
     delta_bnds = None
-    delta_vmin = -0.5
-    delta_vmax = 0.5
+    delta_vmin = -0.6
+    delta_vmax = 0.6
     delta_cmap = "RdBu"
+    glacier_class_uri = None
+    glacier_class_bnds = None
+    glacier_change_stats = None
     tif_bytes = None
     tif_fname = None
 
-    if da_first is not None and da_last is not None and len(frames) >= 2:
+    if len(frames) >= 2:
         _prog(0.88, "Usklajujem rastrski mreži (Landsat 30 m ↔ Sentinel-2) za karto sprememb Δ..." if lang == "sl" else "Aligning Landsat 30 m & Sentinel-2 grids for Δ change map...")
-        delta_out = align_and_compute_delta(
-            da_first,
-            da_last,
+        dyn_out = compute_dynamic_frame_delta(
+            frames[0],
+            frames[-1],
             target_epsg=target_epsg,
             index_name=layer_m,
-            threshold=0.15,
             max_width=1000 if low_ram else 1300,
         )
-        diff_da = delta_out["diff_da"]
-        ch_summary = delta_out["change_summary"]
-        delta_uri = delta_out["delta_overlay_uri"]
-        delta_bnds = delta_out["delta_overlay_bounds"]
-        delta_vmin = delta_out["delta_vmin"]
-        delta_vmax = delta_out["delta_vmax"]
-        delta_cmap = delta_out["delta_cmap"]
-        tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
-        tif_fname = f"AI_Fusion_Delta_{layer_m}_{plan['place_name']}_{frames[0]['date']}_to_{frames[-1]['date']}_EPSG{epsg_num}.tif"
+        if isinstance(dyn_out, dict):
+            diff_da = dyn_out["diff_da"]
+            ch_summary = dyn_out["change_summary"]
+            delta_uri = dyn_out["delta_overlay_uri"]
+            delta_bnds = dyn_out["delta_overlay_bounds"]
+            delta_vmin = dyn_out["delta_vmin"]
+            delta_vmax = dyn_out["delta_vmax"]
+            delta_cmap = dyn_out["delta_cmap"]
+            glacier_class_uri = dyn_out.get("glacier_class_uri")
+            glacier_class_bnds = dyn_out.get("glacier_class_bounds")
+            glacier_change_stats = dyn_out.get("glacier_change_stats")
+        elif da_first is not None and da_last is not None:
+            delta_out = align_and_compute_delta(
+                da_first,
+                da_last,
+                target_epsg=target_epsg,
+                index_name=layer_m,
+                threshold=0.12,
+                max_width=1000 if low_ram else 1300,
+            )
+            diff_da = delta_out["diff_da"]
+            ch_summary = delta_out["change_summary"]
+            delta_uri = delta_out["delta_overlay_uri"]
+            delta_bnds = delta_out["delta_overlay_bounds"]
+            delta_vmin = delta_out["delta_vmin"]
+            delta_vmax = delta_out["delta_vmax"]
+            delta_cmap = delta_out["delta_cmap"]
+        if diff_da is not None:
+            tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
+            tif_fname = f"AI_Fusion_Delta_{layer_m}_{plan['place_name']}_{frames[0]['date']}_to_{frames[-1]['date']}_EPSG{epsg_num}.tif"
 
     # 6. Unified Multi-Decade Timelapse GIFs
     rgb_pngs = [f["rgb_png_bytes"] for f in frames if f.get("rgb_png_bytes")]
@@ -2038,6 +2083,8 @@ def execute_temporal_fusion(
         "transition_year": 2017,
         "total_frames": len(frames),
     }
+    if isinstance(glacier_change_stats, dict):
+        synergy_metrics.update(glacier_change_stats)
 
     gc.collect()
     base_out.update(
@@ -2061,6 +2108,9 @@ def execute_temporal_fusion(
             "delta_vmin": delta_vmin,
             "delta_vmax": delta_vmax,
             "delta_cmap": delta_cmap,
+            "glacier_class_uri": glacier_class_uri,
+            "glacier_class_bounds": glacier_class_bnds,
+            "glacier_change_stats": glacier_change_stats,
             "da_last": da_last,
             "index_da": diff_da if diff_da is not None else da_last,
             "tif_bytes": tif_bytes,
@@ -2766,6 +2816,7 @@ def execute_ai_plan(
             else f"Searching satellite archive ({adaptive_interval})...",
         )
         interval_key = INTERVAL_LABEL_TO_KEY.get(adaptive_interval, INTERVAL_YEARLY)
+        ai_target_season = _resolve_ai_target_season(plan)
         max_cc = 100.0 if sensor == SENSOR_S1 else 25.0
         items, df = search_scenes(
             sensor=sensor,
@@ -2776,7 +2827,7 @@ def execute_ai_plan(
             exclude_l7_slc_off=(sensor == SENSOR_LANDSAT),
             min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
             interval_mode=interval_key,
-            target_season=SEASON_SUMMER,
+            target_season=ai_target_season,
         )
         if not items or df.empty:
             items, df = search_scenes(
@@ -2788,7 +2839,7 @@ def execute_ai_plan(
                 exclude_l7_slc_off=(sensor == SENSOR_LANDSAT),
                 min_coverage_pct=70.0,
                 interval_mode=interval_key,
-                target_season=SEASON_SUMMER,
+                target_season=ai_target_season,
             )
         if not items or df.empty:
             raise RuntimeError(
@@ -2851,6 +2902,9 @@ def execute_ai_plan(
         delta_vmin: float = -0.5
         delta_vmax: float = 0.5
         delta_cmap: str = "RdBu"
+        glacier_class_uri: str | None = None
+        glacier_class_bounds: list[list[float]] | None = None
+        glacier_change_stats: dict[str, float] | None = None
         layer_m = str(plan["index_name"])
         relevant_layers = get_relevant_indices(layer_m, task)
         extra_idx_list = [l for l in relevant_layers if l not in ("RGB", "SAR", layer_m)]
@@ -2942,6 +2996,9 @@ def execute_ai_plan(
             delta_vmin = float(mf_out.get("delta_vmin", -0.5))
             delta_vmax = float(mf_out.get("delta_vmax", 0.5))
             delta_cmap = str(mf_out.get("delta_cmap") or "RdBu")
+            glacier_class_uri = mf_out.get("glacier_class_uri")
+            glacier_class_bounds = mf_out.get("glacier_class_bounds")
+            glacier_change_stats = mf_out.get("glacier_change_stats")
             mf_reps = list(mf_out.get("replacements") or [])
 
             if len(frames) >= 2:
@@ -3000,6 +3057,9 @@ def execute_ai_plan(
                 "delta_vmin": delta_vmin,
                 "delta_vmax": delta_vmax,
                 "delta_cmap": delta_cmap,
+                "glacier_class_uri": glacier_class_uri,
+                "glacier_class_bounds": glacier_class_bounds,
+                "glacier_change_stats": glacier_change_stats,
                 "da_last": da_last,
                 "index_da": diff_da if diff_da is not None else da_last,
                 "tif_bytes": tif_bytes,

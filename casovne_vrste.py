@@ -27,11 +27,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from rasterio.enums import Resampling
 
 from analize import (
+    GLACIER_CHANGE_RGBA_MAP,
     SAR_METRICS,
     SPECTRAL_INDICES,
     apply_cloud_mask,
+    classify_glacier_change,
     compute_index,
     compute_index_stats,
+    compute_water_cleaned_ndsi,
     extract_sar_metric,
     get_required_bands_for_sensor,
 )
@@ -637,6 +640,142 @@ def align_and_compute_delta(
         "delta_vmin": delta_vmin,
         "delta_vmax": delta_vmax,
         "delta_cmap": delta_cmap,
+        "aligned_resolution_m": round(aligned_res_m, 2),
+    }
+
+
+def _downsample_da_to_small_grid(
+    da: xr.DataArray,
+    *,
+    max_dim: int = 280,
+    fallback_crs: int | str = "EPSG:3794",
+) -> dict[str, Any]:
+    """Downsample a 2D metric DataArray to <= ``max_dim × max_dim`` (~150 KB) for instant on-the-fly Δ."""
+    h, w = int(da.shape[-2]), int(da.shape[-1])
+    step_y = max(1, int(np.ceil(h / float(max_dim))))
+    step_x = max(1, int(np.ceil(w / float(max_dim))))
+    sub = da.isel(y=slice(0, None, step_y), x=slice(0, None, step_x))
+    crs_val = str(da.rio.crs) if da.rio.crs is not None else str(fallback_crs)
+    return {
+        "values": np.asarray(sub.values, dtype=np.float32),
+        "x": np.asarray(sub.coords["x"].values, dtype=np.float64),
+        "y": np.asarray(sub.coords["y"].values, dtype=np.float64),
+        "crs": crs_val,
+    }
+
+
+def _small_grid_to_da(grid_dict: dict[str, Any], fallback_crs: int | str = "EPSG:3794") -> xr.DataArray:
+    """Reconstruct a georeferenced float32 DataArray from a lightweight cached grid dict."""
+    arr = np.asarray(grid_dict["values"], dtype=np.float32)
+    x_c = np.asarray(grid_dict["x"], dtype=np.float64)
+    y_c = np.asarray(grid_dict["y"], dtype=np.float64)
+    crs_str = str(grid_dict.get("crs") or fallback_crs)
+    da = xr.DataArray(arr, dims=("y", "x"), coords={"y": y_c, "x": x_c})
+    da = da.rio.write_crs(crs_str, inplace=False)
+    da = da.rio.write_nodata(np.nan, inplace=False)
+    return da
+
+
+def compute_dynamic_frame_delta(
+    frame_t1: dict[str, Any],
+    frame_t2: dict[str, Any],
+    *,
+    target_epsg: int | str = "EPSG:3794",
+    index_name: str = "NDSI",
+    threshold: float | None = None,
+    max_width: int = 1200,
+) -> dict[str, Any] | None:
+    """Recompute aligned ``Δ (t2 - t1)``, area stats, and (for NDSI) water-aware glacier change on-the-fly.
+
+    Works instantaneously from lightweight cached grids in ``frames`` with ZERO extra STAC calls
+    and supports mixed-resolution pairs (e.g. 30 m Landsat t1 + 10 m Sentinel-2 t2).
+    """
+    g1 = frame_t1.get("index_grid_small")
+    g2 = frame_t2.get("index_grid_small")
+    if not (isinstance(g1, dict) and isinstance(g2, dict)):
+        return None
+
+    idx_u = str(index_name or "NDVI").strip().upper()
+    da1 = _small_grid_to_da(g1, fallback_crs=target_epsg)
+    da2 = _small_grid_to_da(g2, fallback_crs=target_epsg)
+    if not _grids_match(da1, da2):
+        da2_al = da2.rio.reproject_match(da1, resampling=Resampling.bilinear)
+    else:
+        da2_al = da2
+
+    x_vals = np.asarray(da1.coords["x"].values, dtype=np.float64)
+    aligned_res_m = float(abs(x_vals[1] - x_vals[0])) if x_vals.size >= 2 else 30.0
+    eff_thr = float(threshold if threshold is not None else (2.0 if idx_u in ("LST", "VV", "VH") else 0.12))
+
+    glacier_class_uri: str | None = None
+    glacier_class_bnds: list[list[float]] | None = None
+    glacier_change_stats: dict[str, float] | None = None
+
+    if idx_u == "NDSI":
+        # Water-aware GLIMS cleaning: proglacial lakes (high NDWI / low NIR) become -0.5 instead of +0.6!
+        w1_da = _small_grid_to_da(frame_t1["ndwi_grid_small"], fallback_crs=target_epsg) if isinstance(frame_t1.get("ndwi_grid_small"), dict) else None
+        w2_da = _small_grid_to_da(frame_t2["ndwi_grid_small"], fallback_crs=target_epsg) if isinstance(frame_t2.get("ndwi_grid_small"), dict) else None
+        r1_da = _small_grid_to_da(frame_t1["nir_grid_small"], fallback_crs=target_epsg) if isinstance(frame_t1.get("nir_grid_small"), dict) else None
+        r2_da = _small_grid_to_da(frame_t2["nir_grid_small"], fallback_crs=target_epsg) if isinstance(frame_t2.get("nir_grid_small"), dict) else None
+
+        if w1_da is not None and not _grids_match(da1, w1_da):
+            w1_da = w1_da.rio.reproject_match(da1, resampling=Resampling.bilinear)
+        if w2_da is not None and not _grids_match(da1, w2_da):
+            w2_da = w2_da.rio.reproject_match(da1, resampling=Resampling.bilinear)
+        if r1_da is not None and not _grids_match(da1, r1_da):
+            r1_da = r1_da.rio.reproject_match(da1, resampling=Resampling.bilinear)
+        if r2_da is not None and not _grids_match(da1, r2_da):
+            r2_da = r2_da.rio.reproject_match(da1, resampling=Resampling.bilinear)
+
+        clean_1 = compute_water_cleaned_ndsi(da1, ndwi=w1_da, nir=r1_da)
+        clean_2 = compute_water_cleaned_ndsi(da2_al, ndwi=w2_da, nir=r2_da)
+        diff_vals = (clean_2 - clean_1).astype(np.float32)
+
+        cls_u8, gl_stats = classify_glacier_change(
+            da1,
+            da2_al,
+            ndwi_t1=w1_da,
+            ndwi_t2=w2_da,
+            nir_t1=r1_da,
+            nir_t2=r2_da,
+            resolution_m=aligned_res_m,
+        )
+        cls_da = xr.DataArray(cls_u8, dims=da1.dims, coords=da1.coords, name="Glacier_Change_Class")
+        cls_da = cls_da.rio.write_crs(da1.rio.crs, inplace=False).rio.write_nodata(0, inplace=False)
+        glacier_class_uri, glacier_class_bnds = raster_to_map_overlay_png(
+            cls_da,
+            src_epsg=target_epsg,
+            is_rgb=False,
+            discrete_rgba_map=GLACIER_CHANGE_RGBA_MAP,
+            max_width=max_width,
+        )
+        glacier_change_stats = gl_stats
+    else:
+        diff_vals = (
+            np.asarray(da2_al.values, dtype=np.float32)
+            - np.asarray(da1.values, dtype=np.float32)
+        )
+
+    diff_da = xr.DataArray(diff_vals, dims=da1.dims, coords=da1.coords, name=f"Delta_{idx_u}")
+    diff_da = diff_da.rio.write_crs(da1.rio.crs, inplace=False).rio.write_nodata(np.nan, inplace=False)
+    ch_summary = compute_change_summary(diff_da, resolution_m=aligned_res_m, threshold=eff_thr)
+    delta_uri, delta_bnds, delta_vmin, delta_vmax, delta_cmap = render_diverging_change_overlay(
+        diff_da,
+        src_epsg=target_epsg,
+        index_name=idx_u,
+        max_width=max_width,
+    )
+    return {
+        "diff_da": diff_da,
+        "change_summary": ch_summary,
+        "delta_overlay_uri": delta_uri,
+        "delta_overlay_bounds": delta_bnds,
+        "delta_vmin": delta_vmin,
+        "delta_vmax": delta_vmax,
+        "delta_cmap": delta_cmap,
+        "glacier_class_uri": glacier_class_uri,
+        "glacier_class_bounds": glacier_class_bnds,
+        "glacier_change_stats": glacier_change_stats,
         "aligned_resolution_m": round(aligned_res_m, 2),
     }
 
@@ -1727,16 +1866,31 @@ def build_multidate_visual_frames(
         else:
             ds_masked = ds_ep
 
-        # 2. Primary Spectral Index / SAR overlay, scalar mean & date-stamped PNG
+        # 2. Primary Spectral Index / SAR overlay, scalar mean, lightweight grid & date-stamped PNG
         idx_uri: str | None = None
         idx_png: bytes | None = None
         idx_mean: float | None = None
+        index_grid_small: dict[str, Any] | None = None
+        ndwi_grid_small: dict[str, Any] | None = None
+        nir_grid_small: dict[str, Any] | None = None
         try:
             da_idx = _compute_layer(ds_masked, sensor=sensor, metric_name=idx_key)
             vals_arr = np.asarray(da_idx.values, dtype=np.float32)
             fin = vals_arr[np.isfinite(vals_arr)]
             if fin.size > 0:
                 idx_mean = round(float(np.mean(fin)), 4)
+
+            try:
+                index_grid_small = _downsample_da_to_small_grid(da_idx, max_dim=280, fallback_crs=target_epsg)
+                if idx_key == "NDSI" and not is_sar:
+                    if "B08" in ds_masked.data_vars:
+                        nir_grid_small = _downsample_da_to_small_grid(ds_masked["B08"], max_dim=280, fallback_crs=target_epsg)
+                    if all(b in ds_masked.data_vars for b in ("B03", "B08")):
+                        da_ndwi_tmp = _compute_layer(ds_masked, sensor=sensor, metric_name="NDWI")
+                        ndwi_grid_small = _downsample_da_to_small_grid(da_ndwi_tmp, max_dim=280, fallback_crs=target_epsg)
+                        del da_ndwi_tmp
+            except Exception:
+                pass
 
             vmin_v = float(idx_spec["vmin"])
             vmax_v = float(idx_spec["vmax"])
@@ -1760,7 +1914,7 @@ def build_multidate_visual_frames(
                 cmap_name=cmap_n,
                 vmin=vmin_v,
                 vmax=vmax_v,
-                stamp_text=f"{act_date} | {plat_lbl}{mean_tag}",
+                stamp_text=f"{act_date} | {plat_banner}{mean_tag}",
                 max_width=max_thumb_width,
                 target_size=target_size,
             )
@@ -1868,18 +2022,46 @@ def build_multidate_visual_frames(
                     "extra_means": extra_means,
                     "rgb_png_bytes": rgb_png,
                     "index_png_bytes": idx_png,
+                    "index_grid_small": index_grid_small,
+                    "ndwi_grid_small": ndwi_grid_small,
+                    "nir_grid_small": nir_grid_small,
                 }
             )
 
-    # Pixel-aligned Δ between earliest and latest clear frames + diverging spatial change map overlay
+    # Pixel-aligned Δ between earliest and latest clear frames (water-aware for NDSI!)
     diff_da: xr.DataArray | None = None
     delta_uri: str | None = None
     delta_bnds: list[list[float]] | None = None
-    delta_vmin: float = -0.5
-    delta_vmax: float = 0.5
+    delta_vmin: float = -0.6
+    delta_vmax: float = 0.6
     delta_cmap: str = "RdBu"
+    glacier_class_uri: str | None = None
+    glacier_class_bnds: list[list[float]] | None = None
+    glacier_change_stats: dict[str, float] | None = None
 
-    if da_first is not None and da_last is not None and len(frames) >= 2:
+    if len(frames) >= 2:
+        try:
+            dyn_init = compute_dynamic_frame_delta(
+                frames[0],
+                frames[-1],
+                target_epsg=target_epsg,
+                index_name=idx_key,
+                max_width=overlay_max_width,
+            )
+            if isinstance(dyn_init, dict):
+                diff_da = dyn_init["diff_da"]
+                delta_uri = dyn_init["delta_overlay_uri"]
+                delta_bnds = dyn_init["delta_overlay_bounds"]
+                delta_vmin = dyn_init["delta_vmin"]
+                delta_vmax = dyn_init["delta_vmax"]
+                delta_cmap = dyn_init["delta_cmap"]
+                glacier_class_uri = dyn_init.get("glacier_class_uri")
+                glacier_class_bnds = dyn_init.get("glacier_class_bounds")
+                glacier_change_stats = dyn_init.get("glacier_change_stats")
+        except Exception as exc:
+            logger.warning("Dynamic Δ change overlay skipped: %s", exc)
+
+    if diff_da is None and da_first is not None and da_last is not None and len(frames) >= 2:
         try:
             da_l_aligned = da_last
             if not _grids_match(da_first, da_l_aligned):
@@ -1922,6 +2104,9 @@ def build_multidate_visual_frames(
         "delta_vmin": delta_vmin,
         "delta_vmax": delta_vmax,
         "delta_cmap": delta_cmap,
+        "glacier_class_uri": glacier_class_uri,
+        "glacier_class_bounds": glacier_class_bnds,
+        "glacier_change_stats": glacier_change_stats,
         "replacements": replacements,
     }
 

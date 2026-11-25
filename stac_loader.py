@@ -121,6 +121,7 @@ SEASON_SPRING: str = "spring"
 SEASON_AUTUMN: str = "autumn"
 SEASON_WINTER: str = "winter"
 SEASON_ALL_YEAR: str = "all_year"
+SEASON_GLACIER_ABLATION: str = "glacier_ablation"
 YEARLY_SEASON_KEYS: tuple[str, ...] = (
     SEASON_SUMMER,
     SEASON_SPRING,
@@ -134,6 +135,12 @@ YEARLY_SEASON_SPECS: dict[str, dict[str, Any]] = {
     SEASON_AUTUMN: {"months": (9, 10), "expanded_months": (8, 11), "mid_doy": 274},
     SEASON_WINTER: {"months": (12, 1, 2), "expanded_months": (11, 3), "mid_doy": 15},
     SEASON_ALL_YEAR: {"months": tuple(range(1, 13)), "expanded_months": (), "mid_doy": 196},
+    SEASON_GLACIER_ABLATION: {
+        "months": (7, 8, 9),
+        "doy_range": (196, 258),          # Jul 15 – Sep 15 (late-summer ablation minimum)
+        "expanded_months": (6, 7, 8, 9),  # Fallback to June only when zero late-summer scenes exist
+        "mid_doy": 227,                   # Aug 15
+    },
 }
 
 # Sentinel-2 granules with >= 95% nodata are corrupt/empty downlink gaps (often reporting 0.0% cloud!)
@@ -818,6 +825,7 @@ def filter_by_temporal_interval(
     season_spec = YEARLY_SEASON_SPECS[season_key]
     exact_months = set(season_spec["months"])
     expanded_months = set(season_spec["expanded_months"])
+    doy_range = season_spec.get("doy_range")
     mid_doy = int(season_spec["mid_doy"])
 
     selected_rows: list[dict[str, Any]] = []
@@ -828,7 +836,11 @@ def filter_by_temporal_interval(
         cands = buckets[bucket_key]
 
         if mode == INTERVAL_YEARLY and season_key != SEASON_ALL_YEAR:
-            in_season = [r for r in cands if int(r.get("_month", 0)) in exact_months]
+            if isinstance(doy_range, tuple) and len(doy_range) == 2:
+                d_lo, d_hi = int(doy_range[0]), int(doy_range[1])
+                in_season = [r for r in cands if d_lo <= int(r.get("_doy", 0)) <= d_hi]
+            else:
+                in_season = [r for r in cands if int(r.get("_month", 0)) in exact_months]
             if in_season:
                 cands = in_season
             else:

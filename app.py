@@ -147,6 +147,7 @@ from casovne_vrste import (
     compute_change_detection,
     compute_change_summary,
     compute_cloud_free_composite,
+    compute_dynamic_frame_delta,
     extract_time_series,
     generate_timelapse_frames,
     render_change_swipe_pair,
@@ -7889,6 +7890,28 @@ def _render_ai_chat_analysis_fragment(
 
             # --- TAB 2: Spatial Change Map (Δ = t2 - t1) & All Toggleable Layers ---
             with t_delta:
+                dd1, dd2 = st.columns(2, gap="small")
+                with dd1:
+                    delta_idx_t1 = st.selectbox(
+                        t("ai_mf_delta_t1", lang=lang),
+                        options=list(range(n_fr)),
+                        index=0,
+                        format_func=_frame_dropdown_label,
+                        key=f"ai_mf_delta_t1_{result_id}",
+                    )
+                with dd2:
+                    delta_idx_t2 = st.selectbox(
+                        t("ai_mf_delta_t2", lang=lang),
+                        options=list(range(n_fr)),
+                        index=n_fr - 1,
+                        format_func=_frame_dropdown_label,
+                        key=f"ai_mf_delta_t2_{result_id}",
+                    )
+
+                fr_d1 = frames_list[int(delta_idx_t1)]
+                fr_d2 = frames_list[int(delta_idx_t2)]
+                is_default_pair = int(delta_idx_t1) == 0 and int(delta_idx_t2) == (n_fr - 1)
+
                 ai_op_delta = st.slider(
                     t("opacity_layer_label"),
                     0,
@@ -7897,15 +7920,74 @@ def _render_ai_chat_analysis_fragment(
                     5,
                     key=f"ai_mf_delta_op_{result_id}",
                 )
+
+                # Instant on-the-fly Δ (t2 - t1) & GLIMS glacier retreat classification (0 STAC calls!)
                 d_cmap = str(ai_res_show.get("delta_cmap") or ("RdBu" if idx_lbl_ts in ("NDSI", "NDWI", "MNDWI") else "RdYlGn"))
-                d_vmin = float(ai_res_show.get("delta_vmin", -0.5))
-                d_vmax = float(ai_res_show.get("delta_vmax", 0.5))
+                d_vmin = float(ai_res_show.get("delta_vmin", -0.6))
+                d_vmax = float(ai_res_show.get("delta_vmax", 0.6))
+                dyn_delta_uri = ai_res_show.get("delta_overlay_uri") if is_default_pair else None
+                dyn_delta_bnds = ai_res_show.get("delta_overlay_bounds") if is_default_pair else None
+                dyn_g_uri = ai_res_show.get("glacier_class_uri") if is_default_pair else None
+                dyn_g_bnds = ai_res_show.get("glacier_class_bounds") if is_default_pair else None
+                dyn_g_stats = ai_res_show.get("glacier_change_stats") if is_default_pair else None
+                dyn_delta_mean: float | None = None
+
+                if fr_d1.get("index_grid_small") is not None and fr_d2.get("index_grid_small") is not None:
+                    try:
+                        dyn_out = compute_dynamic_frame_delta(
+                            fr_d1,
+                            fr_d2,
+                            target_epsg=str(ai_res_show.get("crs") or "EPSG:3794"),
+                            index_name=idx_lbl_ts,
+                        )
+                        if dyn_out.get("delta_overlay_uri"):
+                            dyn_delta_uri = dyn_out["delta_overlay_uri"]
+                            dyn_delta_bnds = dyn_out["delta_overlay_bounds"]
+                            d_vmin = float(dyn_out.get("delta_vmin", d_vmin))
+                            d_vmax = float(dyn_out.get("delta_vmax", d_vmax))
+                            d_cmap = str(dyn_out.get("delta_cmap") or d_cmap)
+                            dyn_delta_mean = dyn_out.get("delta_mean")
+                        if dyn_out.get("glacier_class_uri"):
+                            dyn_g_uri = dyn_out["glacier_class_uri"]
+                            dyn_g_bnds = dyn_out["glacier_class_bounds"]
+                        if isinstance(dyn_out.get("glacier_change_stats"), dict):
+                            dyn_g_stats = dyn_out["glacier_change_stats"]
+                    except Exception:
+                        pass
+
+                if dyn_delta_mean is None and fr_d1.get("index_mean") is not None and fr_d2.get("index_mean") is not None:
+                    dyn_delta_mean = float(fr_d2["index_mean"]) - float(fr_d1["index_mean"])
+
+                # Quantitative KPI row for selected (t1 -> t2) pair
+                if isinstance(dyn_g_stats, dict) and idx_lbl_ts == "NDSI":
+                    gk1, gk2, gk3, gk4 = st.columns(4, gap="small")
+                    gk1.metric(
+                        t("ai_mf_glacier_loss_land", lang=lang),
+                        f"{float(dyn_g_stats.get('ice_loss_land_ha', 0.0)):.1f} ha",
+                    )
+                    gk2.metric(
+                        t("ai_mf_glacier_new_lake", lang=lang),
+                        f"{float(dyn_g_stats.get('new_proglacial_lake_ha', 0.0)):.1f} ha",
+                    )
+                    gk3.metric(
+                        t("ai_mf_glacier_gain", lang=lang),
+                        f"{float(dyn_g_stats.get('ice_gain_ha', 0.0)):.1f} ha",
+                    )
+                    gk4.metric(
+                        f"Δ {idx_lbl_ts} (t2 − t1)",
+                        f"{dyn_delta_mean:+.3f}" if dyn_delta_mean is not None else "—",
+                    )
+                elif dyn_delta_mean is not None:
+                    st.markdown(
+                        f"**Δ {idx_lbl_ts} ({fr_d1['date']} → {fr_d2['date']}):** `{dyn_delta_mean:+.3f}`"
+                    )
+
                 st.markdown(
                     build_horizontal_colorbar_html(
                         d_cmap,
                         d_vmin,
                         d_vmax,
-                        label=f"Δ {idx_lbl_ts} (t2 − t1)",
+                        label=f"Δ {idx_lbl_ts} ({fr_d1['date']} → {fr_d2['date']})",
                         units="°C" if idx_lbl_ts == "LST" else "",
                     ),
                     unsafe_allow_html=True,
@@ -7915,64 +7997,76 @@ def _render_ai_chat_analysis_fragment(
                     if idx_lbl_ts == "NDSI"
                     else t("ai_mf_delta_legend_generic", lang=lang)
                 )
+                if dyn_g_uri:
+                    st.caption(t("ai_mf_glacier_class_legend", lang=lang))
 
-                f_first, f_latest = frames_list[0], frames_list[-1]
                 delta_layers: list[dict[str, Any]] = []
-                if f_first.get("rgb_overlay_uri") and f_first.get("bounds_4326"):
+                if fr_d1.get("rgb_overlay_uri") and fr_d1.get("bounds_4326"):
                     delta_layers.append(
                         {
-                            "name": f"🛰️ RGB (t1: {f_first['date']})",
-                            "image": f_first["rgb_overlay_uri"],
-                            "bounds": f_first["bounds_4326"],
+                            "name": f"🛰️ RGB (t1: {fr_d1['date']})",
+                            "image": fr_d1["rgb_overlay_uri"],
+                            "bounds": fr_d1["bounds_4326"],
                             "opacity": 1.0,
                             "show": False,
                             "zindex": 11,
                         }
                     )
-                if f_latest.get("rgb_overlay_uri") and f_latest.get("bounds_4326"):
+                if fr_d2.get("rgb_overlay_uri") and fr_d2.get("bounds_4326"):
                     delta_layers.append(
                         {
-                            "name": f"🛰️ RGB (t2: {f_latest['date']})",
-                            "image": f_latest["rgb_overlay_uri"],
-                            "bounds": f_latest["bounds_4326"],
+                            "name": f"🛰️ RGB (t2: {fr_d2['date']})",
+                            "image": fr_d2["rgb_overlay_uri"],
+                            "bounds": fr_d2["bounds_4326"],
                             "opacity": 1.0,
                             "show": True,
                             "zindex": 12,
                         }
                     )
-                if f_latest.get("index_overlay_uri") and f_latest.get("bounds_4326"):
+                if fr_d2.get("index_overlay_uri") and fr_d2.get("bounds_4326"):
                     delta_layers.append(
                         {
-                            "name": f"📊 {idx_lbl_ts} (t2: {f_latest['date']})",
-                            "image": f_latest["index_overlay_uri"],
-                            "bounds": f_latest["bounds_4326"],
+                            "name": f"📊 {idx_lbl_ts} (t2: {fr_d2['date']})",
+                            "image": fr_d2["index_overlay_uri"],
+                            "bounds": fr_d2["bounds_4326"],
                             "opacity": float(ai_op_delta) / 100.0,
                             "show": False,
                             "zindex": 14,
                         }
                     )
                 for ex_i, ex_c in enumerate(extra_codes_avail):
-                    ex_u = (f_latest.get("extra_overlays") or {}).get(ex_c)
-                    if ex_u and f_latest.get("bounds_4326"):
+                    ex_u = (fr_d2.get("extra_overlays") or {}).get(ex_c)
+                    if ex_u and fr_d2.get("bounds_4326"):
                         delta_layers.append(
                             {
-                                "name": f"{_layer_pill_label(ex_c)} (t2: {f_latest['date']})",
+                                "name": f"{_layer_pill_label(ex_c)} (t2: {fr_d2['date']})",
                                 "image": ex_u,
-                                "bounds": f_latest["bounds_4326"],
+                                "bounds": fr_d2["bounds_4326"],
                                 "opacity": float(ai_op_delta) / 100.0,
                                 "show": False,
                                 "zindex": 15 + ex_i,
                             }
                         )
-                if ai_res_show.get("delta_overlay_uri") and ai_res_show.get("delta_overlay_bounds"):
+                if dyn_delta_uri and dyn_delta_bnds:
                     delta_layers.append(
                         {
-                            "name": t("ai_mf_delta_layer_name", lang=lang, idx=idx_lbl_ts),
-                            "image": ai_res_show["delta_overlay_uri"],
-                            "bounds": ai_res_show["delta_overlay_bounds"],
+                            "name": f"🔥 Δ {idx_lbl_ts} ({fr_d1['date']} → {fr_d2['date']})",
+                            "image": dyn_delta_uri,
+                            "bounds": dyn_delta_bnds,
                             "opacity": float(ai_op_delta) / 100.0,
                             "show": True,
                             "zindex": 20,
+                        }
+                    )
+                if dyn_g_uri and dyn_g_bnds:
+                    delta_layers.append(
+                        {
+                            "name": t("ai_mf_glacier_class_layer", lang=lang),
+                            "image": dyn_g_uri,
+                            "bounds": dyn_g_bnds,
+                            "opacity": float(ai_op_delta) / 100.0,
+                            "show": False,
+                            "zindex": 22,
                         }
                     )
 
