@@ -45,6 +45,7 @@ if _APP_DIR not in sys.path:
 _LOCAL_MODULES_ORDER: tuple[str, ...] = (
     "github_sync",
     "auth",
+    "projekti",
     "geodezija_crs",
     "map_overlay",
     "kartografija",
@@ -90,6 +91,18 @@ from github_sync import (
     get_github_sync_status,
     github_restore_all_on_startup,
     is_github_sync_configured,
+)
+from projekti import (
+    delete_map_layout,
+    delete_user_project,
+    export_user_bundle_json,
+    import_user_bundle_json,
+    list_map_layouts,
+    list_user_projects,
+    load_last_session,
+    save_last_session,
+    save_map_layout,
+    save_user_project,
 )
 from ai_pomocnik import (
     AI_EXAMPLE_PROMPTS,
@@ -5897,6 +5910,65 @@ def _render_cartography_fragment(
                     st.session_state["tab4_pending_preset"] = "crisis"
                     st.rerun(scope="fragment")
 
+            _auth_u_ws4 = st.session_state.get("auth_user")
+            if isinstance(_auth_u_ws4, dict) and _auth_u_ws4.get("username"):
+                _uname_ws4 = str(_auth_u_ws4["username"])
+                st.divider()
+                st.caption(t("carto_saved_tpl_header", lang=lang))
+                sv_c1, sv_c2 = st.columns([1.45, 0.95], gap="small")
+                with sv_c1:
+                    tpl_name_in = st.text_input(
+                        t("carto_saved_tpl_header", lang=lang),
+                        placeholder=t("carto_saved_tpl_name_ph", lang=lang),
+                        label_visibility="collapsed",
+                        key="tab4_saved_tpl_name_in",
+                    )
+                with sv_c2:
+                    if st.button(
+                        t("carto_saved_tpl_save_btn", lang=lang),
+                        width="stretch",
+                        key="tab4_saved_tpl_save_btn",
+                    ):
+                        clean_tn = str(tpl_name_in or "").strip()
+                        if clean_tn:
+                            cur_cfg_save = dict(
+                                st.session_state.get("tab4_layout_config") or DEFAULT_LAYOUT_CONFIG
+                            )
+                            save_map_layout(_uname_ws4, clean_tn, cur_cfg_save, sync=True)
+                            _maybe_auto_save_session()
+                            st.success(t("carto_saved_tpl_saved_ok", lang=lang, name=clean_tn))
+                            st.rerun(scope="fragment")
+
+                _user_layouts = list_map_layouts(_uname_ws4)
+                if _user_layouts:
+                    _lnames = list(_user_layouts.keys())
+                    sel_tpl = st.selectbox(
+                        t("carto_saved_tpl_select_label", lang=lang),
+                        options=_lnames,
+                        key="tab4_saved_tpl_select",
+                    )
+                    tl_c1, tl_c2 = st.columns(2, gap="small")
+                    with tl_c1:
+                        if st.button(
+                            t("carto_saved_tpl_load_btn", lang=lang),
+                            width="stretch",
+                            key="tab4_saved_tpl_load_btn",
+                        ):
+                            _cfg_load = (_user_layouts.get(sel_tpl) or {}).get("config")
+                            if isinstance(_cfg_load, dict):
+                                st.session_state["tab4_pending_layout_overrides"] = dict(_cfg_load)
+                                st.toast(t("carto_saved_tpl_loaded_ok", lang=lang, name=sel_tpl))
+                                st.rerun(scope="fragment")
+                    with tl_c2:
+                        if st.button(
+                            t("carto_saved_tpl_del_btn", lang=lang),
+                            width="stretch",
+                            key="tab4_saved_tpl_del_btn",
+                        ):
+                            delete_map_layout(_uname_ws4, sel_tpl, sync=True)
+                            st.success(t("carto_saved_tpl_deleted_ok", lang=lang, name=sel_tpl))
+                            st.rerun(scope="fragment")
+
         # --- EXPANDER 2: Title, Notes & Footer ---
         with st.expander(t("carto_exp_2_text"), expanded=False):
             chk_title = st.toggle(t("carto_chk_title"), key="tab4_chk_title")
@@ -7198,11 +7270,15 @@ def _apply_user_profile_prefs_to_session(profile: dict[str, Any]) -> None:
     if pref_model:
         st.session_state["gemini_model"] = pref_model
 
+    auto_save = bool(profile.get("auto_save_session", True))
+    st.session_state["auth_auto_save_session"] = auto_save
+
     st.session_state["_auth_last_saved_prefs"] = {
         "preferred_lang": str(st.session_state.get("lang", "sl")),
         "preferred_crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
         "preferred_resolution": int(st.session_state.get("selected_resolution", 10)),
         "preferred_gemini_model": str(st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)),
+        "auto_save_session": auto_save,
     }
 
 
@@ -7217,6 +7293,7 @@ def _sync_logged_in_profile_prefs() -> None:
         "preferred_crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
         "preferred_resolution": int(st.session_state.get("selected_resolution", 10)),
         "preferred_gemini_model": str(st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)),
+        "auto_save_session": bool(st.session_state.get("auth_auto_save_session", True)),
     }
     last_saved = st.session_state.get("_auth_last_saved_prefs")
     if last_saved == cur_prefs:
@@ -7231,6 +7308,233 @@ def _sync_logged_in_profile_prefs() -> None:
         )
         st.session_state["auth_user"] = updated
         st.session_state["_auth_last_saved_prefs"] = dict(cur_prefs)
+    except Exception:
+        pass
+
+
+def _collect_current_workspace_payload(
+    *,
+    center_lat: float | None = None,
+    center_lon: float | None = None,
+    bbox_4326: Sequence[float] | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    loc_label: str | None = None,
+) -> dict[str, Any]:
+    """Build a lightweight, strictly JSON-safe snapshot of the current user workspace."""
+    c_lat = float(center_lat if center_lat is not None else st.session_state.get("map_lat", SLOVENIA_CENTER_LAT))
+    c_lon = float(center_lon if center_lon is not None else st.session_state.get("map_lon", SLOVENIA_CENTER_LON))
+    rad_m = int(st.session_state.get("map_radius_m", 2000))
+    l_name = str(loc_label or st.session_state.get("active_location_label") or "Ljubljana")
+    poly_geo = aoi_polygon_4326 if aoi_polygon_4326 is not None else (
+        st.session_state.get("drawn_polygon_4326") or st.session_state.get("uploaded_geojson_aoi")
+    )
+    bbox_list = [float(v) for v in bbox_4326] if (bbox_4326 is not None and len(bbox_4326) == 4) else (
+        [float(v) for v in st.session_state["search_bbox_4326"]]
+        if (isinstance(st.session_state.get("search_bbox_4326"), (list, tuple)) and len(st.session_state["search_bbox_4326"]) == 4)
+        else None
+    )
+
+    s_date = st.session_state.get("search_start_date")
+    e_date = st.session_state.get("search_end_date")
+    start_str = s_date.isoformat() if isinstance(s_date, (date, datetime)) else str(s_date or "")
+    end_str = e_date.isoformat() if isinstance(e_date, (date, datetime)) else str(e_date or "")
+
+    # Compact analysis summary (scalars/metadata only, zero rasters)
+    analysis_summary: dict[str, Any] = {}
+    t2_meta = st.session_state.get("tab2_index_meta")
+    if isinstance(t2_meta, dict):
+        analysis_summary["active_index"] = t2_meta.get("index_code") or t2_meta.get("name")
+        analysis_summary["index_date"] = t2_meta.get("date_str")
+    t2_stats = st.session_state.get("tab2_index_stats")
+    if isinstance(t2_stats, dict):
+        analysis_summary["index_mean"] = t2_stats.get("mean")
+        analysis_summary["index_median"] = t2_stats.get("median")
+    t2_snow = st.session_state.get("tab2_snow_stats")
+    if isinstance(t2_snow, dict):
+        analysis_summary["snow_area_km2"] = t2_snow.get("snow_area_km2")
+        analysis_summary["snowline_m"] = t2_snow.get("snowline_elevation_m")
+    t5_dis = st.session_state.get("tab5_disaster_result")
+    if isinstance(t5_dis, dict):
+        analysis_summary["disaster_type"] = t5_dis.get("disaster_type")
+        analysis_summary["affected_area_ha"] = t5_dis.get("affected_area_ha")
+        analysis_summary["affected_area_km2"] = t5_dis.get("affected_area_km2")
+    t7_gnss = st.session_state.get("tab7_gnss_result")
+    if isinstance(t7_gnss, dict):
+        analysis_summary["gnss_date"] = t7_gnss.get("date_str")
+        analysis_summary["gnss_best_pdop"] = t7_gnss.get("min_pdop")
+
+    return {
+        "aoi": {
+            "location_name": l_name,
+            "center_lat": round(c_lat, 6),
+            "center_lon": round(c_lon, 6),
+            "radius_m": rad_m,
+            "bbox_4326": bbox_list,
+            "custom_polygon_geojson": poly_geo if isinstance(poly_geo, dict) else None,
+        },
+        "settings": {
+            "sensor": str(st.session_state.get("selected_sensor", SENSOR_S2)),
+            "start_date": start_str,
+            "end_date": end_str,
+            "interval": str(st.session_state.get("temporal_interval", INTERVAL_ALL)),
+            "target_season": str(st.session_state.get("yearly_target_season", SEASON_SUMMER)),
+            "max_cloud_pct": int(st.session_state.get("search_max_cloud", 20)),
+            "resolution_m": int(st.session_state.get("selected_resolution", 10)),
+            "crs_mode": str(st.session_state.get("sidebar_crs_mode", "auto")),
+            "basemap": str(st.session_state.get("map_basemap", "satellite")),
+            "exclude_l7_slc": bool(st.session_state.get("exclude_l7_slc_off", True)),
+            "min_swath_coverage": 95 if bool(st.session_state.get("exclude_partial_swaths", True)) else 0,
+        },
+        "cartography_layout": dict(st.session_state.get("tab4_layout_config") or DEFAULT_LAYOUT_CONFIG),
+        "analysis_summary": analysis_summary,
+        "ai_chat_messages": list(st.session_state.get("ai_chat_messages") or []),
+    }
+
+
+def _apply_project_payload_to_session(payload: dict[str, Any]) -> None:
+    """Restore a saved project or last-session snapshot into Streamlit session state before widgets render."""
+    if not isinstance(payload, dict):
+        return
+
+    # 1. Restore AOI
+    aoi = payload.get("aoi")
+    if isinstance(aoi, dict):
+        if aoi.get("location_name"):
+            st.session_state["active_location_label"] = str(aoi["location_name"])
+        if aoi.get("center_lat") is not None and aoi.get("center_lon") is not None:
+            try:
+                st.session_state["map_lat"] = float(aoi["center_lat"])
+                st.session_state["map_lon"] = float(aoi["center_lon"])
+                st.session_state["map_jump_version"] = int(st.session_state.get("map_jump_version", 0)) + 1
+            except (TypeError, ValueError):
+                pass
+        if aoi.get("radius_m") is not None:
+            try:
+                _max_r = int(get_ram_limits()["max_radius_m"])
+                r_val = max(250, min(int(aoi["radius_m"]), _max_r))
+                st.session_state["map_radius_m"] = r_val
+                st.session_state["ws1_map_radius_slider"] = r_val
+            except (TypeError, ValueError):
+                pass
+        poly = aoi.get("custom_polygon_geojson")
+        if isinstance(poly, dict) and poly.get("type"):
+            st.session_state["drawn_polygon_4326"] = poly
+            st.session_state["sidebar_aoi_mode"] = "draw"
+            st.session_state["draw_map_version"] = int(st.session_state.get("draw_map_version", 0)) + 1
+        else:
+            st.session_state["drawn_polygon_4326"] = None
+            st.session_state["uploaded_geojson_aoi"] = None
+            st.session_state["sidebar_aoi_mode"] = "map"
+
+    # 2. Restore Settings
+    settings = payload.get("settings")
+    if isinstance(settings, dict):
+        sens = str(settings.get("sensor") or "")
+        if sens in SENSOR_META:
+            st.session_state["selected_sensor"] = sens
+            st.session_state["active_sensor"] = sens
+            st.session_state["sidebar_sensor_select"] = sens
+            st.session_state["main_bar_sensor_select"] = sens
+            st.session_state["tab3_sensor_select"] = sens
+
+        for s_key, targets in (
+            ("start_date", ("search_start_date", "sidebar_start_date", "tab3_start_date")),
+            ("end_date", ("search_end_date", "sidebar_end_date", "tab3_end_date")),
+        ):
+            raw_d = settings.get(s_key)
+            if raw_d:
+                try:
+                    parsed_d = date.fromisoformat(str(raw_d)[:10])
+                    for tk in targets:
+                        st.session_state[tk] = parsed_d
+                except ValueError:
+                    pass
+
+        if settings.get("interval") in INTERVAL_KEYS:
+            iv = str(settings["interval"])
+            st.session_state["temporal_interval"] = iv
+            st.session_state["sidebar_interval_select"] = iv
+            st.session_state["tab3_interval_select"] = iv
+
+        if settings.get("target_season") in SEASON_KEYS:
+            ts = str(settings["target_season"])
+            st.session_state["yearly_target_season"] = ts
+            st.session_state["sidebar_yearly_season"] = ts
+            st.session_state["tab3_yearly_season"] = ts
+
+        if settings.get("max_cloud_pct") is not None:
+            try:
+                mc = max(0, min(100, int(settings["max_cloud_pct"])))
+                st.session_state["search_max_cloud"] = mc
+                st.session_state["sidebar_max_cloud"] = mc
+                st.session_state["tab3_max_cloud"] = mc
+            except (TypeError, ValueError):
+                pass
+
+        if settings.get("resolution_m") is not None:
+            try:
+                res_m = int(settings["resolution_m"])
+                cur_s = str(st.session_state.get("selected_sensor", SENSOR_S2))
+                if res_m in SENSOR_META.get(cur_s, {}).get("res_options", []):
+                    st.session_state["selected_resolution"] = res_m
+                    st.session_state[f"sidebar_res_select_{cur_s}"] = res_m
+                    st.session_state["last_rec_res_key"] = f"{cur_s}_{res_m}"
+            except (TypeError, ValueError):
+                pass
+
+        if settings.get("crs_mode") in CRS_MODE_KEYS:
+            st.session_state["sidebar_crs_mode"] = str(settings["crs_mode"])
+
+        if settings.get("basemap") in BASEMAP_KEYS:
+            st.session_state["map_basemap"] = str(settings["basemap"])
+
+        if "exclude_l7_slc" in settings:
+            v_l7 = bool(settings["exclude_l7_slc"])
+            st.session_state["exclude_l7_slc_off"] = v_l7
+            st.session_state["sidebar_l7_slc_exclude"] = v_l7
+            st.session_state["tab3_l7_slc_exclude"] = v_l7
+
+        if "min_swath_coverage" in settings:
+            v_ex = float(settings.get("min_swath_coverage") or 0) >= 50.0
+            st.session_state["exclude_partial_swaths"] = v_ex
+            st.session_state["sidebar_exclude_partial"] = v_ex
+            st.session_state["tab3_exclude_partial"] = v_ex
+
+    # 3. Restore QGIS-style Cartography LayoutConfig
+    layout = payload.get("cartography_layout")
+    if isinstance(layout, dict) and layout:
+        merged_l = merge_layout_config(layout)
+        st.session_state["tab4_layout_config"] = merged_l
+        st.session_state["tab4_pending_layout_overrides"] = dict(merged_l)
+
+    # 4. Restore text AI chat history into Workspace 5
+    chats = payload.get("ai_chat_messages")
+    if isinstance(chats, list):
+        st.session_state["ai_chat_messages"] = [
+            {
+                "role": "user" if m.get("role") == "user" else "assistant",
+                "content": str(m.get("content") or ""),
+                "action": m.get("action"),
+                "plan": m.get("plan"),
+                "result_id": None,
+                "fallback_note": str(m.get("fallback_note") or ""),
+            }
+            for m in chats
+            if isinstance(m, dict) and str(m.get("content") or "").strip()
+        ]
+        st.session_state["ai_chat_results"] = {}
+
+
+def _maybe_auto_save_session() -> None:
+    """Auto-save lightweight active session to ``last_session.json`` + GitHub Cloud if enabled."""
+    auth_user = st.session_state.get("auth_user")
+    if not isinstance(auth_user, dict) or not auth_user.get("username"):
+        return
+    if not bool(st.session_state.get("auth_auto_save_session", True)):
+        return
+    try:
+        payload = _collect_current_workspace_payload()
+        save_last_session(str(auth_user["username"]), payload, sync=True, show_toast=False)
     except Exception:
         pass
 
@@ -7262,6 +7566,13 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                 f'<div class="{badge_cls}" title="{gh_status["detail"]}">{gh_status["badge_text"]}</div>',
                 unsafe_allow_html=True,
             )
+            st.session_state.setdefault(
+                "auth_auto_save_session", bool(auth_user.get("auto_save_session", True))
+            )
+            st.toggle(
+                t("auth_auto_save_toggle", lang=lang),
+                key="auth_auto_save_session",
+            )
             col_sync, col_out = st.columns([1.25, 0.85], gap="small")
             with col_sync:
                 if st.button(
@@ -7285,10 +7596,12 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                 ):
                     st.session_state.pop("auth_user", None)
                     st.session_state.pop("_auth_last_saved_prefs", None)
+                    st.session_state.pop("_pending_restore_last_session", None)
                     st.session_state["_auth_flash_msg"] = t("auth_logout_ok", lang=lang)
                     st.rerun()
         else:
             st.caption(t("auth_guest_badge", lang=lang))
+            st.caption(t("auth_guest_cloud_hint", lang=lang))
             with st.expander(t("auth_expander_label", lang=lang), expanded=False):
                 tab_login, tab_reg = st.tabs(
                     [t("auth_tab_login", lang=lang), t("auth_tab_register", lang=lang)]
@@ -7314,6 +7627,9 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                         if ok and profile is not None:
                             st.session_state["auth_user"] = profile
                             st.session_state["_auth_pending_profile"] = profile
+                            last_sess = load_last_session(str(profile.get("username", "")))
+                            if last_sess is not None:
+                                st.session_state["_pending_restore_last_session"] = last_sess
                             st.session_state["_auth_flash_msg"] = t(msg_key, lang=lang)
                             st.rerun()
                         else:
@@ -7356,6 +7672,7 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                                 "preferred_gemini_model": str(
                                     st.session_state.get("gemini_model", DEFAULT_GEMINI_MODEL)
                                 ),
+                                "auto_save_session": True,
                             }
                             ok, msg_key, profile = register_user(
                                 reg_u,
@@ -7373,6 +7690,151 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                                 st.error(t(msg_key, lang=lang))
 
 
+def _render_sidebar_projects_manager(
+    *,
+    lang: str,
+    center_lat: float,
+    center_lon: float,
+    bbox_4326: Sequence[float] | None,
+    aoi_polygon_4326: dict[str, Any] | None,
+    loc_label: str,
+) -> None:
+    """Render the collapsible '💾 Moji projekti (N)' manager in the Sidebar for logged-in users."""
+    auth_user = st.session_state.get("auth_user")
+    if not isinstance(auth_user, dict) or not auth_user.get("username"):
+        return
+    uname = str(auth_user["username"])
+    projects = list_user_projects(uname)
+
+    with st.expander(t("proj_expander_title", lang=lang, n=len(projects)), expanded=False):
+        p_name = st.text_input(
+            t("proj_name_label", lang=lang),
+            placeholder=t("proj_name_placeholder", lang=lang),
+            key="sb_proj_name_input",
+        )
+        p_note = st.text_input(
+            t("proj_note_label", lang=lang),
+            placeholder=t("proj_note_placeholder", lang=lang),
+            key="sb_proj_note_input",
+        )
+        if st.button(
+            t("proj_btn_save", lang=lang),
+            type="primary",
+            width="stretch",
+            key="sb_proj_save_btn",
+        ):
+            clean_pn = str(p_name or "").strip()
+            if not clean_pn:
+                st.warning(t("proj_save_err_empty", lang=lang))
+            else:
+                payload = _collect_current_workspace_payload(
+                    center_lat=center_lat,
+                    center_lon=center_lon,
+                    bbox_4326=bbox_4326,
+                    aoi_polygon_4326=aoi_polygon_4326,
+                    loc_label=loc_label,
+                )
+                save_user_project(uname, clean_pn, str(p_note or ""), payload, sync=True)
+                _maybe_auto_save_session()
+                st.success(t("proj_saved_ok", lang=lang, name=clean_pn))
+                st.rerun()
+
+        st.divider()
+        if not projects:
+            st.caption(t("proj_list_empty", lang=lang))
+        else:
+            proj_ids = [str(p["id"]) for p in projects]
+            proj_map = {str(p["id"]): p for p in projects}
+
+            def _fmt_proj(pid: str) -> str:
+                pr = proj_map[pid]
+                loc = str((pr.get("aoi") or {}).get("location_name") or "—")
+                sens = str((pr.get("settings") or {}).get("sensor") or "S2")
+                s_short = SENSOR_META.get(sens, {}).get("short_name", sens)
+                upd = str(pr.get("updated_at") or "")[:10]
+                return f"{pr['name']} · {loc} · {s_short} · {upd}"
+
+            sel_pid = st.selectbox(
+                t("proj_select_label", lang=lang),
+                options=proj_ids,
+                format_func=_fmt_proj,
+                key="sb_proj_selected_id",
+            )
+            sel_proj = proj_map.get(sel_pid)
+            if sel_proj and sel_proj.get("note"):
+                st.caption(f"📝 {sel_proj['note']}")
+
+            c_ld, c_up, c_dl = st.columns(3, gap="small")
+            with c_ld:
+                if st.button(t("proj_btn_load", lang=lang), width="stretch", key="sb_proj_load_btn"):
+                    if sel_proj is not None:
+                        st.session_state["_pending_project_load"] = sel_proj
+                        st.session_state["_pending_toast_msg"] = t(
+                            "proj_loaded_toast", lang=lang, name=sel_proj["name"]
+                        )
+                        st.rerun()
+            with c_up:
+                if st.button(t("proj_btn_update", lang=lang), width="stretch", key="sb_proj_upd_btn"):
+                    if sel_proj is not None:
+                        payload = _collect_current_workspace_payload(
+                            center_lat=center_lat,
+                            center_lon=center_lon,
+                            bbox_4326=bbox_4326,
+                            aoi_polygon_4326=aoi_polygon_4326,
+                            loc_label=loc_label,
+                        )
+                        save_user_project(
+                            uname,
+                            str(sel_proj["name"]),
+                            str(p_note or sel_proj.get("note") or ""),
+                            payload,
+                            overwrite_id=str(sel_proj["id"]),
+                            sync=True,
+                        )
+                        st.success(t("proj_updated_ok", lang=lang, name=sel_proj["name"]))
+                        st.rerun()
+            with c_dl:
+                if st.button(t("proj_btn_delete", lang=lang), width="stretch", key="sb_proj_del_btn"):
+                    if sel_proj is not None:
+                        delete_user_project(uname, str(sel_proj["id"]), sync=True)
+                        st.success(t("proj_deleted_ok", lang=lang, name=sel_proj["name"]))
+                        st.rerun()
+
+        st.divider()
+        st.caption(t("proj_backup_header", lang=lang))
+        bundle_bytes = export_user_bundle_json(uname)
+        st.download_button(
+            t("proj_btn_export_json", lang=lang),
+            data=bundle_bytes,
+            file_name=f"eo_backup_{uname}_{date.today().isoformat()}.json",
+            mime="application/json",
+            width="stretch",
+            key="sb_proj_export_json_btn",
+        )
+        up_json = st.file_uploader(
+            t("proj_import_label", lang=lang),
+            type=["json"],
+            key="sb_proj_import_json",
+        )
+        if up_json is not None:
+            import_sig = f"{up_json.name}:{up_json.size}"
+            if st.session_state.get("_last_imported_bundle_sig") != import_sig:
+                try:
+                    counts = import_user_bundle_json(uname, up_json.getvalue(), sync=True)
+                    st.session_state["_last_imported_bundle_sig"] = import_sig
+                    st.success(
+                        t(
+                            "proj_import_ok",
+                            lang=lang,
+                            p=counts["projects"],
+                            l=counts["map_layouts"],
+                        )
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(t("proj_import_err", lang=lang, err=exc))
+
+
 def main() -> None:
     _init_session_state()
     github_restore_all_on_startup()
@@ -7380,6 +7842,14 @@ def main() -> None:
     pending_prof = st.session_state.pop("_auth_pending_profile", None)
     if isinstance(pending_prof, dict):
         _apply_user_profile_prefs_to_session(pending_prof)
+
+    pending_proj = st.session_state.pop("_pending_project_load", None)
+    if isinstance(pending_proj, dict):
+        _apply_project_payload_to_session(pending_proj)
+
+    pending_toast = st.session_state.pop("_pending_toast_msg", None)
+    if pending_toast:
+        st.toast(str(pending_toast))
 
     pending_ws = st.session_state.pop("pending_workspace", None)
     if pending_ws in WORKSPACE_KEYS:
@@ -7472,6 +7942,14 @@ def main() -> None:
 
         # --- 0. Opcijski uporabniški profil (Gost / Prijava / GitHub Cloud) ---
         _render_sidebar_user_profile_card(lang)
+        _render_sidebar_projects_manager(
+            lang=lang,
+            center_lat=float(center_lat),
+            center_lon=float(center_lon),
+            bbox_4326=bbox_4326,
+            aoi_polygon_4326=aoi_polygon_4326,
+            loc_label=str(loc_label),
+        )
 
         crs_mode_cur = str(st.session_state.get("sidebar_crs_mode", "auto"))
         if crs_mode_cur not in CRS_MODE_KEYS:
@@ -7717,6 +8195,34 @@ def main() -> None:
         f"</div>"
     )
     st.markdown(header_html, unsafe_allow_html=True)
+
+    _pend_last_sess = st.session_state.get("_pending_restore_last_session")
+    if isinstance(_pend_last_sess, dict) and isinstance(st.session_state.get("auth_user"), dict):
+        saved_at_str = str(_pend_last_sess.get("saved_at") or "")[:16].replace("T", " ")
+        with st.container(border=True):
+            rc1, rc2, rc3 = st.columns([3.2, 1.3, 0.7], vertical_alignment="center")
+            with rc1:
+                st.markdown(t("proj_restore_last_banner", lang=lang, saved_at=saved_at_str))
+            with rc2:
+                if st.button(
+                    t("proj_restore_last_btn", lang=lang),
+                    type="primary",
+                    width="stretch",
+                    key="banner_restore_last_sess_btn",
+                ):
+                    st.session_state["_pending_project_load"] = st.session_state.pop(
+                        "_pending_restore_last_session", None
+                    )
+                    st.session_state["_pending_toast_msg"] = t("proj_restored_session_toast", lang=lang)
+                    st.rerun()
+            with rc3:
+                if st.button(
+                    t("proj_restore_last_dismiss", lang=lang),
+                    width="stretch",
+                    key="banner_dismiss_last_sess_btn",
+                ):
+                    st.session_state.pop("_pending_restore_last_session", None)
+                    st.rerun()
 
     # 5-Workspace Top Navigation (izvede se SAMO aktivni delovni prostor -> 3–5× hitrejše delovanje!)
     active_ws = _touch_selector(
@@ -10195,11 +10701,20 @@ def main() -> None:
     # WORKSPACE 5: KONVERZACIJSKI AI AGENT ZA DALJINSKO ZAZNAVANJE (GEMINI)
     # =======================================================================
     elif active_ws == "ws_ai":
-        hdr_col, new_col = st.columns([3.8, 1.0], vertical_alignment="bottom")
+        _auth_u_ws5 = st.session_state.get("auth_user")
+        _ws5_logged_in = isinstance(_auth_u_ws5, dict) and bool(_auth_u_ws5.get("username"))
+        hdr_col, new_col = st.columns([3.5, 1.3], vertical_alignment="bottom")
         with hdr_col:
             st.subheader(t("ai_header"))
             st.caption(t("ai_intro"))
         with new_col:
+            if _ws5_logged_in:
+                st.markdown(
+                    f'<div style="text-align:right;margin-bottom:4px;">'
+                    f'<span class="geo-badge">{t("ai_chat_cloud_pill", lang=lang)}</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
             if st.button(
                 t("ai_chat_new_btn"),
                 width="stretch",
@@ -10214,6 +10729,24 @@ def main() -> None:
                 st.session_state["ai_pending_chat_prompt"] = None
                 gc.collect()
                 st.rerun()
+            if _ws5_logged_in and st.session_state.get("ai_chat_messages"):
+                if st.button(
+                    t("ai_chat_save_proj_btn", lang=lang),
+                    width="stretch",
+                    key="tab6_btn_save_chat_proj",
+                ):
+                    _u5 = str(_auth_u_ws5["username"])
+                    _proj_auto_name = f"AI · {loc_label} ({date.today().isoformat()})"
+                    _p_pay = _collect_current_workspace_payload(
+                        center_lat=float(center_lat),
+                        center_lon=float(center_lon),
+                        bbox_4326=bbox_4326,
+                        aoi_polygon_4326=aoi_polygon_4326,
+                        loc_label=str(loc_label),
+                    )
+                    save_user_project(_u5, _proj_auto_name, "AI Assistant session", _p_pay, sync=True)
+                    _maybe_auto_save_session()
+                    st.toast(t("proj_saved_ok", lang=lang, name=_proj_auto_name))
 
         # --- 1. Nastavitve Gemini API (čist 6-gumbni izbirnik + kompakten gumb za preverjanje ključa) ---
         with st.expander(t("ai_api_expander"), expanded=False):
@@ -10593,6 +11126,7 @@ def main() -> None:
 
                     ai_prog.empty()
                     ai_status.empty()
+                    _maybe_auto_save_session()
                     gc.collect()
                     st.rerun()
                 except Exception as exc:

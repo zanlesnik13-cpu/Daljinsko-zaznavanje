@@ -34,6 +34,7 @@ DEFAULT_PROFILE_PREFS: dict[str, Any] = {
     "preferred_crs_mode": "auto",
     "preferred_resolution": 10,
     "preferred_gemini_model": "gemini-3.8-flash",
+    "auto_save_session": True,
 }
 
 
@@ -249,19 +250,22 @@ def authenticate_user(username: str, password: str) -> tuple[bool, str, dict[str
 
 
 def sync_user_data_to_github(username: str) -> bool:
-    """Manually push ``auth_users.json`` and the user's ``profile.json`` to GitHub Cloud."""
+    """Manually push ``auth_users.json`` and all user JSON files to GitHub Cloud."""
     uname = normalize_username(username)
     pushed_any = False
     if AUTH_USERS_PATH.is_file():
         if github_push_file(AUTH_USERS_REL, commit_message="chore(sync): sync auth_users.json", show_toast=False):
             pushed_any = True
     if uname:
-        prof_path = get_user_dir(uname) / "profile.json"
-        if prof_path.is_file():
-            if github_push_file(
-                get_user_profile_rel_path(uname),
-                commit_message=f"chore(sync): sync profile for {uname}",
-                show_toast=True,
-            ):
-                pushed_any = True
+        udir = get_user_dir(uname)
+        for fname in ("profile.json", "projects.json", "map_layouts.json", "last_session.json"):
+            fpath = udir / fname
+            if fpath.is_file():
+                rel = f"data/users/{uname}/{fname}"
+                if github_push_file(
+                    rel,
+                    commit_message=f"chore(sync): sync {fname} for {uname}",
+                    show_toast=False,
+                ):
+                    pushed_any = True
     return pushed_any
