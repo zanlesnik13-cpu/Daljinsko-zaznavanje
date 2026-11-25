@@ -7154,57 +7154,214 @@ def _render_ai_chat_analysis_fragment(
             )
             st.plotly_chart(fig_g, width="stretch", key=f"ai_chat_gnss_plotly_{result_id}")
 
-    elif ai_kind_show == "time_series":
+    elif ai_kind_show in ("time_series", "time_series_and_comparison"):
         ts_ai: pd.DataFrame = ai_res_show["ts_df"]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Št. datumov" if lang == "sl" else "Valid Dates", f"{len(ts_ai)}")
-        m2.metric("Povprečje" if lang == "sl" else "Mean", f"{ts_ai['mean'].mean():.3f}")
-        m3.metric(t("ai_plan_period"), f"{ts_ai['date_str'].iloc[0]} → {ts_ai['date_str'].iloc[-1]}")
-        m4.metric(t("ai_plan_crs"), ai_crs_show)
-
-        fig_ai_ts = go.Figure()
-        fig_ai_ts.add_trace(
-            go.Scatter(
-                x=ts_ai["date_str"],
-                y=ts_ai["mean"],
-                mode="lines+markers",
-                name=pl["index_name"],
-                line=dict(color="#0F766E", width=2.5),
-                marker=dict(size=7, color="#0F766E"),
-            )
+        idx_lbl_ts = str(pl.get("index_name", "NDVI"))
+        comp_rgb = ai_res_show.get("comparison_rgb")
+        comp_idx = ai_res_show.get("comparison_index")
+        cs_ts = ai_res_show.get("change_summary") or {}
+        has_swipe = (
+            (isinstance(comp_rgb, dict) and len(comp_rgb.get("overlay_uris") or []) >= 2)
+            or (isinstance(comp_idx, dict) and len(comp_idx.get("overlay_uris") or []) >= 2)
         )
+
+        # Compute linear trend slope for KPI card
+        trend_str = "—"
         if len(ts_ai) >= 3:
-            x_ord = np.arange(len(ts_ai), dtype=np.float64)
-            slope, intercept = np.polyfit(x_ord, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
+            x_ord_k = np.arange(len(ts_ai), dtype=np.float64)
+            sl_k, _ = np.polyfit(x_ord_k, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
+            trend_str = f"{sl_k:+.4f}/obs"
+        elif len(ts_ai) >= 2:
+            d_val = float(ts_ai["mean"].iloc[-1]) - float(ts_ai["mean"].iloc[0])
+            trend_str = f"{d_val:+.3f}"
+
+        delta_str = (
+            f"{float(cs_ts['mean']):+.3f}"
+            if (isinstance(cs_ts, dict) and cs_ts.get("mean") is not None)
+            else f"{ts_ai['mean'].mean():.3f}"
+        )
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Št. datumov" if lang == "sl" else "Valid Dates", f"{len(ts_ai)}")
+        m2.metric(
+            "Obdobje t1 → t2" if lang == "sl" else "Period t1 → t2",
+            f"{ts_ai['date_str'].iloc[0]} → {ts_ai['date_str'].iloc[-1]}",
+        )
+        m3.metric("Trend", trend_str)
+        m4.metric(
+            (f"Δ {idx_lbl_ts}" if cs_ts else ("Povprečje" if lang == "sl" else "Mean")),
+            delta_str,
+        )
+        m5.metric(t("ai_plan_crs"), ai_crs_show)
+
+        def _draw_ts_plotly() -> None:
+            fig_ai_ts = go.Figure()
             fig_ai_ts.add_trace(
                 go.Scatter(
                     x=ts_ai["date_str"],
-                    y=slope * x_ord + intercept,
-                    mode="lines",
-                    name="Trend",
-                    line=dict(color="#DC2626", width=1.8, dash="dash"),
+                    y=ts_ai["mean"],
+                    mode="lines+markers",
+                    name=idx_lbl_ts,
+                    line=dict(color="#0F766E", width=2.5),
+                    marker=dict(size=7, color="#0F766E"),
                 )
             )
-        fig_ai_ts.update_layout(
-            title=t(
-                "ai_ts_chart_title",
-                idx=pl["index_name"],
-                place=pl["place_name"],
-                sensor=ai_sensor_short,
-                crs=ai_crs_show,
-            ),
-            xaxis_title=t("col_date"),
-            yaxis_title=pl["index_name"],
-            height=410,
-            plot_bgcolor="#FFFFFF",
-            paper_bgcolor="#FFFFFF",
-            font=dict(color="#0F172A"),
-        )
-        st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
+            if len(ts_ai) >= 3:
+                x_ord = np.arange(len(ts_ai), dtype=np.float64)
+                slope, intercept = np.polyfit(x_ord, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
+                fig_ai_ts.add_trace(
+                    go.Scatter(
+                        x=ts_ai["date_str"],
+                        y=slope * x_ord + intercept,
+                        mode="lines",
+                        name="Trend",
+                        line=dict(color="#DC2626", width=1.8, dash="dash"),
+                    )
+                )
+            fig_ai_ts.update_layout(
+                title=t(
+                    "ai_ts_chart_title",
+                    idx=idx_lbl_ts,
+                    place=pl["place_name"],
+                    sensor=ai_sensor_short,
+                    crs=ai_crs_show,
+                ),
+                xaxis_title=t("col_date"),
+                yaxis_title=idx_lbl_ts,
+                height=410,
+                plot_bgcolor="#FFFFFF",
+                paper_bgcolor="#FFFFFF",
+                font=dict(color="#0F172A"),
+            )
+            st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
+
+        if has_swipe:
+            tab_lbl_swipe = (
+                "🔄 Vizualna primerjava Prej / Potem (t1 ↔ t2)"
+                if lang == "sl"
+                else "🔄 Visual Before / After Comparison (t1 ↔ t2)"
+            )
+            tab_lbl_ts = (
+                "📈 Časovna vrsta (Graf trenda)"
+                if lang == "sl"
+                else "📈 Time Series (Trend Chart)"
+            )
+            t_sw, t_ts = st.tabs([tab_lbl_swipe, tab_lbl_ts])
+
+            with t_sw:
+                avail_modes: list[str] = []
+                if isinstance(comp_rgb, dict) and len(comp_rgb.get("overlay_uris") or []) >= 2:
+                    avail_modes.append("rgb")
+                if isinstance(comp_idx, dict) and len(comp_idx.get("overlay_uris") or []) >= 2:
+                    avail_modes.append("index")
+
+                mode_labels = {
+                    "rgb": "🛰️ Resnične barve (RGB)" if lang == "sl" else "🛰️ True Color (RGB)",
+                    "index": f"📊 Indeks ({idx_lbl_ts})" if lang == "sl" else f"📊 Index ({idx_lbl_ts})",
+                }
+                if len(avail_modes) > 1:
+                    sw_mode = _touch_selector(
+                        "Sloj primerjave" if lang == "sl" else "Comparison Layer",
+                        options=avail_modes,
+                        default=avail_modes[0],
+                        format_func=lambda m: mode_labels[m],
+                        key=f"ai_chat_ts_sw_mode_{result_id}",
+                        use_pills=True,
+                    )
+                else:
+                    sw_mode = avail_modes[0]
+
+                active_comp = comp_rgb if (sw_mode == "rgb" and comp_rgb is not None) else comp_idx
+                c_dates = (active_comp or {}).get("dates") or [
+                    str(ts_ai["date_str"].iloc[0]),
+                    str(ts_ai["date_str"].iloc[-1]),
+                ]
+                c_uris = (active_comp or {}).get("overlay_uris") or []
+                c_bnds = (active_comp or {}).get("overlay_bounds") or []
+                sw_tag = "RGB" if sw_mode == "rgb" else idx_lbl_ts
+
+                for rep in (active_comp or {}).get("replacements") or []:
+                    st.info(
+                        t(
+                            "comp3_replaced_badge",
+                            req=rep.get("requested_date", ""),
+                            orig_pct=float(rep.get("original_clear_pct", 0.0)),
+                            act=rep.get("actual_date", ""),
+                            act_pct=float(rep.get("actual_clear_pct", 0.0)),
+                        )
+                    )
+
+                ai_op_ts_sw = st.slider(
+                    t("opacity_layer_label"),
+                    0,
+                    100,
+                    95,
+                    5,
+                    key=f"ai_chat_ts_sw_op_{result_id}",
+                )
+                if len(c_uris) >= 2 and len(c_bnds) >= 2:
+                    swipe_html = build_zoomable_swipe_map(
+                        overlay_uri_t1=c_uris[0],
+                        bounds_t1=c_bnds[0],
+                        overlay_uri_t2=c_uris[-1],
+                        bounds_t2=c_bnds[-1],
+                        label_t1=f"t1: {c_dates[0]} ({sw_tag})",
+                        label_t2=f"t2: {c_dates[-1]} ({sw_tag})",
+                        center_lat=float(ai_res_show["lat"]),
+                        center_lon=float(ai_res_show["lon"]),
+                        basemap_mode=basemap_now,
+                        aoi_bbox_4326=ai_res_show.get("bbox_4326"),
+                        aoi_bbox_3794=ai_res_show.get("bbox_3794"),
+                        aoi_outline_label=t("slippy_aoi_outline"),
+                        height=520,
+                        opacity=float(ai_op_ts_sw) / 100.0,
+                        lang=lang,
+                    )
+                    components.html(swipe_html, height=540, scrolling=False)
+                    st.caption(t("swipe_zoom_hint"))
+
+            with t_ts:
+                _draw_ts_plotly()
+        else:
+            _draw_ts_plotly()
 
     # 3. Export & Cartography Handoff Bar
-    if ai_kind_show in ("time_series", "gnss_plan"):
-        if ai_res_show.get("csv_bytes"):
+    if ai_kind_show in ("time_series", "time_series_and_comparison", "gnss_plan"):
+        has_csv = bool(ai_res_show.get("csv_bytes"))
+        has_tif_ts = bool(ai_res_show.get("tif_bytes"))
+        if has_csv and has_tif_ts:
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                st.download_button(
+                    label=t("ai_btn_dl_csv"),
+                    data=ai_res_show["csv_bytes"],
+                    file_name=ai_res_show["csv_filename"],
+                    mime="text/csv",
+                    width="stretch",
+                    key=f"ai_chat_dl_csv_{result_id}",
+                )
+            with ec2:
+                st.download_button(
+                    label=t("ai_btn_dl_tif"),
+                    data=ai_res_show["tif_bytes"],
+                    file_name=ai_res_show["tif_filename"],
+                    mime="image/tiff",
+                    width="stretch",
+                    key=f"ai_chat_dl_tif_{result_id}",
+                )
+            with ec3:
+                if st.button(
+                    t("ai_btn_send_carto"),
+                    type="primary",
+                    width="stretch",
+                    key=f"ai_chat_send_carto_{result_id}",
+                ):
+                    st.session_state["tab6_ai_result"] = ai_res_show
+                    st.session_state["tab4_pending_source_select"] = "tab6_ai"
+                    st.session_state["tab6_sent_to_carto"] = True
+                    st.session_state["pending_workspace"] = "ws_geo"
+                    st.rerun(scope="app")
+        elif has_csv:
             st.download_button(
                 label=t("ai_btn_dl_csv"),
                 data=ai_res_show["csv_bytes"],
@@ -11026,7 +11183,7 @@ def main() -> None:
                         parsed_plan = route_res["plan"]
                         ai_out = execute_ai_plan(
                             parsed_plan,
-                            target_epsg=target_crs,
+                            target_epsg=None,
                             geocode_fn=lambda name, _l=lang: geocode_place(name, lang=_l),
                             lang=lang,
                             progress_cb=lambda f, m: _on_ai_prog(0.08 + 0.78 * f, m),
@@ -11058,14 +11215,16 @@ def main() -> None:
                         st.session_state["tab6_ai_result"] = ai_out
                         st.session_state["tab6_sent_to_carto"] = False
 
-                        # Sinhroniziraj geokodiran AOI v globalno sejo
+                        # Sinhroniziraj geokodiran AOI & lokalni auto-UTM CRS v globalno sejo
                         st.session_state["map_lat"] = round(float(ai_out["lat"]), 6)
                         st.session_state["map_lon"] = round(float(ai_out["lon"]), 6)
-                        st.session_state["radius_m"] = int(parsed_plan["radius_m"])
+                        st.session_state["map_radius_m"] = int(parsed_plan["radius_m"])
                         st.session_state["ws1_map_radius_slider"] = int(parsed_plan["radius_m"])
                         st.session_state["active_location_label"] = str(
                             ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""
                         )
+                        if not is_in_slovenia(float(ai_out["lat"]), float(ai_out["lon"])):
+                            st.session_state["sidebar_crs_mode"] = "auto"
 
                         fb_note_str = (
                             reply_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")

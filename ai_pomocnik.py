@@ -17,6 +17,7 @@ from __future__ import annotations
 import calendar
 import gc
 import json
+import math
 import os
 import re
 import unicodedata
@@ -47,6 +48,8 @@ from geodezija_crs import (
     CRS_D96TM,
     bbox_from_point_wgs84,
     export_to_geotiff_bytes,
+    get_auto_utm_epsg,
+    is_in_slovenia,
 )
 from gnss_plan import run_gnss_mission_plan
 from kartografija import DEFAULT_LAYOUT_CONFIG, LAYOUT_PRESETS, merge_layout_config
@@ -199,6 +202,7 @@ VALID_TASKS: tuple[str, ...] = (
     "spectral_index",
     "cloud_free_composite",
     "time_series",
+    "time_series_and_comparison",
     "change_comparison",
     "disaster_flood",
     "disaster_fire",
@@ -208,6 +212,109 @@ VALID_TASKS: tuple[str, ...] = (
 )
 VALID_INDICES: tuple[str, ...] = ("NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "NDSI", "LST", "VV")
 VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60)
+
+# Global landmarks & common typos -> (canonical_name, lat, lon)
+# Prevents ambiguous place names (e.g. "Boca Chica" -> Dominican Republic instead of SpaceX Starbase Texas!)
+_KNOWN_GLOBAL_LANDMARKS: tuple[tuple[tuple[str, ...], str, float, float], ...] = (
+    (
+        ("starbase", "boca chic", "spacex", "sapacex"),
+        "SpaceX Starbase, Boca Chica, Texas, USA",
+        25.9972,
+        -97.1561,
+    ),
+    (
+        ("pasterz",),
+        "Pasterze Glacier, Austria",
+        47.0860,
+        12.7240,
+    ),
+    (
+        ("giga berlin", "gigafactory berlin", "tesla berlin", "grunheide"),
+        "Tesla Gigafactory Berlin-Brandenburg, Germany",
+        52.3984,
+        13.7945,
+    ),
+    (
+        ("palm jumeirah",),
+        "Palm Jumeirah, Dubai, UAE",
+        25.1124,
+        55.1390,
+    ),
+    (
+        ("panama canal", "panamski prekop"),
+        "Panama Canal, Panama",
+        9.0800,
+        -79.6800,
+    ),
+    (
+        ("suez canal", "sueski prekop"),
+        "Suez Canal, Egypt",
+        30.5852,
+        32.2654,
+    ),
+    (
+        ("aral sea", "aralsko jezero"),
+        "Aral Sea, Kazakhstan/Uzbekistan",
+        45.0000,
+        59.5000,
+    ),
+    (
+        ("cape canaveral", "kennedy space"),
+        "Kennedy Space Center, Florida, USA",
+        28.5729,
+        -80.6490,
+    ),
+)
+
+_EXPANSION_COMPARISON_CUES: tuple[str, ...] = (
+    "siril",
+    "siri",
+    "razsir",
+    "zrasl",
+    "rast ",
+    "rasti",
+    "gradnj",
+    "gradil",
+    "umik",
+    "krci",
+    "izsek",
+    "sprememb",
+    "skozi let",
+    "skozi cas",
+    "prej in potem",
+    "prej/potem",
+    "over the years",
+    "over time",
+    "through the years",
+    "expansion",
+    "expanded",
+    "expand",
+    "growth",
+    "grew",
+    "retreat",
+    "shrink",
+    "construction",
+    "deforest",
+    "before and after",
+)
+
+
+def resolve_ai_metric_crs(lat: float, lon: float) -> str:
+    """Return exact local metric EPSG string: ``EPSG:3794`` in Slovenia, local auto-UTM globally."""
+    if is_in_slovenia(float(lat), float(lon)):
+        return CRS_D96TM
+    epsg_int, _ = get_auto_utm_epsg(float(lat), float(lon))
+    return f"EPSG:{int(epsg_int)}"
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return great-circle distance in kilometers between two WGS84 points."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+    return 2.0 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
 
 INTERVAL_LABEL_TO_KEY: dict[str, str] = {
     "Vsi posnetki": INTERVAL_ALL,
@@ -415,10 +522,45 @@ def _normalize_slovenian_place_name(raw_name: str) -> str:
     return cleaned
 
 
+def _match_known_global_landmark(text: str) -> tuple[str, float, float] | None:
+    """Match famous global landmarks (and common typos) to unambiguous ``(name, lat, lon)``."""
+    norm = _normalize_ascii(text)
+    if not norm:
+        return None
+    for stems, canonical, lat, lon in _KNOWN_GLOBAL_LANDMARKS:
+        if any(st in norm for st in stems):
+            return (canonical, float(lat), float(lon))
+    return None
+
+
+def _coerce_valid_lat_lon(raw_lat: Any, raw_lon: Any) -> tuple[float | None, float | None]:
+    """Return ``(lat, lon)`` as floats if both are valid finite WGS84 coordinates, else ``(None, None)``."""
+    if raw_lat is None or raw_lon is None:
+        return None, None
+    try:
+        la = float(raw_lat)
+        lo = float(raw_lon)
+        if np.isfinite(la) and np.isfinite(lo) and -90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0:
+            if not (abs(la) < 1e-6 and abs(lo) < 1e-6):
+                return round(la, 6), round(lo, 6)
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
 def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local") -> dict[str, Any]:
     """Validate and enforce strict geodetic/sensor rules on any parsed JSON plan."""
     today = date.today()
-    place_name = _normalize_slovenian_place_name(str(raw_plan.get("place_name") or "Ljubljana"))
+    raw_place = str(raw_plan.get("place_name") or raw_plan.get("location") or "Ljubljana").strip()
+    lm_hit = _match_known_global_landmark(raw_place)
+    if lm_hit is not None:
+        place_name = lm_hit[0]
+    else:
+        place_name = _normalize_slovenian_place_name(raw_place)
+
+    lat_val, lon_val = _coerce_valid_lat_lon(raw_plan.get("lat"), raw_plan.get("lon"))
+    if lat_val is None and lm_hit is not None:
+        lat_val, lon_val = lm_hit[1], lm_hit[2]
 
     try:
         radius_m = int(round(float(raw_plan.get("radius_m", 4000))))
@@ -429,6 +571,12 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
     task_type = str(raw_plan.get("task_type") or "spectral_index").strip().lower()
     if task_type not in VALID_TASKS:
         task_type = "spectral_index"
+
+    include_comparison = bool(raw_plan.get("include_comparison", False)) or (
+        task_type == "time_series_and_comparison"
+    )
+    if task_type == "time_series" and include_comparison:
+        task_type = "time_series_and_comparison"
 
     index_name = str(raw_plan.get("index_name") or "NDVI").strip().upper()
     if index_name not in VALID_INDICES:
@@ -497,11 +645,18 @@ def validate_and_normalize_plan(raw_plan: dict[str, Any], engine: str = "local")
             f"using {sensor} over {start_d.isoformat()} – {end_d.isoformat()}."
         )
 
+    target_crs_hint = resolve_ai_metric_crs(lat_val, lon_val) if (lat_val is not None and lon_val is not None) else None
+
     return {
         "place_name": place_name,
+        "location": place_name,
+        "lat": lat_val,
+        "lon": lon_val,
+        "target_epsg": target_crs_hint,
         "radius_m": radius_m,
         "sensor": sensor,
         "task_type": task_type,
+        "include_comparison": include_comparison,
         "index_name": index_name,
         "start_date": start_d.isoformat(),
         "end_date": end_d.isoformat(),
@@ -540,13 +695,16 @@ def _extract_gemini_text(body: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Engine 1: Gemini REST API Planner
 # ---------------------------------------------------------------------------
-_GEMINI_SYSTEM_PROMPT = """You are a geodetic Earth Observation (remote sensing) planner for Slovenia and Europe.
+_GEMINI_SYSTEM_PROMPT = """You are a global geodetic Earth Observation (remote sensing) planner for Slovenia, Europe, and worldwide locations.
 Convert the user's Slovenian or English request into a STRICT JSON object with these exact keys:
 {
-  "place_name": string (nominative town/place name suitable for geocoding, e.g. "Celje", "Slovenj Gradec", "Črna na Koroškem", "Kras", "Bled", "Ljubljana", "Kranj", "Murska Sobota"),
+  "place_name": string (unambiguous full place name including region/state and country, e.g. "SpaceX Starbase, Boca Chica, Texas, USA", "Črna na Koroškem, Slovenia", "Pasterze Glacier, Austria" — NEVER a bare ambiguous town name!),
+  "lat": number | null (exact WGS84 latitude whenever you know the landmark/place, e.g. 25.9972 for SpaceX Starbase, 46.0569 for Ljubljana),
+  "lon": number | null (exact WGS84 longitude whenever you know the landmark/place, e.g. -97.1561 for SpaceX Starbase, 14.5058 for Ljubljana),
   "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
   "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
-  "task_type": "scene_rgb" | "spectral_index" | "cloud_free_composite" | "time_series" | "change_comparison" | "disaster_flood" | "disaster_fire" | "disaster_forest" | "terrain_dem" | "gnss_plan",
+  "task_type": "scene_rgb" | "spectral_index" | "cloud_free_composite" | "time_series" | "time_series_and_comparison" | "change_comparison" | "disaster_flood" | "disaster_fire" | "disaster_forest" | "terrain_dem" | "gnss_plan",
+  "include_comparison": boolean (true for multi-year spatial growth/expansion/retreat/deforestation/construction),
   "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "NDSI" | "LST" | "VV",
   "start_date": "YYYY-MM-DD",
   "end_date": "YYYY-MM-DD",
@@ -567,9 +725,10 @@ STRICT SCIENTIFIC RULES:
 8. For LST / surface temperature -> sensor="landsat-c2-l2", index_name="LST", resolution_m=30.
 9. For NDSI / snow / glaciers -> index_name="NDSI".
 10. Whenever start_date is before 2016-01-01 -> MUST use sensor="landsat-c2-l2" and resolution_m=30.
-11. For multi-year trends / time series (>5 years) -> task_type="time_series", interval="Letno".
-12. Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
-13. Always normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota".
+11. For multi-year spatial growth, factory/urban expansion, glacier retreat, deforestation, or "how it changed over the years" -> task_type="time_series_and_comparison", include_comparison=true, interval="Letno" (use index_name="NDBI" for factories/urban expansion, "NDSI" for glaciers, "NDVI" for vegetation).
+12. Always provide accurate numeric "lat" and "lon" for specific landmarks/facilities (e.g. SpaceX Starbase Boca Chica Texas = 25.9972, -97.1561).
+13. Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
+14. Always normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota".
 Return ONLY valid JSON without markdown code fences."""
 
 
@@ -621,6 +780,11 @@ def parse_eo_request_gemini(
 # Engine 2: Built-in Smart Local Fallback Parser (100% Offline, Deterministic)
 # ---------------------------------------------------------------------------
 def _extract_place_local(query: str, norm_q: str) -> str:
+    # 0. Check known global landmarks & common typos first (e.g. SpaceX Starbase Boca Chica Texas)
+    lm_hit = _match_known_global_landmark(norm_q)
+    if lm_hit is not None:
+        return lm_hit[0]
+
     # 1. Check built-in Slovenian place stems (longest stem first)
     for stem, canonical, _lat, _lon in _SLOVENIAN_PLACE_STEMS:
         if stem in norm_q:
@@ -743,7 +907,10 @@ def _extract_dates_local(norm_q: str) -> tuple[date, date, date, str]:
 def parse_eo_request_local(query: str) -> dict[str, Any]:
     """Deterministic offline Slovenian/English remote-sensing query parser."""
     norm_q = _normalize_ascii(query)
-    place_name = _extract_place_local(query, norm_q)
+    lm_hit = _match_known_global_landmark(norm_q)
+    place_name = lm_hit[0] if lm_hit is not None else _extract_place_local(query, norm_q)
+    lm_lat = lm_hit[1] if lm_hit is not None else None
+    lm_lon = lm_hit[2] if lm_hit is not None else None
     start_d, end_d, event_d, interval = _extract_dates_local(norm_q)
 
     # 1. Detect task_type & index_name
@@ -754,6 +921,7 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
     is_flood = any(k in norm_q for k in ("poplav", "flood", "inundat", "razlitj"))
     is_fire = any(k in norm_q for k in ("pozar", "wildfire", "fire", "burn", "dnbr", "opozar"))
     is_forest = any(k in norm_q for k in ("vetrolom", "posek", "zled", "susa", "windthrow", "clearcut", "deforest", "dndvi"))
+    is_expansion_change = any(k in norm_q for k in _EXPANSION_COMPARISON_CUES)
     is_ts = any(
         k in norm_q
         for k in (
@@ -762,14 +930,28 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
             "timeseries",
             "trend",
             "skozi cas",
+            "skozi let",
             "spreminj",
             "over time",
+            "over the years",
+            "through the years",
             "letna",
             "year",
             "zgodovin",
             "histor",
         )
-    ) or ((end_d - start_d).days >= 400 and not (is_flood or is_fire or is_forest or is_change or is_dem or is_gnss))
+    ) or is_expansion_change or ((end_d - start_d).days >= 400 and not (is_flood or is_fire or is_forest or is_change or is_dem or is_gnss))
+
+    # If user asks about multi-year growth/expansion/retreat without explicit years, use a multi-year window
+    if (is_expansion_change or "skozi let" in norm_q or "over the years" in norm_q) and (end_d - start_d).days < 365:
+        today_d = date.today()
+        if any(k in norm_q for k in ("ledenik", "glacier", "pasterz", "aral")):
+            start_d = date(1985, 1, 1)
+        else:
+            start_d = date(2018, 1, 1)
+        end_d = today_d
+        event_d = today_d
+        interval = "Letno"
 
     # Index detection
     if "ndsi" in norm_q or any(k in norm_q for k in ("sneg", "snez", "ledenik", "snow", "glacier")):
@@ -780,7 +962,10 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
         index_name = "MNDWI"
     elif "ndwi" in norm_q or any(k in norm_q for k in ("vodn", "jezer", "water", "lake", "river", "reka")):
         index_name = "NDWI"
-    elif "ndbi" in norm_q or any(k in norm_q for k in ("pozidav", "urban", "mesto", "city", "built")):
+    elif "ndbi" in norm_q or any(
+        k in norm_q
+        for k in ("pozidav", "urban", "mesto", "city", "built", "tovarn", "factory", "starbase", "gradnj", "gigafactory", "objekt")
+    ):
         index_name = "NDBI"
     elif "nbr" in norm_q or is_fire:
         index_name = "NBR"
@@ -881,16 +1066,22 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
             f"for {place_name} ({start_d.isoformat()} – {end_d.isoformat()})."
         )
     elif is_ts:
-        task_type = "time_series"
+        task_type = "time_series_and_comparison" if is_expansion_change else "time_series"
         sensor = SENSOR_LANDSAT if start_d < date(2016, 1, 1) else (SENSOR_S1 if index_name == "VV" else SENSOR_S2)
         radius_m = 3500
-        resolution_m = 30 if sensor == SENSOR_LANDSAT else 20
+        resolution_m = 30 if sensor == SENSOR_LANDSAT else 10
         expl_sl = (
-            f"Zaznana večletna časovna vrsta indeksa {index_name} za {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). "
+            f"Zaznana večletna časovna vrsta ({index_name}) + interaktivna vizualna primerjava Prej / Potem (RGB in {index_name}) "
+            f"za {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). Senzor: {sensor}, vzorčenje: {interval}."
+            if is_expansion_change
+            else f"Zaznana večletna časovna vrsta indeksa {index_name} za {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). "
             f"Senzor: {sensor}, vzorčenje: {interval} (z izločanjem delnih posnetkov < 90 % AOI)."
         )
         expl_en = (
-            f"Detected multi-temporal {index_name} time series for {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). "
+            f"Detected multi-year {index_name} time series + interactive Before / After visual comparison (RGB & {index_name}) "
+            f"for {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). Sensor: {sensor}, sampling: {interval}."
+            if is_expansion_change
+            else f"Detected multi-temporal {index_name} time series for {place_name} ({start_d.isoformat()} – {end_d.isoformat()}). "
             f"Sensor: {sensor}, sampling: {interval} (excluding partial swaths < 90% AOI)."
         )
     elif any(k in norm_q for k in ("rgb", "naravn", "true color", "slik", "posnetek")) and not any(
@@ -933,9 +1124,12 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
     return validate_and_normalize_plan(
         {
             "place_name": place_name,
+            "lat": lm_lat,
+            "lon": lm_lon,
             "radius_m": radius_m,
             "sensor": sensor,
             "task_type": task_type,
+            "include_comparison": bool(task_type == "time_series_and_comparison" or (task_type == "time_series" and is_expansion_change)),
             "index_name": index_name,
             "start_date": start_d.isoformat(),
             "end_date": end_d.isoformat(),
@@ -1061,7 +1255,7 @@ def build_technical_summary(
             lines.append(f"Total Affected Area: {d_sum['affected_area_ha']:,.2f} ha ({d_sum['affected_area_km2']:.3f} km², {d_sum['affected_pct']:.2f}% of AOI)")
             if task == "disaster_flood":
                 lines.append(f"Permanent Water (pre-flood): {d_sum.get('permanent_water_ha', 0.0):,.2f} ha")
-    elif task == "time_series":
+    elif task in ("time_series", "time_series_and_comparison"):
         ts_df: pd.DataFrame = result["ts_df"]
         n_obs = len(ts_df)
         d1 = str(ts_df["date_str"].iloc[0]) if n_obs else plan["start_date"]
@@ -1271,7 +1465,7 @@ def build_analysis_context_dict(
                 "gnss_summary": g_sum,
             }
         )
-    elif kind == "time_series" and isinstance(result.get("ts_df"), pd.DataFrame):
+    elif kind in ("time_series", "time_series_and_comparison") and isinstance(result.get("ts_df"), pd.DataFrame):
         ts_df: pd.DataFrame = result["ts_df"]
         n_obs = len(ts_df)
         vals = ts_df["mean"].to_numpy(dtype=np.float64) if n_obs else np.array([], dtype=np.float64)
@@ -1290,25 +1484,82 @@ def build_analysis_context_dict(
                 "first_val": round(float(vals[0]), 4) if n_obs else None,
                 "last_val": round(float(vals[-1]), 4) if n_obs else None,
                 "trend_slope_per_obs": slope,
+                "has_visual_comparison": bool(result.get("comparison_rgb") or result.get("comparison_index")),
             }
         )
+        cs_ts = result.get("change_summary") or {}
+        if cs_ts:
+            ctx["delta_mean"] = round(float(cs_ts.get("mean", 0.0)), 4)
+            ctx["pos_area_ha"] = round(float(cs_ts.get("pos_area_ha", 0.0)), 2)
+            ctx["neg_area_ha"] = round(float(cs_ts.get("neg_area_ha", 0.0)), 2)
     return ctx
+
+
+def resolve_plan_coordinates(
+    plan: dict[str, Any],
+    *,
+    geocode_fn: Callable[[str], tuple[float, float, str] | None] | None = None,
+    lang: str = "sl",
+) -> tuple[float, float, str]:
+    """Resolve unambiguous ``(lat, lon, resolved_label)`` for an AI plan.
+
+    If the plan already carries valid numeric ``(lat, lon)`` from Gemini or the
+    global landmark table, Nominatim is checked only as a label/refinement helper
+    and is strictly rejected if it fails or lands more than 30 km away from the
+    AI's known landmark coordinates (preventing e.g. 'Boca Chica' from hijacking
+    SpaceX Starbase Texas to the Dominican Republic).
+    """
+    place_name = str(plan.get("place_name") or plan.get("location") or "Ljubljana").strip()
+    ai_lat, ai_lon = _coerce_valid_lat_lon(plan.get("lat"), plan.get("lon"))
+
+    # Also check known global landmarks if AI didn't supply lat/lon
+    if ai_lat is None:
+        lm_hit = _match_known_global_landmark(place_name)
+        if lm_hit is not None:
+            place_name, ai_lat, ai_lon = lm_hit[0], lm_hit[1], lm_hit[2]
+
+    geo = None
+    try:
+        geo = geocode_fn(place_name) if geocode_fn is not None else _default_geocode_place(place_name)
+    except Exception:
+        geo = None
+    if geo is None:
+        try:
+            geo = _default_geocode_place(place_name)
+        except Exception:
+            geo = None
+
+    if ai_lat is not None and ai_lon is not None:
+        if geo is not None:
+            g_lat, g_lon, g_lbl = float(geo[0]), float(geo[1]), str(geo[2])
+            if _haversine_km(ai_lat, ai_lon, g_lat, g_lon) <= 30.0:
+                return g_lat, g_lon, g_lbl or place_name
+        return float(ai_lat), float(ai_lon), place_name
+
+    if geo is not None:
+        return float(geo[0]), float(geo[1]), str(geo[2])
+
+    raise RuntimeError(
+        f"Lokacije '{place_name}' ni bilo mogoče najti. Poskusite z bolj znanim krajem ali koordinatami."
+        if lang == "sl"
+        else f"Could not geocode '{place_name}'. Try a nearby town name or coordinates."
+    )
 
 
 def execute_ai_plan(
     plan: dict[str, Any],
     *,
-    target_epsg: str = CRS_D96TM,
+    target_epsg: str | None = None,
     geocode_fn: Callable[[str], tuple[float, float, str] | None] | None = None,
     lang: str = "sl",
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Execute ANY validated AI EO/geodetic plan strictly in metric projection (EPSG:3794 / UTM).
+    """Execute ANY validated AI EO/geodetic plan strictly in local metric projection (EPSG:3794 in SLO, auto-UTM globally).
 
-    Supports all 10 app capabilities:
+    Supports all app capabilities:
     ``disaster_flood``, ``disaster_fire``, ``disaster_forest``, ``spectral_index`` (incl. NDSI+DEM
     snowline & LST °C), ``scene_rgb``, ``cloud_free_composite``, ``time_series``,
-    ``change_comparison``, ``terrain_dem``, and ``gnss_plan``.
+    ``time_series_and_comparison``, ``change_comparison``, ``terrain_dem``, and ``gnss_plan``.
     """
 
     def _prog(pct: float, msg: str) -> None:
@@ -1316,17 +1567,10 @@ def execute_ai_plan(
             progress_cb(pct, msg)
 
     _prog(0.08, f"Geokodiram lokacijo: {plan['place_name']}..." if lang == "sl" else f"Geocoding location: {plan['place_name']}...")
-    geo = geocode_fn(plan["place_name"]) if geocode_fn is not None else _default_geocode_place(plan["place_name"])
-    if geo is None:
-        geo = _default_geocode_place(plan["place_name"])
-    if geo is None:
-        raise RuntimeError(
-            f"Lokacije '{plan['place_name']}' ni bilo mogoče najti. Poskusite z bolj znanim krajem ali koordinatami."
-            if lang == "sl"
-            else f"Could not geocode '{plan['place_name']}'. Try a nearby town name or coordinates."
-        )
+    lat, lon, resolved_label = resolve_plan_coordinates(plan, geocode_fn=geocode_fn, lang=lang)
 
-    lat, lon, resolved_label = float(geo[0]), float(geo[1]), str(geo[2])
+    # Always enforce exact local metric projection: EPSG:3794 in Slovenia, local auto-UTM globally!
+    target_epsg = resolve_ai_metric_crs(lat, lon)
     bbox_4326, bbox_3794 = bbox_from_point_wgs84(lat, lon, float(plan["radius_m"]))
     task = plan["task_type"]
     sensor = plan["sensor"]
@@ -1334,8 +1578,9 @@ def execute_ai_plan(
     epsg_num = str(target_epsg).split(":")[-1]
 
     base_out: dict[str, Any] = {
-        "plan": plan,
+        "plan": {**plan, "lat": lat, "lon": lon, "target_epsg": target_epsg},
         "crs": target_epsg,
+        "epsg_code": int(epsg_num),
         "lat": lat,
         "lon": lon,
         "resolved_place": resolved_label,
@@ -1647,9 +1892,9 @@ def execute_ai_plan(
         _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
         return base_out
 
-    # --- F. Multi-Temporal Time Series (with Same-Season + AOI Cloud Fallback) ---
-    if task == "time_series":
-        _prog(0.18, "Iščem satelitski arhiv za časovno vrsto..." if lang == "sl" else "Searching satellite archive for time series...")
+    # --- F. Multi-Temporal Time Series (+ Visual Before/After Swipe Comparison t1 ↔ t2) ---
+    if task in ("time_series", "time_series_and_comparison"):
+        _prog(0.16, "Iščem satelitski arhiv za časovno vrsto..." if lang == "sl" else "Searching satellite archive for time series...")
         interval_key = INTERVAL_LABEL_TO_KEY.get(plan["interval"], INTERVAL_YEARLY)
         max_cc = 100.0 if sensor == SENSOR_S1 else 25.0
         items, df = search_scenes(
@@ -1664,6 +1909,18 @@ def execute_ai_plan(
             target_season=SEASON_SUMMER,
         )
         if not items or df.empty:
+            items, df = search_scenes(
+                sensor=sensor,
+                bbox_4326=bbox_4326,
+                start_date=plan["start_date"],
+                end_date=plan["end_date"],
+                max_cloud_cover=45.0 if sensor != SENSOR_S1 else 100.0,
+                exclude_l7_slc_off=(sensor == SENSOR_LANDSAT),
+                min_coverage_pct=70.0,
+                interval_mode=interval_key,
+                target_season=SEASON_SUMMER,
+            )
+        if not items or df.empty:
             raise RuntimeError(
                 "Za izbrano obdobje in lokacijo ni bilo najdenih posnetkov za časovno vrsto."
                 if lang == "sl"
@@ -1673,16 +1930,25 @@ def execute_ai_plan(
         if len(items) > 24:
             pick_idx = np.linspace(0, len(items) - 1, 24, dtype=int)
             items = [items[i] for i in pick_idx]
+            df = df.iloc[pick_idx].reset_index(drop=True)
+
+        want_comparison = bool(
+            task == "time_series_and_comparison"
+            or plan.get("include_comparison")
+            or len(items) >= 2
+        )
+        ts_prog_span = 0.48 if want_comparison else 0.70
 
         def _ts_cb(cur: int, total: int, d_str: str) -> None:
-            _prog(0.25 + 0.70 * (cur / max(total, 1)), f"{d_str} ({cur}/{total})")
+            _prog(0.22 + ts_prog_span * (cur / max(total, 1)), f"{d_str} ({cur}/{total})")
 
+        eff_ts_res = max(res_m, 30 if sensor == SENSOR_LANDSAT else 10)
         ts_df = extract_time_series(
             items=items,
             bbox_4326=bbox_4326,
             index_name=plan["index_name"],
             target_epsg=target_epsg,
-            resolution=max(res_m, 30 if sensor == SENSOR_LANDSAT else 10),
+            resolution=eff_ts_res,
             mask_clouds=(sensor != SENSOR_S1),
             progress_callback=_ts_cb,
             sensor=sensor,
@@ -1694,14 +1960,111 @@ def execute_ai_plan(
                 if lang == "sl"
                 else "No scenes had enough cloud-free pixels to build the time series."
             )
+
         csv_bytes = ts_df.to_csv(index=False).encode("utf-8")
         csv_fname = f"AI_TimeSeries_{plan['index_name']}_{plan['place_name']}_{plan['start_date']}_{plan['end_date']}.csv"
+
+        # Step B: Load earliest (t1) and latest (t2) clear satellite scenes for Zoomable Swipe Comparison!
+        comp_rgb: dict[str, Any] | None = None
+        comp_idx: dict[str, Any] | None = None
+        ch_summary: dict[str, Any] = {}
+        diff_da = None
+        tif_bytes: bytes | None = None
+        tif_fname: str | None = None
+
+        if want_comparison and len(ts_df) >= 2:
+            try:
+                raw_by_date = df.attrs.get("raw_items_by_date") or {}
+                date_to_group: dict[str, Any] = {}
+                for i_row in range(min(len(items), len(df))):
+                    date_to_group[str(df.iloc[i_row]["date_str"])] = items[i_row]
+                if isinstance(raw_by_date, dict):
+                    for dk, dv in raw_by_date.items():
+                        date_to_group.setdefault(str(dk), dv)
+
+                ts_dates_sorted = [str(d) for d in ts_df["date_str"].tolist()]
+                d_first, d_last = ts_dates_sorted[0], ts_dates_sorted[-1]
+                g_first = date_to_group.get(d_first) or items[-1]
+                g_last = date_to_group.get(d_last) or items[0]
+                all_cands = list(raw_by_date.values()) if isinstance(raw_by_date, dict) and raw_by_date else list(items)
+                layer_m = str(plan["index_name"])
+                comp_res_m = float(max(res_m, 30 if sensor == SENSOR_LANDSAT else 10))
+
+                if sensor != SENSOR_S1:
+                    _prog(
+                        0.74,
+                        f"Pripravljam vizualno RGB primerjavo {d_first} ↔ {d_last}..."
+                        if lang == "sl"
+                        else f"Building True Color RGB swipe comparison {d_first} ↔ {d_last}...",
+                    )
+                    comp_rgb = render_multi_date_comparison(
+                        item_groups=[g_first, g_last],
+                        date_labels=[d_first, d_last],
+                        bbox_4326=bbox_4326,
+                        layer_mode="RGB",
+                        target_epsg=target_epsg,
+                        resolution=comp_res_m,
+                        sensor=sensor,
+                        mask_clouds=False,
+                        all_candidates=all_cands,
+                        candidates_by_date=df.attrs.get("candidates_by_bucket"),
+                        auto_cloud_fallback=True,
+                        min_clear_pct=75.0,
+                    )
+
+                _prog(
+                    0.86,
+                    f"Pripravljam primerjavo indeksa {layer_m} ({d_first} ↔ {d_last})..."
+                    if lang == "sl"
+                    else f"Building {layer_m} index comparison ({d_first} ↔ {d_last})...",
+                )
+                comp_idx = render_multi_date_comparison(
+                    item_groups=[g_first, g_last],
+                    date_labels=[d_first, d_last],
+                    bbox_4326=bbox_4326,
+                    layer_mode=layer_m,
+                    target_epsg=target_epsg,
+                    resolution=comp_res_m,
+                    sensor=sensor,
+                    mask_clouds=(sensor != SENSOR_S1),
+                    all_candidates=all_cands,
+                    candidates_by_date=df.attrs.get("candidates_by_bucket"),
+                    auto_cloud_fallback=(sensor != SENSOR_S1),
+                    min_clear_pct=75.0,
+                )
+                diff_da = comp_idx.get("diff_da") if isinstance(comp_idx, dict) else None
+                if diff_da is not None:
+                    ch_summary = compute_change_summary(
+                        diff_da,
+                        resolution_m=comp_res_m,
+                        threshold=2.0 if sensor == SENSOR_S1 else (2.0 if layer_m == "LST" else 0.15),
+                    )
+                    tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
+                    r_dates = comp_idx.get("dates") or [d_first, d_last]
+                    tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_dates[0]}_to_{r_dates[-1]}_EPSG{epsg_num}.tif"
+            except Exception:
+                # Never fail the entire time series if optional visual swipe comparison encounters an edge error
+                pass
+
+        result_kind = (
+            "time_series_and_comparison"
+            if (comp_rgb is not None or comp_idx is not None)
+            else "time_series"
+        )
+        gc.collect()
         base_out.update(
             {
-                "kind": "time_series",
+                "kind": result_kind,
                 "ts_df": ts_df,
                 "csv_bytes": csv_bytes,
                 "csv_filename": csv_fname,
+                "comparison_rgb": comp_rgb,
+                "comparison_index": comp_idx,
+                "comparison_result": comp_idx or comp_rgb,
+                "change_summary": ch_summary,
+                "index_da": diff_da,
+                "tif_bytes": tif_bytes,
+                "tif_filename": tif_fname,
             }
         )
         base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
@@ -2011,10 +2374,14 @@ Return STRICT JSON ONLY (no markdown fences) with this exact schema:
     "inset_position": "bottom_right" | "top_right" | "bottom_left" | "top_left" | "right_panel_bottom"
   },
   "plan": null OR {
-    "place_name": string (nominative town/place name suitable for geocoding, e.g. "Celje", "Slovenj Gradec", "Črna na Koroškem", "Kras", "Bled", "Ljubljana", "Kranj", "Murska Sobota"),
+    "place_name": string (unambiguous full place name including region/state and country, e.g. "SpaceX Starbase, Boca Chica, Texas, USA", "Črna na Koroškem, Slovenia", "Pasterze Glacier, Austria" — NEVER a bare ambiguous town name!),
+    "location": string (same unambiguous full place name),
+    "lat": number | null (exact WGS84 latitude whenever you know the landmark/place, e.g. 25.9972 for SpaceX Starbase, 46.0569 for Ljubljana),
+    "lon": number | null (exact WGS84 longitude whenever you know the landmark/place, e.g. -97.1561 for SpaceX Starbase, 14.5058 for Ljubljana),
     "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
     "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
-    "task_type": "scene_rgb" | "spectral_index" | "cloud_free_composite" | "time_series" | "change_comparison" | "disaster_flood" | "disaster_fire" | "disaster_forest" | "terrain_dem" | "gnss_plan",
+    "task_type": "scene_rgb" | "spectral_index" | "cloud_free_composite" | "time_series" | "time_series_and_comparison" | "change_comparison" | "disaster_flood" | "disaster_fire" | "disaster_forest" | "terrain_dem" | "gnss_plan",
+    "include_comparison": boolean (true whenever user asks about spatial growth, expansion, shrinking, construction, deforestation, glacier retreat, or change over the years),
     "index_name": "NDVI" | "NDWI" | "MNDWI" | "NDBI" | "NBR" | "NDSI" | "LST" | "VV",
     "start_date": "YYYY-MM-DD",
     "end_date": "YYYY-MM-DD",
@@ -2026,7 +2393,7 @@ Return STRICT JSON ONLY (no markdown fences) with this exact schema:
   }
 }
 
-ALL 10 SUPPORTED TASK TYPES FOR "run_analysis":
+ALL 11 SUPPORTED TASK TYPES FOR "run_analysis":
 - "disaster_flood": Floods/inundation/radar -> sensor="sentinel-1-rtc", index_name="VV".
 - "disaster_fire": Wildfire/burn severity -> index_name="NBR".
 - "disaster_forest": Windthrow/clearcut/forest loss -> index_name="NDVI".
@@ -2034,6 +2401,7 @@ ALL 10 SUPPORTED TASK TYPES FOR "run_analysis":
 - "scene_rgb": Single-date True Color RGB or SAR composite.
 - "cloud_free_composite": Cloud-free temporal median composite over a period.
 - "time_series": Multi-year or seasonal time series chart + trend (Sentinel-2 2017+ or Landsat 1984+).
+- "time_series_and_comparison": Multi-year time series chart + trend PAIRED with an interactive zoomable Before/After swipe map (earliest t1 ↔ latest t2 in RGB & index) + Δ stats. ALWAYS use this for spatial growth, factory/urban expansion ("širila", "zrasla"), glacier retreat ("umikala"), deforestation, or "changes over the years"!
 - "change_comparison": 2-date Before/After comparison with zoomable swipe map + Δ stats.
 - "terrain_dem": Copernicus DEM 30 m elevation, slope [°], aspect [°], hillshade, elevation profile (resolution_m=30).
 - "gnss_plan": GNSS Mission Planning (GPS/Galileo/GLONASS visibility, PDOP/HDOP/VDOP, DEM+S2 obstacle mask, optimal windows).
@@ -2044,10 +2412,11 @@ CARTOGRAPHY RULES FOR "generate_map":
 - Set "target_layer": "satellite_rgb" if user explicitly asks for the RGB/satellite image map, "analysis_mask" if they ask for the flood/fire/index mask, "workspace_layer" if they refer to a layer loaded in Workspaces 1–3, else "latest_ai".
 - Set "reset_layout": true ONLY if the user explicitly asks to reset layout to defaults.
 
-SCIENTIFIC & REGIONAL RULES:
+SCIENTIFIC & GLOBAL GEOCODING RULES:
+- ALWAYS provide accurate numeric "lat" and "lon" AND an unambiguous full "place_name"/"location" with region/country for specific landmarks/facilities (e.g. SpaceX Starbase Boca Chica Texas = 25.9972, -97.1561, NOT Boca Chica Dominican Republic!).
 - LST -> sensor="landsat-c2-l2", resolution_m=30.
 - start_date < 2016-01-01 -> sensor="landsat-c2-l2", resolution_m=30.
-- Multi-year trends (>5 years) -> task_type="time_series", interval="Letno".
+- Multi-year spatial growth/expansion/retreat -> task_type="time_series_and_comparison", include_comparison=true, interval="Letno" (NDBI for factories/urban expansion, NDSI for glaciers, NDVI for vegetation).
 - Known Slovenian events: Koroška/Savinja/Celje/Kamnik/Škofja Loka floods = 2023-08-04, Barje floods = 2023-08-05, Kras wildfire = 2022-07-22.
 - Normalize declined Slovenian places/regions to nominative geocodable names: "na Koroškem"/"Koroška" -> "Slovenj Gradec" (or "Črna na Koroškem"), "v Celju"/"v Savinjski dolini" -> "Celje", "na Krasu" -> "Kras", "na Gorenjskem" -> "Kranj", "v Prekmurju" -> "Murska Sobota".
 - If user replies after a previous clarifying question, combine the previous user request + new answer into a complete "run_analysis" plan!"""
@@ -2585,12 +2954,17 @@ def _route_user_message_local(
     norm_q = _normalize_ascii(effective_msg)
     has_qa_cue = any(p in norm_q for p in _QA_PATTERNS) or norm_q.endswith("?")
     has_run_verb = any(p in norm_q for p in _RUN_ACTION_PATTERNS)
-    has_eo_subject = any(p in norm_q for p in _EO_SUBJECT_PATTERNS)
+    has_eo_subject = any(p in norm_q for p in _EO_SUBJECT_PATTERNS) or any(
+        c in norm_q for c in _EXPANSION_COMPARISON_CUES
+    )
     years_in_q = re.findall(r"\b(19[89]\d|20[0-2]\d)\b", norm_q)
     has_year_or_month = bool(years_in_q) or any(
         pat in norm_q for pat, _ in _MONTH_PATTERNS
     ) or any(s in norm_q for s in ("polet", "pomlad", "jesen", "zim", "summer", "winter", "spring", "autumn"))
-    has_known_place = any(stem in norm_q for stem, _, _, _ in _SLOVENIAN_PLACE_STEMS)
+    has_known_place = (
+        any(stem in norm_q for stem, _, _, _ in _SLOVENIAN_PLACE_STEMS)
+        or (_match_known_global_landmark(norm_q) is not None)
+    )
     has_prep_place = bool(
         re.search(
             r"\b(?:za|v|na|okoli|pri|in|for|around|near|over)\s+([A-ZČŠŽ][a-zčšž]+)",
@@ -2827,8 +3201,16 @@ def route_user_message(
                     "fallback_note_sl": fb_sl,
                     "fallback_note_en": fb_en,
                 }
-            if action == "run_analysis" and isinstance(parsed.get("plan"), dict):
-                plan = validate_and_normalize_plan(parsed["plan"], engine="gemini")
+            if action in ("run_analysis", "time_series_and_comparison") and isinstance(parsed.get("plan"), dict):
+                raw_pl = dict(parsed["plan"])
+                norm_m = _normalize_ascii(message)
+                if action == "time_series_and_comparison" or (
+                    str(raw_pl.get("task_type") or "").strip().lower() == "time_series"
+                    and any(c in norm_m for c in _EXPANSION_COMPARISON_CUES)
+                ):
+                    raw_pl["task_type"] = "time_series_and_comparison"
+                    raw_pl["include_comparison"] = True
+                plan = validate_and_normalize_plan(raw_pl, engine="gemini")
                 plan["gemini_model"] = used_model
                 plan["fallback_note_sl"] = fb_sl
                 plan["fallback_note_en"] = fb_en
@@ -3091,7 +3473,7 @@ def _generate_local_conversational_reply(
                 f"- **Interactive Map:** Both the **True Color RGB satellite scene** and the **{idx} overlay** are toggleable in the map's Layer Control."
             )
 
-        if kind == "time_series":
+        if kind in ("time_series", "time_series_and_comparison"):
             n_d = int(analysis_context.get("n_dates", 0))
             d1 = str(analysis_context.get("date_start", ""))
             d2 = str(analysis_context.get("date_end", ""))
