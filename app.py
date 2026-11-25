@@ -128,18 +128,25 @@ from ai_pomocnik import (
     verify_gemini_api_connection,
 )
 from analize import (
+    GLACIER_CHANGE_RGBA_MAP,
+    INDEX_CATEGORIES,
     OPTICAL_SIGNATURE_BANDS,
     SAR_METRICS,
     SPECTRAL_INDICES,
+    SPECTRAL_INDICES_META,
     apply_cloud_mask,
+    classify_glacier_change,
     compute_index,
     compute_index_stats,
     compute_quick_land_cover,
     compute_sar_water_mask,
     compute_snow_glacier_stats,
+    compute_water_cleaned_ndsi,
+    detect_new_proglacial_lake_mask,
     extract_sar_metric,
     extract_spectral_signature,
     get_required_bands_for_sensor,
+    get_supported_indices_for_sensor,
 )
 from casovne_vrste import (
     compile_timelapse_gif,
@@ -194,6 +201,7 @@ from map_overlay import (
     build_zoomable_swipe_map,
     expand_bbox_for_panning,
     raster_to_map_overlay_png,
+    render_diverging_change_overlay,
 )
 from nesrece import (
     DISASTER_FLOOD,
@@ -214,6 +222,7 @@ from stac_loader import (
     INTERVAL_MONTHLY,
     INTERVAL_SEASONAL,
     INTERVAL_YEARLY,
+    SEASON_GLACIER_ABLATION,
     SEASON_SUMMER,
     SENSOR_LANDSAT,
     SENSOR_S1,
@@ -832,10 +841,8 @@ PROFILE_PRESET_I18N: dict[str, str] = {
 
 
 def _get_optical_index_keys(sensor: str) -> list[str]:
-    """Return optical index keys, including thermal LST [°C] whenever Landsat C2 L2 is active."""
-    if sensor == SENSOR_LANDSAT:
-        return [*INDEX_KEYS, "LST"]
-    return list(INDEX_KEYS)
+    """Return all supported optical spectral indices for ``sensor`` (12 for S2 incl. NDRE; 12 for Landsat incl. LST)."""
+    return get_supported_indices_for_sensor(sensor)
 
 
 def _fmt_index_pill(code: str, lang: str) -> str:
@@ -845,8 +852,72 @@ def _fmt_index_pill(code: str, lang: str) -> str:
         return t("sar_VV_VH_pill", lang=lang)
     return code
 
+
+def _render_index_info_card(
+    index_code: str,
+    lang: str,
+    *,
+    active_sensor: str = "sentinel-2-l2a",
+) -> None:
+    """Render a sleek minimalist info card describing the selected spectral index, formula, and interpretation."""
+    meta = SPECTRAL_INDICES_META.get(str(index_code or "").strip().upper())
+    if not meta:
+        return
+    name = meta["name_en"] if lang == "en" else meta["name_sl"]
+    desc = meta["short_desc_en"] if lang == "en" else meta["short_desc_sl"]
+    interp = meta["interpretation_en"] if lang == "en" else meta["interpretation_sl"]
+    formula = meta["formula"]
+    f_lbl = t("idx_formula_lbl", lang=lang)
+    i_lbl = t("idx_interp_lbl", lang=lang)
+    sensor_note = ""
+    if meta.get("s2_only") and active_sensor != SENSOR_S2:
+        sensor_note = f'<div style="margin-top:5px;font-size:12px;color:#B45309;">{t("idx_s2_only_badge", lang=lang)}</div>'
+    elif meta.get("landsat_only") and active_sensor != SENSOR_LANDSAT:
+        sensor_note = f'<div style="margin-top:5px;font-size:12px;color:#B45309;">{t("idx_ls_only_badge", lang=lang)}</div>'
+
+    st.markdown(
+        f"""<div style="background:#F8FAFC;border:1px solid rgba(15,23,42,0.08);border-left:3px solid #0F766E;
+        border-radius:10px;padding:10px 14px;margin:6px 0 10px 0;">
+          <div style="display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px;">
+            <span style="font-size:14px;font-weight:700;color:#0F172A;">{meta['code']} — {name}</span>
+            <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
+              background:#E2E8F0;color:#0F172A;padding:2px 8px;border-radius:999px;">{f_lbl}: {formula}</span>
+          </div>
+          <div style="font-size:13px;color:#334155;margin-top:4px;line-height:1.45;">{desc}</div>
+          <div style="font-size:12px;color:#64748B;margin-top:4px;"><b>{i_lbl}:</b> {interp}</div>
+          {sensor_note}
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_all_indices_guide_expander(lang: str) -> None:
+    """Render a clean collapsible quick-reference table of all 13 spectral indices."""
+    with st.expander(t("idx_guide_expander", lang=lang), expanded=False):
+        rows = []
+        for code, m in SPECTRAL_INDICES_META.items():
+            s_list = tuple(m.get("supported_sensors") or ())
+            sens_txt = (
+                "Sentinel-2"
+                if s_list == ("sentinel-2-l2a",)
+                else ("Landsat" if s_list == ("landsat-c2-l2",) else "S2 + Landsat")
+            )
+            rows.append(
+                {
+                    "Indeks" if lang == "sl" else "Index": code,
+                    "Ime" if lang == "sl" else "Name": m["name_en"] if lang == "en" else m["name_sl"],
+                    "Formula": m["formula"],
+                    t("idx_best_for_lbl", lang=lang): m["best_for_en"] if lang == "en" else m["best_for_sl"],
+                    "Senzor" if lang == "sl" else "Sensor": sens_txt,
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
 INTERVAL_KEYS: list[str] = list(TEMPORAL_INTERVAL_KEYS)
-SEASON_KEYS: list[str] = list(YEARLY_SEASON_KEYS)
+SEASON_KEYS: list[str] = list(YEARLY_SEASON_KEYS) + (
+    [SEASON_GLACIER_ABLATION] if SEASON_GLACIER_ABLATION not in YEARLY_SEASON_KEYS else []
+)
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -3898,74 +3969,158 @@ def _build_time_series_chart(
     target_crs: str,
     resolution_m: int,
     unit_suffix: str = "",
+    *,
+    exclude_archive: bool = True,
+    lang: str = "sl",
 ) -> go.Figure:
     fig = go.Figure()
 
-    # Subtilen pas P10–P90 v kartografski petrol-zeleni barvi
-    fig.add_trace(
-        go.Scatter(
-            x=ts_df["date_str"],
-            y=ts_df["p90"],
-            mode="lines",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False,
-            name="P90",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=ts_df["date_str"],
-            y=ts_df["p10"],
-            mode="lines",
-            line=dict(width=0),
-            fill="tonexty",
-            fillcolor="rgba(15, 118, 110, 0.14)",
-            name=t("ts_trace_band"),
-            hoverinfo="skip",
-        )
+    if exclude_archive and "analysis_reliable" in ts_df.columns:
+        _rel_m = ts_df["analysis_reliable"].astype(bool)
+        ts_rel = ts_df.loc[_rel_m].reset_index(drop=True)
+        ts_arch = ts_df.loc[~_rel_m].reset_index(drop=True)
+        if len(ts_rel) < 2:
+            ts_rel = ts_df
+            ts_arch = ts_df.iloc[0:0]
+    else:
+        ts_rel = ts_df
+        ts_arch = ts_df.iloc[0:0]
+
+    is_dual_fusion = (
+        "sensor_family" in ts_rel.columns
+        and ts_rel["sensor_family"].nunique() >= 2
     )
 
-    customdata = np.stack(
-        [ts_df["valid_pct"].values, ts_df["p10"].values, ts_df["p90"].values, ts_df["std"].values],
-        axis=-1,
-    )
+    # Subtilen pas P10–P90 v kartografski petrol-zeleni barvi (na zanesljivi vrsti)
+    if "p90" in ts_rel.columns and "p10" in ts_rel.columns and not ts_rel.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=ts_rel["date_str"],
+                y=ts_rel["p90"],
+                mode="lines",
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False,
+                name="P90",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=ts_rel["date_str"],
+                y=ts_rel["p10"],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(15, 118, 110, 0.12)",
+                name=t("ts_trace_band"),
+                hoverinfo="skip",
+            )
+        )
+
     hover_valid = t("ts_hover_valid")
-
-    fig.add_trace(
-        go.Scatter(
-            x=ts_df["date_str"],
-            y=ts_df["mean"],
-            mode="lines+markers",
-            name=t("ts_trace_mean"),
-            line=dict(color="#0F766E", width=2.5),
-            marker=dict(size=7, color="#0F766E", line=dict(color="#FFFFFF", width=1.2)),
-            customdata=customdata,
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                f"{t('ts_trace_mean')}: %{{y:.3f}}{unit_suffix} (±%{{customdata[3]:.3f}})<br>"
-                f"P10–P90: %{{customdata[1]:.3f}} – %{{customdata[2]:.3f}}{unit_suffix}<br>"
-                f"{hover_valid}: %{{customdata[0]:.1f}}%<extra></extra>"
-            ),
+    if is_dual_fusion:
+        ts_ls = ts_rel[ts_rel["sensor_family"].astype(str).str.contains("Landsat", case=False, na=False)]
+        ts_s2 = ts_rel[ts_rel["sensor_family"].astype(str).str.contains("Sentinel-2", case=False, na=False)]
+        if not ts_ls.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=ts_ls["date_str"],
+                    y=ts_ls["mean"],
+                    mode="lines+markers",
+                    name="Landsat (30 m)",
+                    line=dict(color="#D97706", width=2.3),
+                    marker=dict(size=7, color="#D97706", symbol="circle"),
+                )
+            )
+        if not ts_s2.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=ts_s2["date_str"],
+                    y=ts_s2["mean"],
+                    mode="lines+markers",
+                    name="Sentinel-2 (10–20 m)",
+                    line=dict(color="#0F766E", width=2.5),
+                    marker=dict(size=7, color="#0F766E", symbol="diamond"),
+                )
+            )
+        fig.add_vline(x="2017-01-01", line_width=1.4, line_dash="dot", line_color="#64748B")
+        fig.add_annotation(
+            x="2017-01-01",
+            y=1.02,
+            yref="paper",
+            text=t("ai_fusion_transition_2017", lang=lang),
+            showarrow=False,
+            font=dict(size=11, color="#475569"),
+            bgcolor="rgba(255,255,255,0.85)",
         )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=ts_df["date_str"],
-            y=ts_df["median"],
-            mode="lines+markers",
-            name=t("ts_trace_median"),
-            line=dict(color="#0F172A", width=1.8, dash="dash"),
-            marker=dict(size=5, color="#0F172A"),
-            customdata=customdata,
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                f"{t('ts_trace_median')}: %{{y:.3f}}{unit_suffix}<br>"
-                f"{hover_valid}: %{{customdata[0]:.1f}}%<extra></extra>"
-            ),
+    else:
+        customdata = np.stack(
+            [ts_rel["valid_pct"].values, ts_rel["p10"].values, ts_rel["p90"].values, ts_rel["std"].values],
+            axis=-1,
         )
-    )
+        fig.add_trace(
+            go.Scatter(
+                x=ts_rel["date_str"],
+                y=ts_rel["mean"],
+                mode="lines+markers",
+                name=t("ts_trace_mean"),
+                line=dict(color="#0F766E", width=2.5),
+                marker=dict(size=7, color="#0F766E", line=dict(color="#FFFFFF", width=1.2)),
+                customdata=customdata,
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    f"{t('ts_trace_mean')}: %{{y:.3f}}{unit_suffix} (±%{{customdata[3]:.3f}})<br>"
+                    f"P10–P90: %{{customdata[1]:.3f}} – %{{customdata[2]:.3f}}{unit_suffix}<br>"
+                    f"{hover_valid}: %{{customdata[0]:.1f}}%<extra></extra>"
+                ),
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=ts_rel["date_str"],
+                y=ts_rel["median"],
+                mode="lines+markers",
+                name=t("ts_trace_median"),
+                line=dict(color="#0F172A", width=1.8, dash="dash"),
+                marker=dict(size=5, color="#0F172A"),
+                customdata=customdata,
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    f"{t('ts_trace_median')}: %{{y:.3f}}{unit_suffix}<br>"
+                    f"{hover_valid}: %{{customdata[0]:.1f}}%<extra></extra>"
+                ),
+            )
+        )
+
+    if not ts_arch.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=ts_arch["date_str"],
+                y=ts_arch["mean"],
+                mode="markers",
+                name=t("ai_ts_archive_trace", lang=lang),
+                marker=dict(
+                    size=9,
+                    color="#94A3B8",
+                    symbol="diamond-open",
+                    line=dict(width=2, color="#64748B"),
+                ),
+            )
+        )
+
+    if len(ts_rel) >= 3:
+        x_ord = np.arange(len(ts_rel), dtype=np.float64)
+        slope, intercept = np.polyfit(x_ord, ts_rel["mean"].to_numpy(dtype=np.float64), 1)
+        fig.add_trace(
+            go.Scatter(
+                x=ts_rel["date_str"],
+                y=slope * x_ord + intercept,
+                mode="lines",
+                name="Trend",
+                line=dict(color="#DC2626", width=1.8, dash="dash"),
+            )
+        )
 
     fig.update_layout(
         title=dict(
@@ -5354,30 +5509,42 @@ def _render_tab2_index_viewer_fragment(
             }
 
         t2_overlays: list[dict[str, Any]] = []
-        _raw_t1_disp = st.session_state.get("loaded_scene_display_ds")
-        t1_disp = _raw_t1_disp if _raw_t1_disp is not None else st.session_state.get("loaded_scene_ds")
-        t1_meta = st.session_state.get("loaded_scene_meta")
-        if t1_disp is not None and t1_meta is not None and t1_meta.get("sensor") == active_sensor:
-            try:
-                t1_uri, t1_bnds, t1_lbl = _get_tab1_overlay_entry(
-                    ds_disp=t1_disp,
-                    meta=t1_meta,
-                    use_percentile=bool(st.session_state.get("tab1_stretch", True)),
-                    gamma=float(st.session_state.get("tab1_gamma", 1.0)),
-                    lang=lang,
-                )
-                t2_overlays.append(
-                    {
-                        "name": t1_lbl,
-                        "image": t1_uri,
-                        "bounds": t1_bnds,
-                        "opacity": 1.0,
-                        "show": False,
-                        "zindex": 12,
-                    }
-                )
-            except Exception:
-                pass
+        if idx_meta.get("rgb_overlay_uri") and idx_meta.get("rgb_overlay_bounds"):
+            t2_overlays.append(
+                {
+                    "name": f"🛰️ RGB ({idx_meta['date_str']})",
+                    "image": idx_meta["rgb_overlay_uri"],
+                    "bounds": idx_meta["rgb_overlay_bounds"],
+                    "opacity": 1.0,
+                    "show": True,
+                    "zindex": 12,
+                }
+            )
+        else:
+            _raw_t1_disp = st.session_state.get("loaded_scene_display_ds")
+            t1_disp = _raw_t1_disp if _raw_t1_disp is not None else st.session_state.get("loaded_scene_ds")
+            t1_meta = st.session_state.get("loaded_scene_meta")
+            if t1_disp is not None and t1_meta is not None and t1_meta.get("sensor") == active_sensor:
+                try:
+                    t1_uri, t1_bnds, t1_lbl = _get_tab1_overlay_entry(
+                        ds_disp=t1_disp,
+                        meta=t1_meta,
+                        use_percentile=bool(st.session_state.get("tab1_stretch", True)),
+                        gamma=float(st.session_state.get("tab1_gamma", 1.0)),
+                        lang=lang,
+                    )
+                    t2_overlays.append(
+                        {
+                            "name": t1_lbl,
+                            "image": t1_uri,
+                            "bounds": t1_bnds,
+                            "opacity": 1.0,
+                            "show": False,
+                            "zindex": 12,
+                        }
+                    )
+                except Exception:
+                    pass
 
         t2_overlays.append(
             {
@@ -10040,7 +10207,7 @@ def main() -> None:
             else:
                 t2_opt_indices = _get_optical_index_keys(active_sensor)
                 with st.container(border=True):
-                    col_s2, col_i2 = st.columns([1.35, 0.9])
+                    col_s2, col_cat2 = st.columns([1.25, 1.0], gap="small")
                     with col_s2:
                         t2_scene_idx = _scene_touch_picker(
                             t("scene_select_label"),
@@ -10051,19 +10218,40 @@ def main() -> None:
                             key=f"tab2_scene_select_{active_sensor}",
                             lang=lang,
                         )
-                    with col_i2:
-                        t2_index_key = _touch_selector(
-                            t("index_select_label"),
-                            options=t2_opt_indices,
-                            default=t2_opt_indices[0],
-                            format_func=lambda k, _l=lang: _fmt_index_pill(k, _l),
-                            key="tab2_index_select",
+                    with col_cat2:
+                        cat_keys_t2 = [c["key"] for c in INDEX_CATEGORIES]
+                        cat_lbl_map = {
+                            c["key"]: (c["label_en"] if lang == "en" else c["label_sl"])
+                            for c in INDEX_CATEGORIES
+                        }
+                        t2_cat_key = _touch_selector(
+                            t("idx_category_label", lang=lang),
+                            options=cat_keys_t2,
+                            default=cat_keys_t2[0],
+                            format_func=lambda k: cat_lbl_map.get(k, k),
+                            key=f"tab2_idx_cat_{active_sensor}",
                             use_pills=True,
                         )
 
-                    st.caption(
-                        f"{t(f'idx_{t2_index_key}_desc')} — `{SPECTRAL_INDICES[t2_index_key]['formula']}`"
+                    cat_indices = [
+                        code
+                        for code in t2_opt_indices
+                        if SPECTRAL_INDICES_META.get(code, {}).get("category") == t2_cat_key
+                    ]
+                    if not cat_indices:
+                        cat_indices = list(t2_opt_indices)
+
+                    t2_index_key = _touch_selector(
+                        t("index_select_label"),
+                        options=cat_indices,
+                        default=cat_indices[0],
+                        format_func=lambda k, _l=lang: _fmt_index_pill(k, _l),
+                        key=f"tab2_index_select_{active_sensor}_{t2_cat_key}",
+                        use_pills=True,
                     )
+
+                    _render_index_info_card(t2_index_key, lang=lang, active_sensor=active_sensor)
+                    _render_all_indices_guide_expander(lang=lang)
 
                     # Hitri 1-klik ledeniški / snežni primeri (Triglav/Kanin, Pasterze, Aletsch)
                     with st.expander(t("snow_presets_header"), expanded=(t2_index_key == "NDSI")):
@@ -10127,6 +10315,10 @@ def main() -> None:
                     )
                     if t2_index_key == "NDSI" and "B08" not in req_bands:
                         req_bands.append("B08")
+                    # Always fetch RGB bands alongside the index so toggleable RGB is ready on the Slippy Map
+                    for rgb_b in ("B04", "B03", "B02"):
+                        if rgb_b not in req_bands:
+                            req_bands.append(rgb_b)
 
                     with st.spinner(
                         t("spinner_index", bands=", ".join(req_bands), idx=t2_index_key, date=chosen_row["date_str"])
@@ -10179,6 +10371,21 @@ def main() -> None:
                                 )
                                 index_da = compute_index(ds_masked, t2_index_key)
                                 index_display_da = index_da
+
+                            rgb_overlay_uri_t2: str | None = None
+                            rgb_overlay_bnds_t2: list[list[float]] | None = None
+                            if all(b in ds_raw.data_vars for b in ("B04", "B03", "B02")):
+                                try:
+                                    rgb_overlay_uri_t2, rgb_overlay_bnds_t2 = raster_to_map_overlay_png(
+                                        ds_raw,
+                                        src_epsg=target_crs,
+                                        is_rgb=True,
+                                        bands=["B04", "B03", "B02"],
+                                        use_percentile_stretch=True,
+                                        max_width=1400,
+                                    )
+                                except Exception:
+                                    pass
 
                             snow_mask_da_res = None
                             snow_display_da_res = None
@@ -10259,6 +10466,8 @@ def main() -> None:
                                 "resolution_m": int(selected_resolution),
                                 "mask_clouds": bool(t2_mask_clouds),
                                 "expanded_pan": use_pan_buf_t2,
+                                "rgb_overlay_uri": rgb_overlay_uri_t2,
+                                "rgb_overlay_bounds": rgb_overlay_bnds_t2,
                             }
                             st.session_state["tab2_tif_bytes"] = tif_bytes
                             st.session_state["tab2_tif_filename"] = tif_filename
@@ -11201,6 +11410,17 @@ def main() -> None:
                                 key=f"tab3_ts_clear_thr_{active_sensor}",
                             )
 
+                    if not is_sar_t3:
+                        _render_index_info_card(ts_metric_key, lang=lang, active_sensor=active_sensor)
+                        ts_manual_fusion = st.toggle(
+                            t("ts_manual_fusion_toggle", lang=lang),
+                            value=True,
+                            help=t("ts_manual_fusion_help", lang=lang),
+                            key="tab3_ts_manual_fusion",
+                        )
+                    else:
+                        ts_manual_fusion = False
+
                     ts_clicked = st.button(
                         t("btn_compute_ts"),
                         type="primary",
@@ -11209,7 +11429,6 @@ def main() -> None:
                     )
 
                 if ts_clicked and active_bbox is not None:
-                    selected_items = _select_evenly_spaced_items(items, int(max_epochs))
                     prog_bar = st.progress(0.0)
                     status_slot = st.empty()
 
@@ -11220,20 +11439,107 @@ def main() -> None:
                             status_slot.caption(t("ts_progress", cur=step + 1, tot=total, date=label))
 
                     try:
-                        ts_df = extract_time_series(
-                            items=selected_items,
-                            bbox_4326=active_bbox,
-                            index_name=ts_metric_key,
-                            target_epsg=target_crs,
-                            resolution=float(selected_resolution),
-                            mask_clouds=ts_mask_clouds,
-                            min_valid_pct=float(ts_clear_thr),
-                            progress_callback=_on_progress,
-                            sensor=active_sensor,
-                            aoi_polygon_4326=active_polygon,
-                            min_swath_coverage_pct=min_swath_guard,
-                            candidates_by_date=summary_df.attrs.get("candidates_by_bucket"),
+                        # Check if multi-sensor temporal fusion applies (optical + toggle ON + range crosses 2017)
+                        d_min_s = str(summary_df["date_str"].min()) if not summary_df.empty else ""
+                        d_max_s = str(summary_df["date_str"].max()) if not summary_df.empty else ""
+                        do_manual_fusion = (
+                            bool(ts_manual_fusion)
+                            and (not is_sar_t3)
+                            and ts_metric_key not in ("LST", "NDRE")
+                            and bool(d_min_s and d_max_s)
+                            and d_min_s < "2017-01-01"
+                            and d_max_s >= "2017-01-01"
                         )
+                        if do_manual_fusion:
+                            eff_season = (
+                                SEASON_GLACIER_ABLATION
+                                if ts_metric_key == "NDSI"
+                                else str(st.session_state.get("yearly_season", SEASON_SUMMER))
+                            )
+                            ls_it, ls_df = search_scenes(
+                                sensor=SENSOR_LANDSAT,
+                                bbox_4326=active_bbox,
+                                start_date=d_min_s,
+                                end_date="2016-12-31",
+                                max_cloud_cover=30.0,
+                                exclude_l7_slc_off=True,
+                                min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
+                                interval_mode=t3_interval_cur if t3_interval_cur != INTERVAL_ALL else INTERVAL_YEARLY,
+                                target_season=eff_season,
+                            )
+                            s2_it, s2_df = search_scenes(
+                                sensor=SENSOR_S2,
+                                bbox_4326=active_bbox,
+                                start_date="2017-01-01",
+                                end_date=d_max_s,
+                                max_cloud_cover=25.0,
+                                min_coverage_pct=DEFAULT_MIN_AOI_COVERAGE_PCT,
+                                interval_mode=t3_interval_cur if t3_interval_cur != INTERVAL_ALL else INTERVAL_YEARLY,
+                                target_season=eff_season,
+                            )
+                            parts_df: list[pd.DataFrame] = []
+                            if ls_it:
+                                ls_pick = _select_evenly_spaced_items(ls_it, max(3, int(max_epochs) // 2))
+                                df_ls_ts = extract_time_series(
+                                    items=ls_pick,
+                                    bbox_4326=active_bbox,
+                                    index_name=ts_metric_key,
+                                    target_epsg=target_crs,
+                                    resolution=max(30.0, float(selected_resolution)),
+                                    mask_clouds=ts_mask_clouds,
+                                    min_valid_pct=float(ts_clear_thr),
+                                    progress_callback=_on_progress,
+                                    sensor=SENSOR_LANDSAT,
+                                    aoi_polygon_4326=active_polygon,
+                                    min_swath_coverage_pct=min_swath_guard,
+                                    candidates_by_date=ls_df.attrs.get("candidates_by_bucket"),
+                                )
+                                if not df_ls_ts.empty:
+                                    df_ls_ts["sensor_family"] = "Landsat (30 m)"
+                                    parts_df.append(df_ls_ts)
+                            if s2_it:
+                                s2_pick = _select_evenly_spaced_items(s2_it, max(3, int(max_epochs) - int(max_epochs) // 2))
+                                df_s2_ts = extract_time_series(
+                                    items=s2_pick,
+                                    bbox_4326=active_bbox,
+                                    index_name=ts_metric_key,
+                                    target_epsg=target_crs,
+                                    resolution=float(selected_resolution),
+                                    mask_clouds=ts_mask_clouds,
+                                    min_valid_pct=float(ts_clear_thr),
+                                    progress_callback=_on_progress,
+                                    sensor=SENSOR_S2,
+                                    aoi_polygon_4326=active_polygon,
+                                    min_swath_coverage_pct=min_swath_guard,
+                                    candidates_by_date=s2_df.attrs.get("candidates_by_bucket"),
+                                )
+                                if not df_s2_ts.empty:
+                                    df_s2_ts["sensor_family"] = "Sentinel-2 (10–20 m)"
+                                    parts_df.append(df_s2_ts)
+                            if parts_df:
+                                ts_df = (
+                                    pd.concat(parts_df, ignore_index=True)
+                                    .sort_values("date_str")
+                                    .reset_index(drop=True)
+                                )
+                            else:
+                                ts_df = pd.DataFrame()
+                        else:
+                            selected_items = _select_evenly_spaced_items(items, int(max_epochs))
+                            ts_df = extract_time_series(
+                                items=selected_items,
+                                bbox_4326=active_bbox,
+                                index_name=ts_metric_key,
+                                target_epsg=target_crs,
+                                resolution=float(selected_resolution),
+                                mask_clouds=ts_mask_clouds,
+                                min_valid_pct=float(ts_clear_thr),
+                                progress_callback=_on_progress,
+                                sensor=active_sensor,
+                                aoi_polygon_4326=active_polygon,
+                                min_swath_coverage_pct=min_swath_guard,
+                                candidates_by_date=summary_df.attrs.get("candidates_by_bucket"),
+                            )
                         prog_bar.empty()
                         status_slot.empty()
 
@@ -11247,6 +11553,7 @@ def main() -> None:
                             "min_valid_pct": int(ts_clear_thr),
                             "replaced": ts_df.attrs.get("replaced_epochs", []),
                             "skipped": ts_df.attrs.get("skipped_epochs", []),
+                            "fusion_active": do_manual_fusion,
                         }
                         gc.collect()
                     except Exception as exc:
@@ -11273,6 +11580,17 @@ def main() -> None:
                     if ts_df_show.empty:
                         st.warning(t("ts_empty_warn"))
                     else:
+                        has_arch_rows = (
+                            "analysis_reliable" in ts_df_show.columns
+                            and bool((~ts_df_show["analysis_reliable"].astype(bool)).any())
+                        )
+                        ts_exclude_arch = True
+                        if has_arch_rows:
+                            ts_exclude_arch = st.toggle(
+                                t("ts_reliable_only_toggle", lang=lang),
+                                value=True,
+                                key="tab3_ts_exclude_archive_toggle",
+                            )
                         ts_unit = (
                             " dB"
                             if is_sar_t3
@@ -11284,6 +11602,8 @@ def main() -> None:
                             target_crs=ts_meta["crs"],
                             resolution_m=ts_meta["resolution_m"],
                             unit_suffix=ts_unit,
+                            exclude_archive=ts_exclude_arch,
+                            lang=lang,
                         )
                         st.plotly_chart(ts_fig, width="stretch", key="tab3_ts_plotly_chart")
 
@@ -11333,6 +11653,8 @@ def main() -> None:
                         )
                     is_comp_rgb = (not is_sar_t3) and comp_layer_key in ("RGB", "NIR")
                     is_comp_lst = (not is_sar_t3) and comp_layer_key == "LST"
+                    if (not is_sar_t3) and comp_layer_key in SPECTRAL_INDICES_META:
+                        _render_index_info_card(comp_layer_key, lang=lang, active_sensor=active_sensor)
                     with col_c_thr:
                         if is_sar_t3:
                             ch_threshold = st.slider(
@@ -11695,7 +12017,14 @@ def main() -> None:
                                 t("tl_scrubber_label"),
                                 options=frame_indices,
                                 value=len(tl_frames) - 1,
-                                format_func=lambda idx: f"{tl_frames[idx]['date_str']} ({tl_frames[idx]['platform']})",
+                                format_func=lambda idx: (
+                                    f"{tl_frames[idx]['date_str']} ({tl_frames[idx]['platform']})"
+                                    + (
+                                        f" [{t('ai_frame_archive_tag', lang=lang)}]"
+                                        if str(tl_frames[idx].get("date_str", ""))[:4] < "1990"
+                                        else ""
+                                    )
+                                ),
                                 key=f"tab3_tl_scrubber_{active_sensor}_{tl_data['layer_mode']}",
                             )
                             chosen_frame = tl_frames[int(scrub_idx)]

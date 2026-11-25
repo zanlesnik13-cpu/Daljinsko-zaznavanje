@@ -42,66 +42,285 @@ SCL_CLASS_LABELS: dict[int, str] = {
     11: "Snow / Ice",
 }
 
-SPECTRAL_INDICES: dict[str, dict[str, Any]] = {
+INDEX_CATEGORIES: tuple[dict[str, str], ...] = (
+    {"key": "Vegetacija", "label_sl": "🌿 Vegetacija", "label_en": "🌿 Vegetation"},
+    {"key": "Voda in sneg", "label_sl": "💧 Voda in sneg", "label_en": "💧 Water & Snow"},
+    {"key": "Tla in pozidanost", "label_sl": "🏗️ Tla in pozidanost", "label_en": "🏗️ Soil & Built-Up"},
+    {"key": "Požari in toplota", "label_sl": "🔥 Požari in toplota", "label_en": "🔥 Fire & Thermal"},
+)
+
+SPECTRAL_INDICES_META: dict[str, dict[str, Any]] = {
+    # --- 1. VEGETACIJA ---
     "NDVI": {
+        "code": "NDVI",
+        "name_sl": "Normalizirani diferenčni indeks vegetacije",
+        "name_en": "Normalized Difference Vegetation Index",
+        "category": "Vegetacija",
         "bands": ("B08", "B04"),
-        "formula": "(B08 - B04) / (B08 + B04)",
+        "formula": "(NIR − Red) / (NIR + Red)",
+        "short_desc_sl": "Meri vitalnost rastlinja, fotosintetsko aktivnost in gostoto biomase.",
+        "short_desc_en": "Measures vegetation vigor, photosynthetic activity, and biomass density.",
+        "interpretation_sl": "< 0: voda/sneg · 0–0.2: gola tla/pozidava · 0.2–0.5: redko rastlinje · > 0.6: gost zdrav gozd",
+        "interpretation_en": "< 0: water/snow · 0–0.2: bare soil/urban · 0.2–0.5: sparse vegetation · > 0.6: dense healthy forest",
+        "best_for_sl": "Gozdovi, kmetijstvo, fenologija in spremljanje krčenja vegetacije.",
+        "best_for_en": "Forests, agriculture, phenology, and vegetation loss monitoring.",
+        "colormap": "RdYlGn",
         "cmap": "RdYlGn",
         "vmin": -0.2,
         "vmax": 0.9,
         "diff_cmap": "RdYlGn",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
     },
+    "EVI": {
+        "code": "EVI",
+        "name_sl": "Izboljšan indeks vegetacije",
+        "name_en": "Enhanced Vegetation Index",
+        "category": "Vegetacija",
+        "bands": ("B08", "B04", "B02"),
+        "formula": "2.5 × (NIR − Red) / (NIR + 6×Red − 7.5×Blue + 1)",
+        "short_desc_sl": "Ne zasiči se v gostih gozdovih in zmanjšuje vpliv atmosfere ter ozadja tal.",
+        "short_desc_en": "Resists saturation in dense canopies while correcting for atmosphere and soil background.",
+        "interpretation_sl": "< 0.1: gola tla/voda · 0.2–0.4: travniki/poljščine · > 0.5: zelo gosta biomasa",
+        "interpretation_en": "< 0.1: bare/water · 0.2–0.4: grasslands/crops · > 0.5: very dense canopy biomass",
+        "best_for_sl": "Gosti gozdovi, tropska/bujna biomasa in primerjava med letnimi časi.",
+        "best_for_en": "Dense forests, high-biomass canopies, and multi-season vigor tracking.",
+        "colormap": "RdYlGn",
+        "cmap": "RdYlGn",
+        "vmin": -0.2,
+        "vmax": 0.9,
+        "diff_cmap": "RdYlGn",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    "SAVI": {
+        "code": "SAVI",
+        "name_sl": "Talno prilagojen indeks vegetacije",
+        "name_en": "Soil-Adjusted Vegetation Index",
+        "category": "Vegetacija",
+        "bands": ("B08", "B04"),
+        "formula": "1.5 × (NIR − Red) / (NIR + Red + 0.5)",
+        "short_desc_sl": "Zmanjšuje vpliv svetlosti golih tal (faktor L = 0.5) pri redkejši vegetaciji.",
+        "short_desc_en": "Minimizes bare soil brightness effects (L = 0.5) over sparse vegetation cover.",
+        "interpretation_sl": "< 0.1: gola tla · 0.15–0.4: mlade poljščine/kras · > 0.5: sklenjena vegetacija",
+        "interpretation_en": "< 0.1: bare soil · 0.15–0.4: young crops/karst · > 0.5: closed canopy",
+        "best_for_sl": "Kmetijske površine v zgodnji rasti, sušna in kraška območja.",
+        "best_for_en": "Early-stage cropland, arid regions, and sparse karst vegetation.",
+        "colormap": "RdYlGn",
+        "cmap": "RdYlGn",
+        "vmin": -0.2,
+        "vmax": 0.9,
+        "diff_cmap": "RdYlGn",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    "NDMI": {
+        "code": "NDMI",
+        "name_sl": "Indeks vlažnosti vegetacije",
+        "name_en": "Normalized Difference Moisture Index",
+        "category": "Vegetacija",
+        "bands": ("B08", "B11"),
+        "formula": "(NIR − SWIR1) / (NIR + SWIR1)",
+        "short_desc_sl": "Meri vsebnost vode v listih — zgodnje odkrivanje sušnega stresa in lubadarja.",
+        "short_desc_en": "Measures canopy leaf water content for early drought and bark-beetle stress detection.",
+        "interpretation_sl": "< −0.2: močan vodni stres/gola tla · 0–0.2: zmerna vlaga · > 0.4: dobro preskrbljen gozd",
+        "interpretation_en": "< −0.2: severe water stress/bare · 0–0.2: moderate moisture · > 0.4: well-hydrated canopy",
+        "best_for_sl": "Sušni stres gozdov, poškodbe zaradi lubadarja in namakanje v kmetijstvu.",
+        "best_for_en": "Forest drought stress, bark-beetle damage, and crop irrigation monitoring.",
+        "colormap": "BrBG",
+        "cmap": "BrBG",
+        "vmin": -0.6,
+        "vmax": 0.7,
+        "diff_cmap": "BrBG",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    "NDRE": {
+        "code": "NDRE",
+        "name_sl": "Indeks rdečega roba (Sentinel-2)",
+        "name_en": "Normalized Difference Red Edge (Sentinel-2)",
+        "category": "Vegetacija",
+        "bands": ("B08", "B05"),
+        "formula": "(NIR − RedEdge1) / (NIR + RedEdge1)",
+        "short_desc_sl": "Zelo občutljiv na vsebnost klorofila — odkriva stres rastlin prej kot klasični NDVI.",
+        "short_desc_en": "Highly sensitive to chlorophyll content — detects plant stress earlier than NDVI.",
+        "interpretation_sl": "< 0.1: gola tla/brez klorofila · 0.2–0.4: zmeren klorofil · > 0.5: visoka vitalnost",
+        "interpretation_en": "< 0.1: bare/no chlorophyll · 0.2–0.4: moderate chlorophyll · > 0.5: peak canopy vigor",
+        "best_for_sl": "Precizno kmetijstvo, gnojenje in zgodnji stres v gostih krošnjah (samo Sentinel-2).",
+        "best_for_en": "Precision agriculture, nitrogen status, and early canopy stress (Sentinel-2 only).",
+        "colormap": "RdYlGn",
+        "cmap": "RdYlGn",
+        "vmin": -0.2,
+        "vmax": 0.8,
+        "diff_cmap": "RdYlGn",
+        "s2_only": True,
+        "supported_sensors": ("sentinel-2-l2a",),
+    },
+    # --- 2. VODA IN SNEG ---
     "NDWI": {
+        "code": "NDWI",
+        "name_sl": "Normalizirani indeks vode",
+        "name_en": "Normalized Difference Water Index",
+        "category": "Voda in sneg",
         "bands": ("B03", "B08"),
-        "formula": "(B03 - B08) / (B03 + B08)",
+        "formula": "(Green − NIR) / (Green + NIR)",
+        "short_desc_sl": "Poudarja odprte vodne površine: reke, jezera, mokrišča in ledeniška jezera.",
+        "short_desc_en": "Highlights open surface water: rivers, lakes, wetlands, and proglacial lakes.",
+        "interpretation_sl": "< 0: kopno/vegetacija · 0.05–0.2: motna/plitva voda · > 0.3: čista globoka voda",
+        "interpretation_en": "< 0: land/vegetation · 0.05–0.2: turbid/shallow water · > 0.3: clear deep water",
+        "best_for_sl": "Kartiranje jezer, poplav, obalnih linij in novih ledeniških jezer.",
+        "best_for_en": "Mapping lakes, floods, shorelines, and newly formed proglacial lakes.",
+        "colormap": "RdBu",
         "cmap": "RdBu",
         "vmin": -0.6,
         "vmax": 0.6,
         "diff_cmap": "RdBu",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
     },
     "MNDWI": {
+        "code": "MNDWI",
+        "name_sl": "Modificirani indeks vode",
+        "name_en": "Modified Normalized Difference Water Index",
+        "category": "Voda in sneg",
         "bands": ("B03", "B11"),
-        "formula": "(B03 - B11) / (B03 + B11)",
+        "formula": "(Green − SWIR1) / (Green + SWIR1)",
+        "short_desc_sl": "Natančno zaznava vodo v urbanem okolju in učinkovito izloča sence stavb.",
+        "short_desc_en": "Accurately isolates water in urban areas while suppressing building shadows.",
+        "interpretation_sl": "< 0: pozidava/tla · > 0.1: vodne površine (tudi mestni kanali in poplave)",
+        "interpretation_en": "< 0: built-up/land · > 0.1: open water (including urban canals and floods)",
+        "best_for_sl": "Mestne poplave, pristanišča, kanali in vodotoki ob pozidanih območjih.",
+        "best_for_en": "Urban flooding, harbors, canals, and water bodies near dense structures.",
+        "colormap": "RdBu",
         "cmap": "RdBu",
         "vmin": -0.6,
         "vmax": 0.6,
         "diff_cmap": "RdBu",
-    },
-    "NDBI": {
-        "bands": ("B11", "B08"),
-        "formula": "(B11 - B08) / (B11 + B08)",
-        "cmap": "RdYlBu_r",
-        "vmin": -0.5,
-        "vmax": 0.5,
-        "diff_cmap": "RdBu_r",
-    },
-    "NBR": {
-        "bands": ("B08", "B12"),
-        "formula": "(B08 - B12) / (B08 + B12)",
-        "cmap": "BrBG",
-        "vmin": -0.5,
-        "vmax": 0.8,
-        "diff_cmap": "BrBG",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
     },
     "NDSI": {
+        "code": "NDSI",
+        "name_sl": "Indeks snega in ledu",
+        "name_en": "Normalized Difference Snow Index",
+        "category": "Voda in sneg",
         "bands": ("B03", "B11"),
-        "formula": "(B03 - B11) / (B03 + B11)",
+        "formula": "(Green − SWIR1) / (Green + SWIR1)",
+        "short_desc_sl": "Loči sneg in ledeniški led od oblakov, skal in tal (z vodno masko za jezera).",
+        "short_desc_en": "Separates snow and glacier ice from clouds, rock, and soil (water-masked for lakes).",
+        "interpretation_sl": "< 0.2: brez snega · 0.2–0.4: mešan sneg/grušč · ≥ 0.4: čisti sneg in ledeniški led",
+        "interpretation_en": "< 0.2: snow-free · 0.2–0.4: mixed snow/debris · ≥ 0.4: clean snow & glacier ice",
+        "best_for_sl": "Umik ledenikov, obseg snežne odeje in nadmorska višina snežne meje.",
+        "best_for_en": "Glacier retreat, seasonal snow cover extent, and snowline altitude.",
+        "colormap": "PuBu",
         "cmap": "PuBu",
         "vmin": -0.2,
         "vmax": 0.9,
         "diff_cmap": "RdBu",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    # --- 3. TLA IN POZIDANOST ---
+    "NDBI": {
+        "code": "NDBI",
+        "name_sl": "Indeks pozidanosti",
+        "name_en": "Normalized Difference Built-Up Index",
+        "category": "Tla in pozidanost",
+        "bands": ("B11", "B08"),
+        "formula": "(SWIR1 − NIR) / (SWIR1 + NIR)",
+        "short_desc_sl": "Poudarja urbane površine, beton, asfalt, industrijske cone in širjenje naselij.",
+        "short_desc_en": "Highlights urban surfaces, concrete, asphalt, industrial zones, and sprawl.",
+        "interpretation_sl": "< −0.1: vegetacija/voda · 0–0.15: mešana pozidava · > 0.2: gosta urbana/industrijska raba",
+        "interpretation_en": "< −0.1: vegetation/water · 0–0.15: mixed urban · > 0.2: dense built-up/industrial",
+        "best_for_sl": "Širjenje mest, gradnja infrastrukture in zaznava neprepustnih površin.",
+        "best_for_en": "Urban expansion, infrastructure growth, and impervious surface mapping.",
+        "colormap": "RdYlBu_r",
+        "cmap": "RdYlBu_r",
+        "vmin": -0.5,
+        "vmax": 0.5,
+        "diff_cmap": "RdBu_r",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    "BSI": {
+        "code": "BSI",
+        "name_sl": "Indeks golih tal",
+        "name_en": "Bare Soil Index",
+        "category": "Tla in pozidanost",
+        "bands": ("B11", "B04", "B08", "B02"),
+        "formula": "((SWIR1 + Red) − (NIR + Blue)) / ((SWIR1 + Red) + (NIR + Blue))",
+        "short_desc_sl": "Izpostavlja gola tla, gradbišča, kamnolome, erozijo in sveže gozdne poseke.",
+        "short_desc_en": "Highlights bare soil, construction sites, quarries, erosion, and clearcuts.",
+        "interpretation_sl": "< −0.1: gosta vegetacija/voda · 0–0.15: redka tla · > 0.2: izpostavljena gola tla/gradbišča",
+        "interpretation_en": "< −0.1: dense vegetation/water · 0–0.15: sparse soil · > 0.2: exposed bare soil/quarries",
+        "best_for_sl": "Kartiranje gradbišč, kamnolomov, erozije in razgaljenih kmetijskih tal.",
+        "best_for_en": "Construction sites, quarries, soil erosion, and tilled bare fields.",
+        "colormap": "YlOrBr",
+        "cmap": "YlOrBr",
+        "vmin": -0.6,
+        "vmax": 0.6,
+        "diff_cmap": "RdBu_r",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    # --- 4. POŽARI IN TOPLOTA ---
+    "NBR": {
+        "code": "NBR",
+        "name_sl": "Normalizirano razmerje požarišč",
+        "name_en": "Normalized Burn Ratio",
+        "category": "Požari in toplota",
+        "bands": ("B08", "B12"),
+        "formula": "(NIR − SWIR2) / (NIR + SWIR2)",
+        "short_desc_sl": "Ocenjuje zdravje gozda pred požarom in jakost poškodb (dNBR) po požarih.",
+        "short_desc_en": "Assesses pre-fire forest health and post-fire burn severity (dNBR).",
+        "interpretation_sl": "< −0.2: hudo požgana tla · 0–0.2: gola tla/zmerne poškodbe · > 0.4: zdrav nepoškodovan gozd",
+        "interpretation_en": "< −0.2: severely burned · 0–0.2: bare/moderate burn · > 0.4: healthy unburned forest",
+        "best_for_sl": "Obseg in jakost gozdnih požarov ter spremljanje obnove vegetacije.",
+        "best_for_en": "Wildfire extent, burn severity mapping, and post-fire regrowth.",
+        "colormap": "BrBG",
+        "cmap": "BrBG",
+        "vmin": -0.5,
+        "vmax": 0.8,
+        "diff_cmap": "BrBG",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
+    },
+    "BAI": {
+        "code": "BAI",
+        "name_sl": "Indeks požganih površin",
+        "name_en": "Burned Area Index",
+        "category": "Požari in toplota",
+        "bands": ("B04", "B08"),
+        "formula": "1 / ((0.1 − Red)² + (0.06 − NIR)²)",
+        "short_desc_sl": "Močno poudari sveža požarišča in zoglenela tla takoj po gozdnem požaru.",
+        "short_desc_en": "Strongly highlights freshly burned scars and charcoal immediately after wildfire.",
+        "interpretation_sl": "< 25: nepožgano · 25–60: delno ožgano · > 60: sveže požarišče / oglje",
+        "interpretation_en": "< 25: unburned · 25–60: partially scorched · > 60: fresh burn scar / charcoal",
+        "best_for_sl": "Hitro izločanje svežih požarišč z vidnim in NIR pasom.",
+        "best_for_en": "Rapid detection of fresh wildfire scars using Red and NIR bands.",
+        "colormap": "inferno",
+        "cmap": "inferno",
+        "vmin": 0.0,
+        "vmax": 120.0,
+        "diff_cmap": "RdBu_r",
+        "supported_sensors": ("sentinel-2-l2a", "landsat-c2-l2"),
     },
     "LST": {
+        "code": "LST",
+        "name_sl": "Temperatura površja tal [°C] (Landsat)",
+        "name_en": "Land Surface Temperature [°C] (Landsat)",
+        "category": "Požari in toplota",
         "bands": ("LST",),
         "formula": "DN × 0.00341802 + 149.0 − 273.15 [°C]",
+        "short_desc_sl": "Fizična temperatura površja tal v °C iz termalnega kanala Landsat ST_B10.",
+        "short_desc_en": "Physical land surface temperature in °C from the Landsat ST_B10 thermal band.",
+        "interpretation_sl": "< 15 °C: voda/gore · 20–30 °C: parki in gozdovi · > 35 °C: mestni toplotni otoki",
+        "interpretation_en": "< 15 °C: water/alpine · 20–30 °C: parks & forests · > 35 °C: urban heat islands",
+        "best_for_sl": "Mestni toplotni otoki (UHI), vročinski valovi in hladilni učinek parkov (Landsat).",
+        "best_for_en": "Urban heat islands (UHI), heatwaves, and urban vegetation cooling (Landsat).",
+        "colormap": "inferno",
         "cmap": "inferno",
         "vmin": -5.0,
         "vmax": 45.0,
         "diff_cmap": "RdBu_r",
         "units": "°C",
         "landsat_only": True,
+        "supported_sensors": ("landsat-c2-l2",),
     },
 }
+
+# Backward-compatible alias used across all modules
+SPECTRAL_INDICES: dict[str, dict[str, Any]] = SPECTRAL_INDICES_META
 
 SAR_METRICS: dict[str, dict[str, Any]] = {
     "VV": {
@@ -442,36 +661,71 @@ def compute_index(ds: xr.Dataset, index_name: str) -> xr.DataArray:
         lst_da = lst_da.rio.write_nodata(np.nan, inplace=False)
         return lst_da
 
-    b1, b2 = spec["bands"]
-    if b1 not in ds.data_vars or b2 not in ds.data_vars:
+    req_bands = tuple(spec["bands"])
+    missing = [b for b in req_bands if b not in ds.data_vars]
+    if missing:
         raise KeyError(
-            f"Dataset is missing required bands ({b1}, {b2}) for index {key}. "
+            f"Dataset is missing required bands {missing} for index {key}. "
             f"Available bands: {list(ds.data_vars)}."
         )
 
-    da1 = ds[b1]
-    da2 = ds[b2]
-    arr1 = da1.values.astype(np.float32, copy=False)
-    arr2 = da2.values.astype(np.float32, copy=False)
+    ref_da = ds[req_bands[0]]
+    out = np.full(ref_da.shape, np.nan, dtype=np.float32)
 
-    num = arr1 - arr2
-    denom = arr1 + arr2
-    valid = np.isfinite(num) & np.isfinite(denom) & (denom != 0.0)
-
-    out = np.full(arr1.shape, np.nan, dtype=np.float32)
-    np.divide(num, denom, out=out, where=valid)
-    np.clip(out, np.float32(-1.0), np.float32(1.0), out=out)
+    if key == "EVI":
+        nir = ds["B08"].values.astype(np.float32, copy=False)
+        red = ds["B04"].values.astype(np.float32, copy=False)
+        blue = ds["B02"].values.astype(np.float32, copy=False)
+        num = np.float32(2.5) * (nir - red)
+        denom = nir + np.float32(6.0) * red - np.float32(7.5) * blue + np.float32(1.0)
+        valid = np.isfinite(num) & np.isfinite(denom) & (np.abs(denom) > np.float32(1e-6))
+        np.divide(num, denom, out=out, where=valid)
+        np.clip(out, np.float32(-1.0), np.float32(1.0), out=out)
+    elif key == "SAVI":
+        nir = ds["B08"].values.astype(np.float32, copy=False)
+        red = ds["B04"].values.astype(np.float32, copy=False)
+        num = np.float32(1.5) * (nir - red)
+        denom = nir + red + np.float32(0.5)
+        valid = np.isfinite(num) & np.isfinite(denom) & (np.abs(denom) > np.float32(1e-6))
+        np.divide(num, denom, out=out, where=valid)
+        np.clip(out, np.float32(-1.0), np.float32(1.0), out=out)
+    elif key == "BSI":
+        swir1 = ds["B11"].values.astype(np.float32, copy=False)
+        red = ds["B04"].values.astype(np.float32, copy=False)
+        nir = ds["B08"].values.astype(np.float32, copy=False)
+        blue = ds["B02"].values.astype(np.float32, copy=False)
+        num = (swir1 + red) - (nir + blue)
+        denom = (swir1 + red) + (nir + blue)
+        valid = np.isfinite(num) & np.isfinite(denom) & (np.abs(denom) > np.float32(1e-6))
+        np.divide(num, denom, out=out, where=valid)
+        np.clip(out, np.float32(-1.0), np.float32(1.0), out=out)
+    elif key == "BAI":
+        red = ds["B04"].values.astype(np.float32, copy=False)
+        nir = ds["B08"].values.astype(np.float32, copy=False)
+        denom = (np.float32(0.1) - red) ** 2 + (np.float32(0.06) - nir) ** 2
+        valid = np.isfinite(denom) & (denom > np.float32(1e-6))
+        np.divide(np.float32(1.0), denom, out=out, where=valid)
+        np.clip(out, np.float32(0.0), np.float32(200.0), out=out)
+    else:
+        b1, b2 = req_bands[0], req_bands[1]
+        arr1 = ds[b1].values.astype(np.float32, copy=False)
+        arr2 = ds[b2].values.astype(np.float32, copy=False)
+        num = arr1 - arr2
+        denom = arr1 + arr2
+        valid = np.isfinite(num) & np.isfinite(denom) & (denom != 0.0)
+        np.divide(num, denom, out=out, where=valid)
+        np.clip(out, np.float32(-1.0), np.float32(1.0), out=out)
 
     index_da = xr.DataArray(
         out,
-        dims=da1.dims,
-        coords=da1.coords,
+        dims=ref_da.dims,
+        coords=ref_da.coords,
         name=key,
         attrs={
             "index_name": key,
             "formula": spec["formula"],
-            "bands": f"{b1}, {b2}",
-            "units": "dimensionless",
+            "bands": ", ".join(req_bands),
+            "units": str(spec.get("units", "dimensionless")),
             "long_name": f"{key}",
             "sensor": ds.attrs.get("sensor", ""),
             "scene_id": ds.attrs.get("scene_id", ""),
@@ -481,11 +735,24 @@ def compute_index(ds: xr.Dataset, index_name: str) -> xr.DataArray:
         },
     )
 
-    crs = ds.rio.crs or da1.rio.crs
+    crs = ds.rio.crs or ref_da.rio.crs
     if crs is not None:
         index_da = index_da.rio.write_crs(crs, inplace=False)
     index_da = index_da.rio.write_nodata(np.nan, inplace=False)
     return index_da
+
+
+compute_spectral_index = compute_index
+
+
+def get_supported_indices_for_sensor(sensor: str) -> list[str]:
+    """Return ordered list of spectral index codes supported by ``sensor``."""
+    s_norm = str(sensor or "sentinel-2-l2a").strip().lower()
+    return [
+        code
+        for code, meta in SPECTRAL_INDICES_META.items()
+        if s_norm in tuple(meta.get("supported_sensors") or ("sentinel-2-l2a", "landsat-c2-l2"))
+    ]
 
 
 def extract_sar_metric(ds: xr.Dataset, metric_name: str) -> xr.DataArray:

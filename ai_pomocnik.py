@@ -220,7 +220,22 @@ VALID_TASKS: tuple[str, ...] = (
     "terrain_dem",
     "gnss_plan",
 )
-VALID_INDICES: tuple[str, ...] = ("NDVI", "NDWI", "MNDWI", "NDBI", "NBR", "NDSI", "LST", "VV")
+VALID_INDICES: tuple[str, ...] = (
+    "NDVI",
+    "EVI",
+    "SAVI",
+    "NDMI",
+    "NDRE",
+    "NDWI",
+    "MNDWI",
+    "NDSI",
+    "NDBI",
+    "BSI",
+    "NBR",
+    "BAI",
+    "LST",
+    "VV",
+)
 VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60)
 
 FUSION_SINGLE: str = "single"
