@@ -947,8 +947,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_mf_fps_norm": "Normalno (1.5 fps)",
         "ai_mf_fps_fast": "Hitro (2.5 fps)",
         "ai_mf_dl_gif": "💾 Prenesi Timelapse (.gif)",
-        "ai_mf_dl_csv": "💾 Prenesi tabelo (.csv)",
+        "ai_mf_dl_csv": "💾 Prenesi časovno vrsto (.csv)",
         "ai_mf_strip_caption": "Vseh {n} čistih vmesnih posnetkov (kronološko, samodejno filtriranje oblakov nad AOI):",
+        "ai_mf_tab_delta": "🗺️ Karta sprememb (Δ) in sloji",
+        "ai_mf_delta_layer_name": "🔥 Karta sprememb Δ {idx} (t2 − t1)",
+        "ai_mf_delta_send_carto": "🗺️ Pošlji karto sprememb v Izdelavo karte (PDF/PNG)",
+        "ai_mf_delta_legend_glacier": "Rdeča = izguba snega/ledu · Bela = brez spremembe · Modra = prirast",
+        "ai_mf_delta_legend_generic": "Rdeča = upad / širjenje pozidave · Bela = brez spremembe · Modra/Zelena = porast",
     },
     "en": {
         # App chrome & header
@@ -1892,8 +1897,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_mf_fps_norm": "Normal (1.5 fps)",
         "ai_mf_fps_fast": "Fast (2.5 fps)",
         "ai_mf_dl_gif": "💾 Download Timelapse (.gif)",
-        "ai_mf_dl_csv": "💾 Download Table (.csv)",
+        "ai_mf_dl_csv": "💾 Download Time Series (.csv)",
         "ai_mf_strip_caption": "All {n} cloud-free intermediate scenes (chronological, automatic AOI cloud fallback):",
+        "ai_mf_tab_delta": "🗺️ Change Map (Δ) & Layers",
+        "ai_mf_delta_layer_name": "🔥 Change Map Δ {idx} (t2 − t1)",
+        "ai_mf_delta_send_carto": "🗺️ Send Change Map to Map Composer (PDF/PNG)",
+        "ai_mf_delta_legend_glacier": "Red = snow/ice loss · White = unchanged · Blue = gain",
+        "ai_mf_delta_legend_generic": "Red = loss / urban expansion · White = unchanged · Blue/Green = gain",
     },
 }
 

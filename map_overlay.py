@@ -363,6 +363,83 @@ def raster_to_map_overlay_png(
     return data_uri, [[float(south), float(west)], [float(north), float(east)]]
 
 
+def render_diverging_change_overlay(
+    diff_da: xr.DataArray,
+    src_epsg: int | str = "EPSG:3794",
+    *,
+    index_name: str = "NDSI",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    neutral_threshold: float | None = None,
+    max_width: int = 1200,
+) -> tuple[str, list[list[float]], float, float, str]:
+    """Render a pixel-aligned Δ (t2 - t1) DataArray as a high-contrast diverging RGBA PNG overlay.
+
+    - ``NDSI`` / ``NDWI`` / ``MNDWI`` -> ``RdBu`` (Red = loss/melt/retreat, Blue = gain)
+    - ``NDVI`` / ``NBR`` -> ``RdYlGn`` (Red = vegetation/burn loss, Green = gain)
+    - ``NDBI`` / ``LST`` -> ``RdBu_r`` (Red = urban expansion/warming, Blue = decrease)
+    - NaN / NoData pixels have ``alpha = 0``; near-zero unchanged pixels smoothly fade to
+      semi-transparent so underlying satellite imagery remains readable.
+
+    Returns ``(data_uri, bounds_4326, eff_vmin, eff_vmax, cmap_name)``.
+    """
+    idx_u = str(index_name or "NDVI").strip().upper()
+    if idx_u in ("NDSI", "NDWI", "MNDWI"):
+        cmap_name = "RdBu"
+    elif idx_u in ("NDBI", "LST"):
+        cmap_name = "RdBu_r"
+    else:
+        cmap_name = "RdYlGn"
+
+    reproj = _prepare_vis_dataarray(
+        diff_da.astype(np.float32, copy=False),
+        src_epsg=src_epsg,
+        resampling=Resampling.bilinear,
+        nodata=np.nan,
+    )
+    west, south, east, north = reproj.rio.bounds()
+    y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
+    vals = np.asarray(reproj.values, dtype=np.float32)
+    finite = np.isfinite(vals)
+
+    if vmin is None or vmax is None:
+        if idx_u == "LST":
+            lim = 8.0
+        elif idx_u in ("VV", "VH"):
+            lim = 6.0
+        else:
+            fin_abs = np.abs(vals[finite])
+            p96 = float(np.percentile(fin_abs, 96.0)) if fin_abs.size > 0 else 0.5
+            lim = float(np.clip(max(p96, 0.25), 0.25, 1.0))
+        eff_vmin = -lim if vmin is None else float(vmin)
+        eff_vmax = lim if vmax is None else float(vmax)
+    else:
+        eff_vmin, eff_vmax = float(vmin), float(vmax)
+
+    denom = max(eff_vmax - eff_vmin, 1e-6)
+    norm = np.clip((np.nan_to_num(vals, nan=0.0) - np.float32(eff_vmin)) / np.float32(denom), 0.0, 1.0)
+    cmap = matplotlib.colormaps[cmap_name]
+    rgba_f = cmap(norm)
+    rgba = np.clip(np.round(rgba_f * 255.0), 0, 255).astype(np.uint8)
+
+    # Smoothly fade near-zero unchanged pixels while keeping strong changes vivid
+    thr = float(
+        neutral_threshold
+        if neutral_threshold is not None
+        else (1.0 if idx_u in ("LST", "VV", "VH") else 0.06)
+    )
+    abs_v = np.abs(np.nan_to_num(vals, nan=0.0))
+    alpha_f = np.where(
+        ~finite,
+        0.0,
+        np.where(abs_v < thr, 0.18 + 0.60 * (abs_v / max(thr, 1e-6)), 0.92),
+    )
+    rgba[..., 3] = np.clip(np.round(alpha_f * 255.0), 0, 255).astype(np.uint8)
+    rgba = _orient_north_up(rgba, y_coords)
+    data_uri = _encode_rgba_to_data_uri(rgba, max_width=max_width, discrete=False)
+    return data_uri, [[float(south), float(west)], [float(north), float(east)]], eff_vmin, eff_vmax, cmap_name
+
+
 def build_horizontal_colorbar_html(
     cmap_name: str,
     vmin: float,

@@ -36,7 +36,7 @@ from analize import (
     get_required_bands_for_sensor,
 )
 from geodezija_crs import clip_to_aoi_polygon, get_parallel_workers
-from map_overlay import raster_to_map_overlay_png
+from map_overlay import raster_to_map_overlay_png, render_diverging_change_overlay
 from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
 
 logger = logging.getLogger(__name__)
@@ -1469,6 +1469,7 @@ def build_multidate_visual_frames(
     sensor: str = SENSOR_S2,
     aoi_polygon_4326: dict[str, Any] | None = None,
     *,
+    extra_indices: Sequence[str] = (),
     max_frames: int = 9,
     all_candidates: Sequence[StacItemOrGroup] | None = None,
     candidates_by_date: dict[str, list[list[pystac.Item]]] | None = None,
@@ -1479,13 +1480,12 @@ def build_multidate_visual_frames(
     default_fps: float = 1.5,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Load an evenly-spaced chronological stack of clear intermediate visual frames (RGB + Index).
+    """Load an evenly-spaced chronological stack of clear intermediate visual frames (RGB + multi-index).
 
-    Designed for RAM-safe operation on both 1 GB Streamlit Cloud (``max_frames=9``) and
-    high-RAM environments (``max_frames=14``): streams each epoch ONCE via
-    ``load_clear_scene_with_fallback``, encodes compact Leaflet base64 overlays + date-stamped
-    PNG frames, immediately frees raw xarrays (``gc.collect()``), and pre-compiles both
-    RGB and Index Timelapse GIFs at ``default_fps``.
+    Streams each epoch ONCE via ``load_clear_scene_with_fallback`` (loading all bands for RGB,
+    ``index_name``, and ``extra_indices`` together), encodes compact Leaflet overlays + date-stamped
+    PNG frames, immediately frees raw xarrays (``gc.collect()``), computes the diverging spatial
+    change map (``Δ = t2 - t1``), and pre-compiles RGB and Index Timelapse GIFs at ``default_fps``.
     """
     n_in = min(len(item_groups), len(date_labels))
     if n_in == 0:
@@ -1496,6 +1496,11 @@ def build_multidate_visual_frames(
             "da_first": None,
             "da_last": None,
             "diff_da": None,
+            "delta_overlay_uri": None,
+            "delta_overlay_bounds": None,
+            "delta_vmin": -0.5,
+            "delta_vmax": 0.5,
+            "delta_cmap": "RdBu",
             "replacements": [],
         }
 
@@ -1513,6 +1518,7 @@ def build_multidate_visual_frames(
 
     is_sar = sensor == SENSOR_S1
     idx_key = str(index_name or ("VV" if is_sar else "NDVI")).strip().upper()
+    clean_extras: list[str] = []
     if is_sar:
         if idx_key not in SAR_METRICS:
             idx_key = "VV"
@@ -1522,8 +1528,19 @@ def build_multidate_visual_frames(
         if idx_key not in SPECTRAL_INDICES:
             idx_key = "NDVI"
         idx_bands = get_required_bands_for_sensor(sensor, idx_key, include_cloud_mask=True)
-        # Merge True Color RGB bands + index bands + cloud mask into ONE single STAC load per epoch
-        req_bands = list(dict.fromkeys(["B04", "B03", "B02", *idx_bands]))
+        extra_band_list: list[str] = []
+        for ex in extra_indices:
+            ex_u = str(ex or "").strip().upper()
+            if not ex_u or ex_u in ("RGB", "SAR", idx_key) or ex_u in clean_extras:
+                continue
+            if ex_u == "SWIR":
+                clean_extras.append("SWIR")
+                extra_band_list.extend(["B12", "B08", "B04"])
+            elif ex_u in SPECTRAL_INDICES:
+                clean_extras.append(ex_u)
+                extra_band_list.extend(get_required_bands_for_sensor(sensor, ex_u, include_cloud_mask=False))
+        # Merge RGB + primary index + complementary indices + cloud mask into ONE STAC load per epoch
+        req_bands = list(dict.fromkeys(["B04", "B03", "B02", *idx_bands, *extra_band_list]))
         idx_spec = SPECTRAL_INDICES[idx_key]
 
     frames: list[dict[str, Any]] = []
@@ -1543,21 +1560,26 @@ def build_multidate_visual_frames(
             cand_pool.extend(candidates_by_date[str(d_lbl)])
         if all_candidates:
             cand_pool.extend(all_candidates)
+        if not cand_pool:
+            cand_pool = [grp]
 
         try:
-            ds_ep, act_date, clear_pct, rep_info = load_clear_scene_with_fallback(
-                primary_item=grp,
-                requested_date=str(d_lbl),
-                candidate_items=cand_pool,
+            ds_ep, fb_info = load_clear_scene_with_fallback(
+                target_date=str(d_lbl),
+                all_candidates=cand_pool,
                 bbox_4326=bbox_4326,
-                bands=req_bands,
                 target_epsg=target_epsg,
-                resolution=float(resolution),
                 sensor=sensor,
-                aoi_polygon_4326=aoi_polygon_4326,
+                resolution=float(resolution),
                 min_clear_pct=float(min_clear_pct),
+                bands=req_bands,
+                primary_group=grp,
+                aoi_polygon_4326=aoi_polygon_4326,
                 auto_fallback=bool(auto_cloud_fallback and not is_sar),
             )
+            act_date = str(fb_info.get("actual_date") or d_lbl)
+            clear_pct = float(fb_info.get("actual_clear_pct", 100.0))
+            rep_info = fb_info if fb_info.get("replaced") else None
         except Exception as exc:
             logger.warning("Skipping visual frame %s: %s", d_lbl, exc)
             continue
@@ -1571,11 +1593,11 @@ def build_multidate_visual_frames(
         if rep_info is not None:
             replacements.append(rep_info)
 
-        plat_raw = str(ds_ep.attrs.get("platform") or "")
+        plat_raw = str(ds_ep.attrs.get("platform") or fb_info.get("platform") or "")
         plat_lbl = _format_platform_stamp(plat_raw, sensor)
         y_coords = np.asarray(ds_ep.coords["y"].values, dtype=np.float64)
 
-        # 1. RGB overlay & date-stamped PNG (for optical sensors)
+        # 1. True Color RGB overlay & date-stamped PNG (always for optical sensors)
         rgb_uri: str | None = None
         rgb_png: bytes | None = None
         bounds_4326: list[list[float]] | None = None
@@ -1600,13 +1622,21 @@ def build_multidate_visual_frames(
             except Exception as exc:
                 logger.warning("RGB frame render skipped for %s: %s", act_date, exc)
 
-        # 2. Spectral Index / SAR overlay, scalar mean & date-stamped PNG
+        # Cloud-masked dataset for clean spectral indices
+        if not is_sar:
+            try:
+                ds_masked, _ = apply_cloud_mask(ds_ep, mask_clouds=True, sensor=sensor)
+            except Exception:
+                ds_masked = ds_ep
+        else:
+            ds_masked = ds_ep
+
+        # 2. Primary Spectral Index / SAR overlay, scalar mean & date-stamped PNG
         idx_uri: str | None = None
         idx_png: bytes | None = None
         idx_mean: float | None = None
         try:
-            ds_for_idx = apply_cloud_mask(ds_ep, sensor=sensor) if not is_sar else ds_ep
-            da_idx = _compute_layer(ds_for_idx, sensor=sensor, metric_name=idx_key)
+            da_idx = _compute_layer(ds_masked, sensor=sensor, metric_name=idx_key)
             vals_arr = np.asarray(da_idx.values, dtype=np.float32)
             fin = vals_arr[np.isfinite(vals_arr)]
             if fin.size > 0:
@@ -1649,6 +1679,71 @@ def build_multidate_visual_frames(
         except Exception as exc:
             logger.warning("Index frame render skipped for %s: %s", act_date, exc)
 
+        # 3. Complementary Spectral Indices / SWIR False Color from the SAME loaded scene!
+        extra_overlays: dict[str, str] = {}
+        extra_pngs: dict[str, bytes] = {}
+        extra_means: dict[str, float | None] = {}
+        for ex_code in clean_extras:
+            try:
+                if ex_code == "SWIR":
+                    if all(b in ds_ep.data_vars for b in ("B12", "B08", "B04")):
+                        sw_uri, sw_bnds = raster_to_map_overlay_png(
+                            ds_ep,
+                            src_epsg=target_epsg,
+                            is_rgb=True,
+                            bands=["B12", "B08", "B04"],
+                            max_width=overlay_max_width,
+                        )
+                        if bounds_4326 is None:
+                            bounds_4326 = sw_bnds
+                        extra_overlays["SWIR"] = sw_uri
+                        sw_u8 = _stretch_rgb_for_pil(ds_ep, ["B12", "B08", "B04"], y_coords)
+                        pil_sw = _resize_pil_frame(
+                            Image.fromarray(sw_u8, mode="RGB"),
+                            max_width=max_thumb_width,
+                            target_size=target_size,
+                        )
+                        extra_pngs["SWIR"] = pil_to_png_bytes(
+                            _stamp_banner_on_pil(pil_sw, f"{act_date} | {plat_lbl} | SWIR")
+                        )
+                        extra_means["SWIR"] = None
+                        del sw_u8, pil_sw
+                elif ex_code in SPECTRAL_INDICES:
+                    da_ex = _compute_layer(ds_masked, sensor=sensor, metric_name=ex_code)
+                    ex_vals = np.asarray(da_ex.values, dtype=np.float32)
+                    ex_fin = ex_vals[np.isfinite(ex_vals)]
+                    ex_mean = round(float(np.mean(ex_fin)), 4) if ex_fin.size > 0 else None
+                    ex_spec = SPECTRAL_INDICES[ex_code]
+                    ex_uri, ex_bnds = raster_to_map_overlay_png(
+                        da_ex,
+                        src_epsg=target_epsg,
+                        is_rgb=False,
+                        cmap_name=str(ex_spec["cmap"]),
+                        vmin=float(ex_spec["vmin"]),
+                        vmax=float(ex_spec["vmax"]),
+                        max_width=overlay_max_width,
+                    )
+                    if bounds_4326 is None:
+                        bounds_4326 = ex_bnds
+                    extra_overlays[ex_code] = ex_uri
+                    extra_means[ex_code] = ex_mean
+                    ex_tag = f" | {ex_code}={ex_mean:.2f}" if ex_mean is not None else f" | {ex_code}"
+                    pil_ex = render_dataarray_to_pil(
+                        da_ex,
+                        cmap_name=str(ex_spec["cmap"]),
+                        vmin=float(ex_spec["vmin"]),
+                        vmax=float(ex_spec["vmax"]),
+                        stamp_text=f"{act_date} | {plat_lbl}{ex_tag}",
+                        max_width=max_thumb_width,
+                        target_size=target_size,
+                    )
+                    extra_pngs[ex_code] = pil_to_png_bytes(pil_ex)
+                    del da_ex, pil_ex
+            except Exception as exc:
+                logger.warning("Complementary layer %s skipped for %s: %s", ex_code, act_date, exc)
+
+        if ds_masked is not ds_ep:
+            del ds_masked
         del ds_ep
         gc.collect()
 
@@ -1665,13 +1760,22 @@ def build_multidate_visual_frames(
                     "bounds_4326": bounds_4326,
                     "rgb_overlay_uri": rgb_uri,
                     "index_overlay_uri": idx_uri,
+                    "extra_overlays": extra_overlays,
+                    "extra_pngs": extra_pngs,
+                    "extra_means": extra_means,
                     "rgb_png_bytes": rgb_png,
                     "index_png_bytes": idx_png,
                 }
             )
 
-    # Pixel-aligned Δ between earliest and latest clear frames
+    # Pixel-aligned Δ between earliest and latest clear frames + diverging spatial change map overlay
     diff_da: xr.DataArray | None = None
+    delta_uri: str | None = None
+    delta_bnds: list[list[float]] | None = None
+    delta_vmin: float = -0.5
+    delta_vmax: float = 0.5
+    delta_cmap: str = "RdBu"
+
     if da_first is not None and da_last is not None and len(frames) >= 2:
         try:
             da_l_aligned = da_last
@@ -1687,8 +1791,14 @@ def build_multidate_visual_frames(
             if da_first.rio.crs is not None:
                 diff_da = diff_da.rio.write_crs(da_first.rio.crs, inplace=False)
             diff_da = diff_da.rio.write_nodata(np.nan, inplace=False)
-        except Exception:
-            diff_da = None
+            delta_uri, delta_bnds, delta_vmin, delta_vmax, delta_cmap = render_diverging_change_overlay(
+                diff_da,
+                src_epsg=target_epsg,
+                index_name=idx_key,
+                max_width=overlay_max_width,
+            )
+        except Exception as exc:
+            logger.warning("Diverging Δ change overlay skipped: %s", exc)
 
     # Pre-compile default RGB and Index Timelapse GIFs at default_fps
     rgb_png_list = [f["rgb_png_bytes"] for f in frames if f.get("rgb_png_bytes")]
@@ -1704,6 +1814,11 @@ def build_multidate_visual_frames(
         "da_first": da_first,
         "da_last": da_last,
         "diff_da": diff_da,
+        "delta_overlay_uri": delta_uri,
+        "delta_overlay_bounds": delta_bnds,
+        "delta_vmin": delta_vmin,
+        "delta_vmax": delta_vmax,
+        "delta_cmap": delta_cmap,
         "replacements": replacements,
     }
 

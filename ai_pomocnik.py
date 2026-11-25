@@ -367,6 +367,37 @@ def choose_adaptive_interval(
         return "Mesečno"
     return "Vsakih 14 dni"
 
+
+def get_relevant_indices(primary_index: str, action: str = "time_series") -> list[str]:
+    """Return ordered visual layers ``[RGB/SAR, primary, complementary...]`` for any EO topic.
+
+    - Glacier / Snow (``NDSI``) -> ``["RGB", "NDSI", "NDWI"]``
+    - Urban / Industrial (``NDBI``) -> ``["RGB", "NDBI", "NDVI"]``
+    - Vegetation / Forest (``NDVI``) -> ``["RGB", "NDVI", "NDWI"]``
+    - Water / Lakes (``NDWI`` / ``MNDWI``) -> ``["RGB", primary, "NDVI"]``
+    - Wildfire (``NBR`` / ``dNBR`` / ``disaster_fire``) -> ``["RGB", "SWIR", "NBR"]``
+    - Surface Temperature (``LST``) -> ``["RGB", "LST", "NDVI"]``
+    - Flood / SAR (``VV`` / ``SAR`` / ``disaster_flood``) -> ``["SAR", "VV"]``
+    """
+    idx_u = str(primary_index or "NDVI").strip().upper()
+    act_l = str(action or "").strip().lower()
+
+    if act_l == "disaster_flood" or idx_u in ("VV", "VH", "SAR"):
+        return ["SAR", "VV"]
+    if act_l == "disaster_fire" or idx_u in ("NBR", "DNBR"):
+        return ["RGB", "SWIR", "NBR"]
+    if idx_u == "NDSI":
+        return ["RGB", "NDSI", "NDWI"]
+    if idx_u == "NDBI":
+        return ["RGB", "NDBI", "NDVI"]
+    if idx_u == "NDVI":
+        return ["RGB", "NDVI", "NDWI"]
+    if idx_u in ("NDWI", "MNDWI"):
+        return ["RGB", idx_u, "NDVI"]
+    if idx_u == "LST":
+        return ["RGB", "LST", "NDVI"]
+    return ["RGB", idx_u, "NDVI" if idx_u != "NDVI" else "NDWI"]
+
 AI_EXAMPLE_PROMPTS: tuple[dict[str, str], ...] = (
     {
         "id": "celje_flood",
@@ -2029,100 +2060,132 @@ def execute_ai_plan(
         tif_bytes: bytes | None = None
         tif_fname: str | None = None
 
+        delta_uri: str | None = None
+        delta_bnds: list[list[float]] | None = None
+        delta_vmin: float = -0.5
+        delta_vmax: float = 0.5
+        delta_cmap: str = "RdBu"
+        layer_m = str(plan["index_name"])
+        relevant_layers = get_relevant_indices(layer_m, task)
+        extra_idx_list = [l for l in relevant_layers if l not in ("RGB", "SAR", layer_m)]
+
         if want_visuals and len(ts_df) >= 2:
-            try:
-                raw_by_date = df.attrs.get("raw_items_by_date") or {}
-                date_to_group: dict[str, Any] = {}
-                for i_row in range(min(len(items), len(df))):
-                    date_to_group[str(df.iloc[i_row]["date_str"])] = items[i_row]
-                if isinstance(raw_by_date, dict):
-                    for dk, dv in raw_by_date.items():
-                        date_to_group.setdefault(str(dk), dv)
+            raw_by_date = df.attrs.get("raw_items_by_date") or {}
+            date_to_group: dict[str, Any] = {}
+            for i_row in range(min(len(items), len(df))):
+                date_to_group[str(df.iloc[i_row]["date_str"])] = items[i_row]
+            if isinstance(raw_by_date, dict):
+                for dk, dv in raw_by_date.items():
+                    date_to_group.setdefault(str(dk), dv)
 
-                ts_dates_sorted = [str(d) for d in ts_df["date_str"].tolist()]
-                matched_groups: list[Any] = []
-                matched_dates: list[str] = []
-                for d_str in ts_dates_sorted:
-                    grp = date_to_group.get(d_str)
-                    if grp is not None:
-                        matched_groups.append(grp)
-                        matched_dates.append(d_str)
-                if len(matched_groups) < 2:
-                    matched_groups = list(items)
-                    matched_dates = [str(df.iloc[i]["date_str"]) for i in range(min(len(items), len(df)))]
+            ts_dates_sorted = [str(d) for d in ts_df["date_str"].tolist()]
+            matched_groups: list[Any] = []
+            matched_dates: list[str] = []
+            for d_str in ts_dates_sorted:
+                grp = date_to_group.get(d_str)
+                if grp is not None:
+                    matched_groups.append(grp)
+                    matched_dates.append(d_str)
+            if len(matched_groups) < 2:
+                matched_groups = list(items)
+                matched_dates = [str(df.iloc[i]["date_str"]) for i in range(min(len(items), len(df)))]
 
-                all_cands = list(raw_by_date.values()) if isinstance(raw_by_date, dict) and raw_by_date else list(items)
-                layer_m = str(plan["index_name"])
-                low_ram = is_low_ram_cloud()
-                max_vis_frames = 9 if low_ram else 14
-                area_est_km2 = ((2.0 * float(plan["radius_m"])) ** 2) / 1e6
-                safe_res, _ = get_safe_processing_resolution(res_m, area_est_km2, sensor=sensor)
-                vis_res_m = float(max(safe_res, 20 if low_ram else res_m, 30 if sensor == SENSOR_LANDSAT else 10))
+            all_cands = list(raw_by_date.values()) if isinstance(raw_by_date, dict) and raw_by_date else list(items)
+            low_ram = is_low_ram_cloud()
+            max_vis_frames = 9 if low_ram else 14
+            area_est_km2 = ((2.0 * float(plan["radius_m"])) ** 2) / 1e6
+            safe_res, _ = get_safe_processing_resolution(res_m, area_est_km2, sensor=sensor)
+            vis_res_m = float(max(safe_res, 20 if low_ram else res_m, 30 if sensor == SENSOR_LANDSAT else 10))
 
-                def _vis_cb(cur: int, total: int, d_str: str) -> None:
-                    _prog(
-                        0.56 + 0.36 * (cur / max(total, 1)),
-                        f"Nalagam vmesni posnetek {d_str} ({cur}/{total})..."
-                        if lang == "sl"
-                        else f"Loading intermediate scene {d_str} ({cur}/{total})...",
-                    )
+            def _vis_cb(cur: int, total: int, d_str: str) -> None:
+                _prog(
+                    0.56 + 0.36 * (cur / max(total, 1)),
+                    f"Nalagam vmesni posnetek {d_str} ({cur}/{total})..."
+                    if lang == "sl"
+                    else f"Loading intermediate scene {d_str} ({cur}/{total})...",
+                )
 
+            mf_out = build_multidate_visual_frames(
+                item_groups=matched_groups,
+                date_labels=matched_dates,
+                bbox_4326=bbox_4326,
+                index_name=layer_m,
+                target_epsg=target_epsg,
+                resolution=vis_res_m,
+                sensor=sensor,
+                extra_indices=extra_idx_list,
+                max_frames=max_vis_frames,
+                all_candidates=all_cands,
+                candidates_by_date=df.attrs.get("candidates_by_bucket"),
+                auto_cloud_fallback=(sensor != SENSOR_S1),
+                min_clear_pct=75.0,
+                max_thumb_width=640 if low_ram else 760,
+                overlay_max_width=1000 if low_ram else 1500,
+                default_fps=1.5,
+                progress_callback=_vis_cb,
+            )
+            frames = list(mf_out.get("frames") or [])
+
+            # HARD GUARANTEE: if strict cloud threshold yielded < 2 frames, retry earliest & latest pair cleanly
+            if len(frames) < 2 and len(matched_groups) >= 2:
                 mf_out = build_multidate_visual_frames(
-                    item_groups=matched_groups,
-                    date_labels=matched_dates,
+                    item_groups=[matched_groups[0], matched_groups[-1]],
+                    date_labels=[matched_dates[0], matched_dates[-1]],
                     bbox_4326=bbox_4326,
                     index_name=layer_m,
                     target_epsg=target_epsg,
                     resolution=vis_res_m,
                     sensor=sensor,
-                    max_frames=max_vis_frames,
+                    extra_indices=extra_idx_list,
+                    max_frames=2,
                     all_candidates=all_cands,
-                    candidates_by_date=df.attrs.get("candidates_by_bucket"),
-                    auto_cloud_fallback=(sensor != SENSOR_S1),
-                    min_clear_pct=75.0,
+                    auto_cloud_fallback=False,
+                    min_clear_pct=10.0,
                     max_thumb_width=640 if low_ram else 760,
-                    overlay_max_width=1100 if low_ram else 1500,
+                    overlay_max_width=1000 if low_ram else 1500,
                     default_fps=1.5,
-                    progress_callback=_vis_cb,
                 )
                 frames = list(mf_out.get("frames") or [])
-                gif_rgb_bytes = mf_out.get("timelapse_rgb_gif_bytes")
-                gif_idx_bytes = mf_out.get("timelapse_index_gif_bytes")
-                diff_da = mf_out.get("diff_da")
-                da_last = mf_out.get("da_last")
-                mf_reps = list(mf_out.get("replacements") or [])
 
-                if len(frames) >= 2:
-                    f0, f_last = frames[0], frames[-1]
-                    if f0.get("rgb_overlay_uri") and f_last.get("rgb_overlay_uri"):
-                        comp_rgb = {
-                            "dates": [f0["date"], f_last["date"]],
-                            "overlay_uris": [f0["rgb_overlay_uri"], f_last["rgb_overlay_uri"]],
-                            "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
-                            "replacements": mf_reps,
-                        }
-                    if f0.get("index_overlay_uri") and f_last.get("index_overlay_uri"):
-                        comp_idx = {
-                            "dates": [f0["date"], f_last["date"]],
-                            "overlay_uris": [f0["index_overlay_uri"], f_last["index_overlay_uri"]],
-                            "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
-                            "replacements": mf_reps,
-                            "diff_da": diff_da,
-                        }
+            gif_rgb_bytes = mf_out.get("timelapse_rgb_gif_bytes")
+            gif_idx_bytes = mf_out.get("timelapse_index_gif_bytes")
+            diff_da = mf_out.get("diff_da")
+            da_last = mf_out.get("da_last")
+            delta_uri = mf_out.get("delta_overlay_uri")
+            delta_bnds = mf_out.get("delta_overlay_bounds")
+            delta_vmin = float(mf_out.get("delta_vmin", -0.5))
+            delta_vmax = float(mf_out.get("delta_vmax", 0.5))
+            delta_cmap = str(mf_out.get("delta_cmap") or "RdBu")
+            mf_reps = list(mf_out.get("replacements") or [])
 
-                if diff_da is not None:
-                    ch_summary = compute_change_summary(
-                        diff_da,
-                        resolution_m=vis_res_m,
-                        threshold=2.0 if sensor == SENSOR_S1 else (2.0 if layer_m == "LST" else 0.15),
-                    )
-                    tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
-                    r_d0 = frames[0]["date"] if frames else ts_dates_sorted[0]
-                    r_d1 = frames[-1]["date"] if frames else ts_dates_sorted[-1]
-                    tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_d0}_to_{r_d1}_EPSG{epsg_num}.tif"
-            except Exception:
-                # Never fail the entire time series if optional visual multi-frame stack encounters an edge error
-                pass
+            if len(frames) >= 2:
+                f0, f_last = frames[0], frames[-1]
+                if f0.get("rgb_overlay_uri") and f_last.get("rgb_overlay_uri"):
+                    comp_rgb = {
+                        "dates": [f0["date"], f_last["date"]],
+                        "overlay_uris": [f0["rgb_overlay_uri"], f_last["rgb_overlay_uri"]],
+                        "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
+                        "replacements": mf_reps,
+                    }
+                if f0.get("index_overlay_uri") and f_last.get("index_overlay_uri"):
+                    comp_idx = {
+                        "dates": [f0["date"], f_last["date"]],
+                        "overlay_uris": [f0["index_overlay_uri"], f_last["index_overlay_uri"]],
+                        "overlay_bounds": [f0["bounds_4326"], f_last["bounds_4326"]],
+                        "replacements": mf_reps,
+                        "diff_da": diff_da,
+                    }
+
+            if diff_da is not None:
+                ch_summary = compute_change_summary(
+                    diff_da,
+                    resolution_m=vis_res_m,
+                    threshold=2.0 if sensor == SENSOR_S1 else (2.0 if layer_m == "LST" else 0.15),
+                )
+                tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
+                r_d0 = frames[0]["date"] if frames else ts_dates_sorted[0]
+                r_d1 = frames[-1]["date"] if frames else ts_dates_sorted[-1]
+                tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_d0}_to_{r_d1}_EPSG{epsg_num}.tif"
 
         result_kind = (
             "time_series_and_comparison"
@@ -2134,6 +2197,8 @@ def execute_ai_plan(
             {
                 "kind": result_kind,
                 "adaptive_interval": adaptive_interval,
+                "relevant_layers": relevant_layers,
+                "extra_indices": extra_idx_list,
                 "ts_df": ts_df,
                 "csv_bytes": csv_bytes,
                 "csv_filename": csv_fname,
@@ -2144,6 +2209,11 @@ def execute_ai_plan(
                 "comparison_index": comp_idx,
                 "comparison_result": comp_idx or comp_rgb,
                 "change_summary": ch_summary,
+                "delta_overlay_uri": delta_uri,
+                "delta_overlay_bounds": delta_bnds,
+                "delta_vmin": delta_vmin,
+                "delta_vmax": delta_vmax,
+                "delta_cmap": delta_cmap,
                 "da_last": da_last,
                 "index_da": diff_da if diff_da is not None else da_last,
                 "tif_bytes": tif_bytes,
@@ -2229,10 +2299,17 @@ def execute_ai_plan(
                 metric_name=plan["index_name"],
                 include_cloud_mask=True,
             )
-            # Also fetch True Color RGB bands (and B08 for NDSI snow filter) in the same single STAC request
+            rel_layers = get_relevant_indices(plan["index_name"], task)
+            comp_codes = [c for c in rel_layers if c not in ("RGB", "SAR", plan["index_name"])]
+            # Fetch True Color RGB + primary + complementary index bands in ONE single STAC request
             extra_b = ["B04", "B03", "B02"]
             if plan["index_name"] == "NDSI":
                 extra_b.append("B08")
+            for cc in comp_codes:
+                if cc == "SWIR":
+                    extra_b.extend(["B12", "B08", "B04"])
+                elif cc in SPECTRAL_INDICES:
+                    extra_b.extend(get_required_bands_for_sensor(sensor, cc, include_cloud_mask=False))
             fetch_bands = list(dict.fromkeys([*req_bands, *extra_b]))
             ds = load_scene(
                 sensor=sensor,
@@ -2257,6 +2334,30 @@ def execute_ai_plan(
                 sat_uri, sat_bnds = None, None
             ds_masked, _ = apply_cloud_mask(ds, sensor=sensor)
             idx_da = compute_index(ds_masked, plan["index_name"])
+            extra_overlay_layers: list[dict[str, Any]] = []
+            for cc in comp_codes:
+                try:
+                    if cc == "SWIR" and all(b in ds.data_vars for b in ("B12", "B08", "B04")):
+                        sw_u, sw_b = raster_to_map_overlay_png(
+                            ds, src_epsg=target_epsg, is_rgb=True, bands=["B12", "B08", "B04"], max_width=1400
+                        )
+                        extra_overlay_layers.append({"code": "SWIR", "name": f"🔥 SWIR ({date_str})", "image": sw_u, "bounds": sw_b})
+                    elif cc in SPECTRAL_INDICES:
+                        c_da = compute_index(ds_masked, cc)
+                        c_sp = SPECTRAL_INDICES[cc]
+                        c_u, c_b = raster_to_map_overlay_png(
+                            c_da,
+                            src_epsg=target_epsg,
+                            is_rgb=False,
+                            cmap_name=str(c_sp["cmap"]),
+                            vmin=float(c_sp["vmin"]),
+                            vmax=float(c_sp["vmax"]),
+                            max_width=1400,
+                        )
+                        extra_overlay_layers.append({"code": cc, "name": f"📊 {cc} ({date_str})", "image": c_u, "bounds": c_b})
+                        del c_da
+                except Exception:
+                    pass
             if plan["index_name"] == "NDSI":
                 try:
                     dem_sn = load_copernicus_dem(bbox_4326=bbox_4326, target_epsg=target_epsg, resolution=30.0)
@@ -2300,6 +2401,7 @@ def execute_ai_plan(
                 "sat_overlay_bounds": sat_bnds,
                 "analysis_overlay_uri": analysis_uri,
                 "analysis_overlay_bounds": analysis_bnds,
+                "extra_overlay_layers": extra_overlay_layers if sensor != SENSOR_S1 else [],
                 "tif_bytes": tif_bytes,
                 "tif_filename": tif_fname,
             }

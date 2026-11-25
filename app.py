@@ -6783,6 +6783,18 @@ def _render_ai_chat_analysis_fragment(
                 "zindex": 18,
             }
         )
+        for ex_i, ex_ov in enumerate(ai_res_show.get("extra_overlay_layers") or []):
+            if isinstance(ex_ov, dict) and ex_ov.get("image") and ex_ov.get("bounds"):
+                overlay_layers.append(
+                    {
+                        "name": str(ex_ov.get("name") or ex_ov.get("code") or f"Layer {ex_i + 1}"),
+                        "image": ex_ov["image"],
+                        "bounds": ex_ov["bounds"],
+                        "opacity": float(ai_op_i) / 100.0,
+                        "show": False,
+                        "zindex": 15 + ex_i,
+                    }
+                )
 
         slippy_ai = build_satellite_slippy_map(
             center_lat=float(ai_res_show["lat"]),
@@ -7251,9 +7263,10 @@ def _render_ai_chat_analysis_fragment(
                 )
 
         if has_multiframe:
-            t_sw, t_tl, t_strip, t_ts = st.tabs(
+            t_sw, t_delta, t_tl, t_strip, t_ts = st.tabs(
                 [
                     t("ai_mf_tab_swipe", lang=lang),
+                    t("ai_mf_tab_delta", lang=lang),
                     t("ai_mf_tab_timelapse", lang=lang),
                     t("ai_mf_tab_strip", lang=lang),
                     t("ai_mf_tab_ts", lang=lang),
@@ -7264,8 +7277,22 @@ def _render_ai_chat_analysis_fragment(
             n_fr = len(frames_list)
             has_rgb_frames = any(bool(f.get("rgb_overlay_uri")) for f in frames_list)
             has_idx_frames = any(bool(f.get("index_overlay_uri")) for f in frames_list)
+            extra_codes_avail: list[str] = []
+            for fr_chk in frames_list:
+                for ek in (fr_chk.get("extra_overlays") or {}).keys():
+                    if ek not in extra_codes_avail:
+                        extra_codes_avail.append(str(ek))
 
-            # --- TAB 1: Compare Any Two Dates (t1 ↔ t2) ---
+            def _layer_pill_label(code: str) -> str:
+                if code == "rgb":
+                    return t("ai_mf_layer_rgb", lang=lang)
+                if code == "index":
+                    ico = "❄️" if idx_lbl_ts == "NDSI" else ("💧" if idx_lbl_ts in ("NDWI", "MNDWI") else "📊")
+                    return f"{ico} {idx_lbl_ts}"
+                ico_e = "💧" if code in ("NDWI", "MNDWI") else ("🔥" if code == "SWIR" else "🌿")
+                return f"{ico_e} {code}"
+
+            # --- TAB 1: Compare Any Two Dates (t1 ↔ t2) with Multi-Index Switcher ---
             with t_sw:
                 dc1, dc2 = st.columns(2, gap="small")
                 with dc1:
@@ -7298,19 +7325,16 @@ def _render_ai_chat_analysis_fragment(
                     avail_sw_modes.append("rgb")
                 if has_idx_frames:
                     avail_sw_modes.append("index")
+                avail_sw_modes.extend(extra_codes_avail)
 
-                mode_lbls = {
-                    "rgb": t("ai_mf_layer_rgb", lang=lang),
-                    "index": t("ai_mf_layer_idx", lang=lang, idx=idx_lbl_ts),
-                }
-                ctrl_c1, ctrl_c2 = st.columns([1.25, 1.0], gap="small")
+                ctrl_c1, ctrl_c2 = st.columns([1.35, 0.95], gap="small")
                 with ctrl_c1:
                     if len(avail_sw_modes) > 1:
                         sw_mode = _touch_selector(
                             t("ai_mf_layer_label", lang=lang),
                             options=avail_sw_modes,
                             default=avail_sw_modes[0],
-                            format_func=lambda m: mode_lbls[m],
+                            format_func=_layer_pill_label,
                             key=f"ai_chat_ts_sw_mode_{result_id}",
                             use_pills=True,
                         )
@@ -7328,12 +7352,20 @@ def _render_ai_chat_analysis_fragment(
 
                 fr_l = frames_list[int(idx_left)]
                 fr_r = frames_list[int(idx_right)]
-                uri_key = "rgb_overlay_uri" if sw_mode == "rgb" else "index_overlay_uri"
-                uri_l = fr_l.get(uri_key) or fr_l.get("index_overlay_uri") or fr_l.get("rgb_overlay_uri")
-                uri_r = fr_r.get(uri_key) or fr_r.get("index_overlay_uri") or fr_r.get("rgb_overlay_uri")
+                if sw_mode == "rgb":
+                    uri_l = fr_l.get("rgb_overlay_uri") or fr_l.get("index_overlay_uri")
+                    uri_r = fr_r.get("rgb_overlay_uri") or fr_r.get("index_overlay_uri")
+                    sw_tag = "RGB"
+                elif sw_mode == "index":
+                    uri_l = fr_l.get("index_overlay_uri") or fr_l.get("rgb_overlay_uri")
+                    uri_r = fr_r.get("index_overlay_uri") or fr_r.get("rgb_overlay_uri")
+                    sw_tag = idx_lbl_ts
+                else:
+                    uri_l = (fr_l.get("extra_overlays") or {}).get(sw_mode) or fr_l.get("index_overlay_uri")
+                    uri_r = (fr_r.get("extra_overlays") or {}).get(sw_mode) or fr_r.get("index_overlay_uri")
+                    sw_tag = str(sw_mode)
                 bnds_l = fr_l.get("bounds_4326")
                 bnds_r = fr_r.get("bounds_4326")
-                sw_tag = "RGB" if sw_mode == "rgb" else idx_lbl_ts
 
                 if uri_l and uri_r and bnds_l and bnds_r:
                     swipe_html = build_zoomable_swipe_map(
@@ -7356,7 +7388,6 @@ def _render_ai_chat_analysis_fragment(
                     components.html(swipe_html, height=540, scrolling=False)
                     st.caption(t("swipe_zoom_hint"))
 
-                # Compact 1-line comparison metric bar + Send t2 to Map Composer
                 try:
                     d_span_days = abs(
                         (date.fromisoformat(fr_r["date"][:10]) - date.fromisoformat(fr_l["date"][:10])).days
@@ -7393,7 +7424,122 @@ def _render_ai_chat_analysis_fragment(
                         st.session_state["pending_workspace"] = "ws_geo"
                         st.rerun(scope="app")
 
-            # --- TAB 2: Visual Timelapse (Animated GIF directly in Chat) ---
+            # --- TAB 2: Spatial Change Map (Δ = t2 - t1) & All Toggleable Layers ---
+            with t_delta:
+                ai_op_delta = st.slider(
+                    t("opacity_layer_label"),
+                    0,
+                    100,
+                    90,
+                    5,
+                    key=f"ai_mf_delta_op_{result_id}",
+                )
+                d_cmap = str(ai_res_show.get("delta_cmap") or ("RdBu" if idx_lbl_ts in ("NDSI", "NDWI", "MNDWI") else "RdYlGn"))
+                d_vmin = float(ai_res_show.get("delta_vmin", -0.5))
+                d_vmax = float(ai_res_show.get("delta_vmax", 0.5))
+                st.markdown(
+                    build_horizontal_colorbar_html(
+                        d_cmap,
+                        d_vmin,
+                        d_vmax,
+                        label=f"Δ {idx_lbl_ts} (t2 − t1)",
+                        units="°C" if idx_lbl_ts == "LST" else "",
+                    ),
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    t("ai_mf_delta_legend_glacier", lang=lang)
+                    if idx_lbl_ts == "NDSI"
+                    else t("ai_mf_delta_legend_generic", lang=lang)
+                )
+
+                f_first, f_latest = frames_list[0], frames_list[-1]
+                delta_layers: list[dict[str, Any]] = []
+                if f_first.get("rgb_overlay_uri") and f_first.get("bounds_4326"):
+                    delta_layers.append(
+                        {
+                            "name": f"🛰️ RGB (t1: {f_first['date']})",
+                            "image": f_first["rgb_overlay_uri"],
+                            "bounds": f_first["bounds_4326"],
+                            "opacity": 1.0,
+                            "show": False,
+                            "zindex": 11,
+                        }
+                    )
+                if f_latest.get("rgb_overlay_uri") and f_latest.get("bounds_4326"):
+                    delta_layers.append(
+                        {
+                            "name": f"🛰️ RGB (t2: {f_latest['date']})",
+                            "image": f_latest["rgb_overlay_uri"],
+                            "bounds": f_latest["bounds_4326"],
+                            "opacity": 1.0,
+                            "show": True,
+                            "zindex": 12,
+                        }
+                    )
+                if f_latest.get("index_overlay_uri") and f_latest.get("bounds_4326"):
+                    delta_layers.append(
+                        {
+                            "name": f"📊 {idx_lbl_ts} (t2: {f_latest['date']})",
+                            "image": f_latest["index_overlay_uri"],
+                            "bounds": f_latest["bounds_4326"],
+                            "opacity": float(ai_op_delta) / 100.0,
+                            "show": False,
+                            "zindex": 14,
+                        }
+                    )
+                for ex_i, ex_c in enumerate(extra_codes_avail):
+                    ex_u = (f_latest.get("extra_overlays") or {}).get(ex_c)
+                    if ex_u and f_latest.get("bounds_4326"):
+                        delta_layers.append(
+                            {
+                                "name": f"{_layer_pill_label(ex_c)} (t2: {f_latest['date']})",
+                                "image": ex_u,
+                                "bounds": f_latest["bounds_4326"],
+                                "opacity": float(ai_op_delta) / 100.0,
+                                "show": False,
+                                "zindex": 15 + ex_i,
+                            }
+                        )
+                if ai_res_show.get("delta_overlay_uri") and ai_res_show.get("delta_overlay_bounds"):
+                    delta_layers.append(
+                        {
+                            "name": t("ai_mf_delta_layer_name", lang=lang, idx=idx_lbl_ts),
+                            "image": ai_res_show["delta_overlay_uri"],
+                            "bounds": ai_res_show["delta_overlay_bounds"],
+                            "opacity": float(ai_op_delta) / 100.0,
+                            "show": True,
+                            "zindex": 20,
+                        }
+                    )
+
+                if delta_layers:
+                    slippy_delta = build_satellite_slippy_map(
+                        center_lat=float(ai_res_show["lat"]),
+                        center_lon=float(ai_res_show["lon"]),
+                        zoom=None,
+                        basemap_mode=basemap_now,
+                        overlay_layers=delta_layers,
+                        aoi_bbox_4326=ai_res_show.get("bbox_4326"),
+                        aoi_outline_label=t("slippy_aoi_outline"),
+                        lang=lang,
+                    )
+                    components.html(slippy_delta.get_root().render(), height=540, scrolling=False)
+                    st.caption(t("ai_layer_toggle_hint"))
+
+                if st.button(
+                    t("ai_mf_delta_send_carto", lang=lang),
+                    type="primary",
+                    width="stretch",
+                    key=f"ai_mf_delta_send_carto_{result_id}",
+                ):
+                    st.session_state["tab6_ai_result"] = ai_res_show
+                    st.session_state["tab4_pending_source_select"] = "tab6_ai"
+                    st.session_state["tab6_sent_to_carto"] = True
+                    st.session_state["pending_workspace"] = "ws_geo"
+                    st.rerun(scope="app")
+
+            # --- TAB 3: Visual Timelapse (Animated GIF directly in Chat) ---
             with t_tl:
                 rgb_pngs_all = [f["rgb_png_bytes"] for f in frames_list if f.get("rgb_png_bytes")]
                 idx_pngs_all = [f["index_png_bytes"] for f in frames_list if f.get("index_png_bytes")]
@@ -7462,50 +7608,55 @@ def _render_ai_chat_analysis_fragment(
                             key=f"ai_mf_dl_gif_{result_id}_{tl_mode}_{sel_fps}",
                         )
 
-            # --- TAB 3: All Intermediate Scenes (Visual Strip Grid) ---
+            # --- TAB 4: All Intermediate Scenes (Visual Strip Gallery with Multi-Index Pills) ---
             with t_strip:
                 st.caption(t("ai_mf_strip_caption", lang=lang, n=n_fr))
-                strip_modes = []
+                strip_modes: list[str] = []
                 if any(f.get("rgb_png_bytes") for f in frames_list):
                     strip_modes.append("rgb")
                 if any(f.get("index_png_bytes") for f in frames_list):
                     strip_modes.append("index")
+                for ek in extra_codes_avail:
+                    if any((f.get("extra_pngs") or {}).get(ek) for f in frames_list):
+                        strip_modes.append(ek)
                 if len(strip_modes) > 1:
                     st_mode = _touch_selector(
                         t("ai_mf_layer_label", lang=lang),
                         options=strip_modes,
                         default=strip_modes[0],
-                        format_func=lambda m: (
-                            t("ai_mf_layer_rgb", lang=lang)
-                            if m == "rgb"
-                            else t("ai_mf_layer_idx", lang=lang, idx=idx_lbl_ts)
-                        ),
+                        format_func=_layer_pill_label,
                         key=f"ai_mf_strip_mode_{result_id}",
                         use_pills=True,
                     )
                 else:
                     st_mode = strip_modes[0] if strip_modes else "rgb"
 
-                png_field = "rgb_png_bytes" if st_mode == "rgb" else "index_png_bytes"
                 for row_start in range(0, n_fr, 3):
                     row_frames = frames_list[row_start : row_start + 3]
                     g_cols = st.columns(3, gap="small")
                     for gc_i, fr_item in enumerate(row_frames):
                         with g_cols[gc_i]:
-                            raw_img = fr_item.get(png_field) or fr_item.get("rgb_png_bytes") or fr_item.get("index_png_bytes")
+                            if st_mode == "rgb":
+                                raw_img = fr_item.get("rgb_png_bytes") or fr_item.get("index_png_bytes")
+                                mean_val = fr_item.get("index_mean")
+                                mean_lbl = idx_lbl_ts
+                            elif st_mode == "index":
+                                raw_img = fr_item.get("index_png_bytes") or fr_item.get("rgb_png_bytes")
+                                mean_val = fr_item.get("index_mean")
+                                mean_lbl = idx_lbl_ts
+                            else:
+                                raw_img = (fr_item.get("extra_pngs") or {}).get(st_mode) or fr_item.get("rgb_png_bytes")
+                                mean_val = (fr_item.get("extra_means") or {}).get(st_mode)
+                                mean_lbl = str(st_mode)
                             if raw_img:
-                                cap_mean = (
-                                    f" · {idx_lbl_ts}: {fr_item['index_mean']:.3f}"
-                                    if fr_item.get("index_mean") is not None
-                                    else ""
-                                )
+                                cap_mean = f" · {mean_lbl}: {mean_val:.3f}" if mean_val is not None else ""
                                 st.image(
                                     raw_img,
                                     caption=f"{fr_item['date']}{cap_mean}",
                                     width="stretch",
                                 )
 
-            # --- TAB 4: Time Series (Chart, Table & CSV) ---
+            # --- TAB 5: Time Series (Chart, Table & Single CSV Button) ---
             with t_ts:
                 _draw_ts_plotly_and_table()
 
@@ -7557,22 +7708,21 @@ def _render_ai_chat_analysis_fragment(
         else:
             _draw_ts_plotly_and_table()
 
-    # 3. Export & Cartography Handoff Bar
-    if ai_kind_show in ("time_series", "time_series_and_comparison", "gnss_plan"):
-        has_csv = bool(ai_res_show.get("csv_bytes"))
-        has_tif_ts = bool(ai_res_show.get("tif_bytes"))
-        if has_csv and has_tif_ts:
-            ec1, ec2, ec3 = st.columns(3)
-            with ec1:
-                st.download_button(
-                    label=t("ai_btn_dl_csv"),
-                    data=ai_res_show["csv_bytes"],
-                    file_name=ai_res_show["csv_filename"],
-                    mime="text/csv",
-                    width="stretch",
-                    key=f"ai_chat_dl_csv_{result_id}",
-                )
-            with ec2:
+    # 3. Export & Cartography Handoff Bar (CSV is already inside Tab 5 for time_series -> zero duplicate CSV buttons!)
+    if ai_kind_show == "gnss_plan":
+        if ai_res_show.get("csv_bytes"):
+            st.download_button(
+                label=t("ai_btn_dl_csv"),
+                data=ai_res_show["csv_bytes"],
+                file_name=ai_res_show["csv_filename"],
+                mime="text/csv",
+                width="stretch",
+                key=f"ai_chat_dl_csv_{result_id}",
+            )
+    elif ai_kind_show in ("time_series", "time_series_and_comparison"):
+        if ai_res_show.get("tif_bytes"):
+            ac1, ac2 = st.columns(2)
+            with ac1:
                 st.download_button(
                     label=t("ai_btn_dl_tif"),
                     data=ai_res_show["tif_bytes"],
@@ -7581,7 +7731,7 @@ def _render_ai_chat_analysis_fragment(
                     width="stretch",
                     key=f"ai_chat_dl_tif_{result_id}",
                 )
-            with ec3:
+            with ac2:
                 if st.button(
                     t("ai_btn_send_carto"),
                     type="primary",
@@ -7593,15 +7743,6 @@ def _render_ai_chat_analysis_fragment(
                     st.session_state["tab6_sent_to_carto"] = True
                     st.session_state["pending_workspace"] = "ws_geo"
                     st.rerun(scope="app")
-        elif has_csv:
-            st.download_button(
-                label=t("ai_btn_dl_csv"),
-                data=ai_res_show["csv_bytes"],
-                file_name=ai_res_show["csv_filename"],
-                mime="text/csv",
-                width="stretch",
-                key=f"ai_chat_dl_csv_{result_id}",
-            )
     else:
         has_tif = bool(ai_res_show.get("tif_bytes"))
         if has_tif:
