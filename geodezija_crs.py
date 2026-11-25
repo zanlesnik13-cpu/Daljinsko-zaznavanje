@@ -470,6 +470,50 @@ def bbox_from_point_wgs84(
     return bbox_4326, bbox_metric
 
 
+def metric_bbox_from_point(
+    lat: float,
+    lon: float,
+    radius_m: float,
+    target_epsg: int | str | None = None,
+) -> tuple[list[float], str]:
+    """Return an exact axis-aligned upright square ``[min_e, min_n, max_e, max_n]`` in ``target_epsg``."""
+    if target_epsg is None:
+        metric_crs, _ = get_best_metric_crs(float(lat), float(lon), mode="auto")
+    else:
+        metric_crs = f"EPSG:{target_epsg}" if isinstance(target_epsg, int) else str(target_epsg)
+    e, n = transform_coords(float(lon), float(lat), EPSG_WGS84, metric_crs)
+    r_val = float(radius_m)
+    return [e - r_val, n - r_val, e + r_val, n + r_val], metric_crs
+
+
+def inscribed_metric_bbox_from_wgs84(
+    bbox_4326: Sequence[float],
+    target_epsg: int | str,
+) -> list[float]:
+    """Compute the largest upright axis-aligned rectangle in ``target_epsg`` inscribed inside ``bbox_4326``.
+
+    Eliminates ~1–3° meridian-convergence tilt wedges at raster corners when loading
+    a WGS84 bounding box into a metric CRS (``EPSG:3794`` or local UTM).
+    """
+    min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox_4326)
+    crs_str = f"EPSG:{target_epsg}" if isinstance(target_epsg, int) else str(target_epsg)
+    e_sw, n_sw = transform_coords(min_lon, min_lat, EPSG_WGS84, crs_str)
+    e_se, n_se = transform_coords(max_lon, min_lat, EPSG_WGS84, crs_str)
+    e_nw, n_nw = transform_coords(min_lon, max_lat, EPSG_WGS84, crs_str)
+    e_ne, n_ne = transform_coords(max_lon, max_lat, EPSG_WGS84, crs_str)
+
+    min_e = max(e_sw, e_nw)
+    max_e = min(e_se, e_ne)
+    min_n = max(n_sw, n_se)
+    max_n = min(n_nw, n_ne)
+    if max_e <= min_e or max_n <= min_n:
+        min_e = min(e_sw, e_nw, e_se, e_ne)
+        max_e = max(e_sw, e_nw, e_se, e_ne)
+        min_n = min(n_sw, n_se, n_nw, n_ne)
+        max_n = max(n_sw, n_se, n_nw, n_ne)
+    return [float(min_e), float(min_n), float(max_e), float(max_n)]
+
+
 def _recommended_resolution_for_area(
     area_km2: float,
     sensor: str | None = None,

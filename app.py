@@ -7876,7 +7876,14 @@ def _render_ai_chat_analysis_fragment(
                         gif_cache[cache_k] = gif_bytes_show
 
                     if gif_bytes_show:
-                        st.image(gif_bytes_show, width="stretch")
+                        gif_b64 = base64.b64encode(gif_bytes_show).decode("ascii")
+                        st.markdown(
+                            f'<img src="data:image/gif;base64,{gif_b64}" alt="Timelapse GIF" '
+                            f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
+                            f'display:block;margin:6px auto 12px auto;border-radius:10px;'
+                            f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
+                            unsafe_allow_html=True,
+                        )
                         gif_tag = "RGB" if tl_mode == "rgb" else idx_lbl_ts
                         gif_fname = f"Timelapse_{gif_tag}_{pl['place_name']}_{frame_dates[0]}_to_{frame_dates[-1]}.gif"
                         st.download_button(
@@ -11271,9 +11278,14 @@ def main() -> None:
                             )
                             tl_data["duration_ms"] = desired_ms
 
-                        col_gif_l, col_gif_c, col_gif_r = st.columns([0.12, 0.76, 0.12])
-                        with col_gif_c:
-                            st.image(tl_data["gif_bytes"], width="stretch")
+                        tl_gif_b64 = base64.b64encode(tl_data["gif_bytes"]).decode("ascii")
+                        st.markdown(
+                            f'<img src="data:image/gif;base64,{tl_gif_b64}" alt="Timelapse GIF" '
+                            f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
+                            f'display:block;margin:6px auto 12px auto;border-radius:10px;'
+                            f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
+                            unsafe_allow_html=True,
+                        )
 
                         tl_fname = (
                             f"{tl_data['prefix']}_timelapse_{tl_data['layer_mode']}_"

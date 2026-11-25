@@ -147,9 +147,18 @@ def _stretch_channel_01(
     use_percentile_stretch: bool = True,
     fixed_range: tuple[float, float] = (0.0, 0.35),
     gamma: float = 1.0,
+    optical_reflectance: bool = False,
 ) -> np.ndarray:
     """Normalize a float32 channel into [0, 1] using 2–98% stretch or fixed bounds + gamma."""
-    finite_vals = arr[np.isfinite(arr)]
+    if optical_reflectance:
+        arr_clean = np.where(np.isfinite(arr), np.clip(arr, np.float32(0.0), np.float32(1.0)), np.nan)
+        finite_vals = arr_clean[np.isfinite(arr_clean) & (arr_clean > 0.0) & (arr_clean <= 1.0)]
+    else:
+        arr_clean = arr
+        finite_vals = arr_clean[np.isfinite(arr_clean)]
+
+    if finite_vals.size == 0:
+        finite_vals = arr_clean[np.isfinite(arr_clean)]
     if finite_vals.size == 0:
         return np.zeros_like(arr, dtype=np.float32)
 
@@ -161,7 +170,7 @@ def _stretch_channel_01(
         p_low, p_high = fixed_range
 
     denom = max(float(p_high - p_low), 1e-6)
-    stretched = np.clip((arr - np.float32(p_low)) / np.float32(denom), 0.0, 1.0)
+    stretched = np.clip((arr_clean - np.float32(p_low)) / np.float32(denom), 0.0, 1.0)
     if gamma != 1.0 and gamma > 0.0:
         stretched = np.power(np.clip(stretched, 0.0, 1.0), np.float32(1.0 / gamma))
     return stretched.astype(np.float32, copy=False)
@@ -317,6 +326,7 @@ def raster_to_map_overlay_png(
                 use_percentile_stretch=use_percentile_stretch,
                 fixed_range=f_range,
                 gamma=gamma,
+                optical_reflectance=(not is_sar_fc),
             )
             rgba[..., idx] = np.where(
                 valid_mask,
@@ -576,7 +586,7 @@ def build_satellite_slippy_map(
         tiles=None,
         control_scale=True,
         max_zoom=19,
-        scroll_wheel_zoom=False,
+        scroll_wheel_zoom=True,
         height=f"{int(height)}px",
     )
 
@@ -1017,7 +1027,7 @@ def build_zoomable_swipe_map(
         center: initCenter,
         zoom: 12,
         zoomControl: true,
-        scrollWheelZoom: false,
+        scrollWheelZoom: true,
         preferCanvas: true,
         maxZoom: 19
       }});

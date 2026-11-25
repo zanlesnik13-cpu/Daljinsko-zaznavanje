@@ -41,7 +41,26 @@ from shapely.geometry import box as shapely_box
 from shapely.geometry import shape as shapely_shape
 from shapely.ops import unary_union as shapely_unary_union
 
-from geodezija_crs import clip_to_aoi_polygon
+from geodezija_crs import clip_to_aoi_polygon, inscribed_metric_bbox_from_wgs84
+
+
+def _clip_dataset_to_upright_metric_box(
+    ds: xr.Dataset,
+    bbox_4326: Sequence[float],
+    crs_str: str,
+) -> xr.Dataset:
+    """Clip a metric-CRS Dataset to the largest upright axis-aligned rectangle inside ``bbox_4326``.
+
+    Eliminates ~1–3° meridian-convergence triangular NoData corners in Cartography and Slippy Maps.
+    """
+    try:
+        min_e, min_n, max_e, max_n = inscribed_metric_bbox_from_wgs84(bbox_4326, crs_str)
+        clipped = ds.rio.clip_box(minx=min_e, miny=min_n, maxx=max_e, maxy=max_n)
+        if clipped.sizes.get("x", 0) >= 4 and clipped.sizes.get("y", 0) >= 4:
+            return clipped.rio.write_crs(crs_str, inplace=False)
+    except Exception:
+        pass
+    return ds
 
 logger = logging.getLogger(__name__)
 
@@ -1242,6 +1261,8 @@ def load_sentinel2_scene(
 
     if aoi_polygon_4326 is not None:
         ds = clip_to_aoi_polygon(ds, aoi_polygon_4326, drop=False)
+    else:
+        ds = _clip_dataset_to_upright_metric_box(ds, bbox_4326, crs_str)
 
     del raw_ds, calibrated_vars
     gc.collect()
@@ -1302,12 +1323,13 @@ def calibrate_landsat_optical_dn(
 ) -> np.ndarray:
     """Calibrate raw Landsat C2 L2 optical DN values to clean surface reflectance in ``[0.0, 1.0]``.
 
-    Masks raw fill (``DN == 0``), radiometrically saturated/corrupt pixels (``DN >= 65455``),
+    Masks raw fill (``DN == 0``), invalid/overflow uint16 fill (``DN >= 65535``),
     and ``qa_pixel`` bit 0 (Fill) to ``np.nan`` BEFORE applying ``DN * 0.0000275 - 0.2``,
-    eliminating bright red/green/blue sensor noise speckles on 1980s Landsat 4/5 scenes.
+    then strictly clips valid reflectance to ``[0.0, 1.0]`` so bright glacier snow renders
+    as clean white instead of purple/yellow saturation stripes on 1980s Landsat 4/5 TM scenes.
     """
     arr = np.asarray(raw_vals)
-    valid_mask = np.isfinite(arr) & (arr > 0) & (arr < 65455)
+    valid_mask = np.isfinite(arr) & (arr > 0) & (arr < 65535)
     if qa_vals is not None:
         qa_u16 = np.asarray(qa_vals, dtype=np.uint16)
         valid_mask &= (qa_u16 & np.uint16(1)) == 0
@@ -1514,6 +1536,8 @@ def load_landsat_scene(
 
     if aoi_polygon_4326 is not None:
         ds = clip_to_aoi_polygon(ds, aoi_polygon_4326, drop=False)
+    else:
+        ds = _clip_dataset_to_upright_metric_box(ds, bbox_4326, crs_str)
 
     del raw_ds, calibrated_vars
     gc.collect()
@@ -1661,6 +1685,8 @@ def load_sentinel1_scene(
 
     if aoi_polygon_4326 is not None:
         ds = clip_to_aoi_polygon(ds, aoi_polygon_4326, drop=False)
+    else:
+        ds = _clip_dataset_to_upright_metric_box(ds, bbox_4326, crs_str)
 
     del raw_ds, calibrated_vars
     gc.collect()

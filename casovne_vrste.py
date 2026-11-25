@@ -23,7 +23,7 @@ import pandas as pd
 import pystac
 import rioxarray  # noqa: F401 - registers .rio accessor on xarray objects
 import xarray as xr
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from rasterio.enums import Resampling
 
 from analize import (
@@ -727,39 +727,46 @@ def _resize_pil_frame(
     return img
 
 
-def _stamp_banner_on_pil(img: Image.Image, stamp_text: str) -> Image.Image:
-    """Draw a dark-slate (#0F172A) date & sensor stamp banner in the top-left corner."""
-    if not stamp_text:
-        return img
+TIMELAPSE_CANVAS_W: int = 640
+TIMELAPSE_CANVAS_H: int = 520
+TIMELAPSE_BANNER_H: int = 44
 
-    rgba = img.convert("RGBA")
-    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    font = _load_stamp_font(size=max(13, min(18, rgba.width // 34)))
 
-    bbox = draw.textbbox((0, 0), stamp_text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    pad_x, pad_y = 10, 6
-    margin = 10
+def _stamp_banner_on_pil(
+    img: Image.Image,
+    stamp_text: str,
+    *,
+    canvas_w: int = TIMELAPSE_CANVAS_W,
+    canvas_h: int = TIMELAPSE_CANVAS_H,
+    banner_h: int = TIMELAPSE_BANNER_H,
+) -> Image.Image:
+    """Place the full-extent scene proportionally on a fixed 640×520 canvas with a 44 px top header bar.
 
-    rect = [
-        margin,
-        margin,
-        min(rgba.width - margin, margin + text_w + 2 * pad_x),
-        min(rgba.height - margin, margin + text_h + 2 * pad_y),
-    ]
-    # Dark slate #0F172A background with crisp cartographic teal left accent #0F766E
-    draw.rectangle(rect, fill=(15, 23, 42, 224))
-    draw.rectangle([rect[0], rect[1], rect[0] + 4, rect[3]], fill=(15, 118, 110, 255))
-    draw.text(
-        (rect[0] + pad_x + 2, rect[1] + pad_y - bbox[1]),
-        stamp_text,
-        fill=(248, 250, 252, 255),
-        font=font,
-    )
-    combined = Image.alpha_composite(rgba, overlay).convert("RGB")
-    return combined
+    Never crops or stretches mixed-resolution (e.g. Landsat 30 m + Sentinel-2 10 m) frames, and keeps
+    the date/platform banner 100% visible above the satellite image.
+    """
+    body_h = max(64, int(canvas_h) - int(banner_h))
+    canvas = Image.new("RGB", (int(canvas_w), int(canvas_h)), (226, 232, 240))
+
+    # Proportionally fit the ENTIRE scene into (canvas_w, body_h) without cropping
+    fitted = ImageOps.contain(img.convert("RGB"), (int(canvas_w), body_h), method=Image.Resampling.LANCZOS)
+    off_x = (int(canvas_w) - fitted.width) // 2
+    off_y = int(banner_h) + (body_h - fitted.height) // 2
+    canvas.paste(fitted, (off_x, off_y))
+
+    # Crisp 44 px dark slate (#0F172A) top header bar with cartographic teal accent
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, 0, int(canvas_w), int(banner_h)], fill=(15, 23, 42))
+    draw.rectangle([0, int(banner_h) - 3, int(canvas_w), int(banner_h)], fill=(15, 118, 110))
+
+    if stamp_text:
+        font = _load_stamp_font(size=16)
+        bbox = draw.textbbox((0, 0), stamp_text, font=font)
+        text_h = bbox[3] - bbox[1]
+        ty = max(4, (int(banner_h) - 3 - text_h) // 2 - bbox[1])
+        draw.text((14, ty), stamp_text, fill=(248, 250, 252), font=font)
+
+    return canvas
 
 
 def _stretch_rgb_for_pil(
@@ -767,7 +774,7 @@ def _stretch_rgb_for_pil(
     bands: Sequence[str],
     y_coords: np.ndarray,
 ) -> np.ndarray:
-    """Compose a north-up uint8 (H, W, 3) array using 2–98% reflectance stretch."""
+    """Compose a north-up uint8 (H, W, 3) array using clean 2–98% stretch on finite reflectance in (0, 1]."""
     channels: list[np.ndarray] = []
     valid = np.ones(ds[bands[0]].shape, dtype=bool)
     for b in bands:
@@ -778,7 +785,10 @@ def _stretch_rgb_for_pil(
     bg_rgb = (226, 232, 240)  # Neutral cartographic slate #E2E8F0
     out_ch: list[np.ndarray] = []
     for idx, arr in enumerate(channels):
-        fin = arr[np.isfinite(arr)]
+        arr_c = np.where(np.isfinite(arr), np.clip(arr, np.float32(0.0), np.float32(1.0)), np.nan)
+        fin = arr_c[np.isfinite(arr_c) & (arr_c > 0.0) & (arr_c <= 1.0)]
+        if fin.size == 0:
+            fin = arr_c[np.isfinite(arr_c)]
         if fin.size == 0:
             stretched = np.zeros_like(arr, dtype=np.float32)
         else:
@@ -786,7 +796,7 @@ def _stretch_rgb_for_pil(
             if hi <= lo:
                 lo, hi = float(fin.min()), float(fin.max())
             denom = max(float(hi - lo), 1e-6)
-            stretched = np.clip((arr - np.float32(lo)) / np.float32(denom), 0.0, 1.0)
+            stretched = np.clip((arr_c - np.float32(lo)) / np.float32(denom), 0.0, 1.0)
         u8 = np.where(valid, np.clip(np.round(stretched * 255.0), 0, 255), bg_rgb[idx]).astype(
             np.uint8
         )
@@ -821,9 +831,10 @@ def render_dataarray_to_pil(
     rgb_u8[~finite] = np.array([226, 232, 240], dtype=np.uint8)
 
     img = Image.fromarray(rgb_u8, mode="RGB")
-    img = _resize_pil_frame(img, max_width=max_width, target_size=target_size)
     if stamp_text:
         img = _stamp_banner_on_pil(img, stamp_text)
+    else:
+        img = _resize_pil_frame(img, max_width=max_width, target_size=target_size)
     return img
 
 
@@ -837,21 +848,35 @@ def pil_to_png_bytes(img: Image.Image) -> bytes:
 def compile_timelapse_gif(
     frames_png_bytes: Sequence[bytes],
     duration_ms: int = 800,
+    max_canvas: tuple[int, int] = (TIMELAPSE_CANVAS_W, TIMELAPSE_CANVAS_H),
 ) -> bytes:
-    """Compile a sequence of PNG frame byte buffers into a looping animated GIF."""
+    """Compile a sequence of PNG frame byte buffers into a uniform, uncropped looping animated GIF."""
     if not frames_png_bytes:
         raise ValueError("Cannot compile timelapse GIF from an empty frame list.")
 
-    pil_frames: list[Image.Image] = []
-    base_size: tuple[int, int] | None = None
+    raw_imgs: list[Image.Image] = []
+    max_w, max_h = int(max_canvas[0]), int(max_canvas[1])
     for raw in frames_png_bytes:
         with Image.open(io.BytesIO(raw)) as im:
-            frame_rgb = im.convert("RGB")
-            if base_size is None:
-                base_size = frame_rgb.size
-            elif frame_rgb.size != base_size:
-                frame_rgb = frame_rgb.resize(base_size, resample=Image.Resampling.BILINEAR)
-            pil_frames.append(frame_rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
+            raw_imgs.append(im.convert("RGB"))
+
+    # Choose uniform target size <= max_canvas preserving full extent without cropping
+    first_w, first_h = raw_imgs[0].size
+    if first_w <= max_w and first_h <= max_h and all(im.size == (first_w, first_h) for im in raw_imgs):
+        target_sz = (first_w, first_h)
+    else:
+        target_sz = (max_w, max_h)
+
+    pil_frames: list[Image.Image] = []
+    for frame_rgb in raw_imgs:
+        if frame_rgb.size != target_sz:
+            frame_rgb = ImageOps.pad(
+                frame_rgb,
+                target_sz,
+                method=Image.Resampling.LANCZOS,
+                color=(226, 232, 240),
+            )
+        pil_frames.append(frame_rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=256))
 
     buf = io.BytesIO()
     pil_frames[0].save(
@@ -864,7 +889,7 @@ def compile_timelapse_gif(
         optimize=True,
     )
     gif_bytes = buf.getvalue()
-    del pil_frames
+    del raw_imgs, pil_frames
     gc.collect()
     return gif_bytes
 
