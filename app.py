@@ -836,6 +836,18 @@ def _fmt_index_pill(code: str, lang: str) -> str:
     return code
 
 INTERVAL_KEYS: list[str] = list(TEMPORAL_INTERVAL_KEYS)
+SEASON_KEYS: list[str] = list(YEARLY_SEASON_KEYS)
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Convert any optional numeric/string value to float safely without raising on None."""
+    if val is None:
+        return float(default)
+    try:
+        out = float(val)
+        return out if np.isfinite(out) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
 INTERVAL_I18N: dict[str, str] = {
     INTERVAL_ALL: "interval_all",
     INTERVAL_14D: "interval_14d",
@@ -8305,7 +8317,7 @@ def _apply_project_payload_to_session(payload: dict[str, Any]) -> None:
             st.session_state["tab3_l7_slc_exclude"] = v_l7
 
         if "min_swath_coverage" in settings:
-            v_ex = float(settings.get("min_swath_coverage") or 0) >= 50.0
+            v_ex = _safe_float(settings.get("min_swath_coverage"), 0.0) >= 50.0
             st.session_state["exclude_partial_swaths"] = v_ex
             st.session_state["sidebar_exclude_partial"] = v_ex
             st.session_state["tab3_exclude_partial"] = v_ex
@@ -8498,6 +8510,16 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                                 st.rerun()
                             else:
                                 st.error(t(msg_key, lang=lang))
+
+        gh_last_err = str(st.session_state.get("_gh_last_error") or "").strip()
+        if gh_last_err:
+            st.warning(
+                (
+                    f"⚠️ Shranjeno samo lokalno — GitHub sinhronizacija ni uspela: {gh_last_err}"
+                    if lang == "sl"
+                    else f"⚠️ Saved locally only — GitHub sync failed: {gh_last_err}"
+                )
+            )
 
         # Compact Gemini API & Model settings (accessible to both Guests and Logged-in users)
         _render_sidebar_gemini_settings(lang)
@@ -9372,7 +9394,7 @@ def main() -> None:
                     if 0 <= selected_idx < len(summary_df) and "coverage_pct" in summary_df.columns:
                         _sel_cov_val = summary_df.iloc[selected_idx]["coverage_pct"]
                         if pd.notna(_sel_cov_val) and float(_sel_cov_val) < 95.0:
-                            st.info(t("swath_partial_notice", cov=float(_sel_cov_val)))
+                            st.info(t("swath_partial_notice", cov=_safe_float(_sel_cov_val, 0.0)))
 
                     load_clicked = st.button(
                         t("btn_load_scene"),
@@ -9385,6 +9407,7 @@ def main() -> None:
                     chosen_item = items[selected_idx]
                     chosen_row = summary_df.iloc[selected_idx]
                     req_bands: list[str] = list(vis_spec["bands"])
+                    safe_res_ws1 = _safe_float(selected_resolution, 30.0 if active_sensor == SENSOR_LANDSAT else 10.0)
 
                     with st.spinner(
                         t(
@@ -9392,7 +9415,7 @@ def main() -> None:
                             bands=", ".join(req_bands),
                             date=chosen_row["date_str"],
                             crs=target_crs,
-                            res=selected_resolution,
+                            res=int(safe_res_ws1),
                         )
                     ):
                         try:
@@ -9413,7 +9436,7 @@ def main() -> None:
                                     bbox_4326=load_bbox,
                                     bands=req_bands,
                                     target_epsg=target_crs,
-                                    resolution=float(selected_resolution),
+                                    resolution=safe_res_ws1,
                                     aoi_polygon_4326=None,
                                 )
                                 ds_loaded = _clip_raster_to_exact_aoi(
@@ -9426,7 +9449,7 @@ def main() -> None:
                                     bbox_4326=active_bbox,
                                     bands=req_bands,
                                     target_epsg=target_crs,
-                                    resolution=float(selected_resolution),
+                                    resolution=safe_res_ws1,
                                     aoi_polygon_4326=active_polygon,
                                 )
                                 ds_display = ds_loaded
@@ -9453,9 +9476,10 @@ def main() -> None:
                             prefix = active_sensor_cfg["file_prefix"]
                             tif_filename = (
                                 f"{prefix}_{chosen_row['date_str']}_{vis_code}_"
-                                f"EPSG{epsg_num}_{selected_resolution}m.tif"
+                                f"EPSG{epsg_num}_{int(safe_res_ws1)}m.tif"
                             )
 
+                            raw_cc = chosen_row.get("cloud_cover") if hasattr(chosen_row, "get") else chosen_row["cloud_cover"]
                             st.session_state["loaded_scene_ds"] = ds_loaded
                             st.session_state["loaded_scene_display_ds"] = ds_display
                             st.session_state["loaded_scene_meta"] = {
@@ -9464,8 +9488,8 @@ def main() -> None:
                                 "date_str": str(chosen_row["date_str"]),
                                 "cloud_cover": (
                                     None
-                                    if pd.isna(chosen_row["cloud_cover"])
-                                    else float(chosen_row["cloud_cover"])
+                                    if raw_cc is None or pd.isna(raw_cc)
+                                    else _safe_float(raw_cc, 0.0)
                                 ),
                                 "mgrs_tile": _format_tile_label(
                                     str(chosen_row["mgrs_tile"]), sensor=active_sensor
@@ -9473,10 +9497,10 @@ def main() -> None:
                                 "platform": str(chosen_row["platform"]),
                                 "scene_id": str(chosen_row["id"]),
                                 "crs": target_crs,
-                                "resolution_m": int(selected_resolution),
+                                "resolution_m": int(safe_res_ws1),
                                 "bands": var_names,
                                 "vis_code": vis_code,
-                                "area_km2": float(st.session_state["search_area_km2"] or area_km2),
+                                "area_km2": _safe_float(st.session_state.get("search_area_km2"), _safe_float(area_km2, 0.0)),
                                 "expanded_pan": use_pan_buf,
                                 "valid_pct": round(loaded_valid_pct, 1),
                             }

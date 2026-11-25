@@ -275,6 +275,17 @@ def _extract_mgrs_tile(item: pystac.Item) -> str:
     return ""
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Convert any optional STAC/metadata value to float safely without raising on None."""
+    if val is None:
+        return float(default)
+    try:
+        out = float(val)
+        return out if np.isfinite(out) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _parse_processing_baseline(item: pystac.Item) -> float | None:
     """Parse Sentinel-2 processing baseline (e.g. '05.11' -> 5.11) if present."""
     raw = item.properties.get("s2:processing_baseline")
@@ -282,7 +293,7 @@ def _parse_processing_baseline(item: pystac.Item) -> float | None:
         return None
     try:
         return float(str(raw).strip())
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -1723,13 +1734,16 @@ def load_scene(
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
     """Dispatch clipped COG loading and same-day tile mosaicking to the selected sensor loader."""
+    safe_res = _safe_float(resolution, 30.0 if sensor == SENSOR_LANDSAT else 10.0)
+    if safe_res <= 0.0:
+        safe_res = 30.0 if sensor == SENSOR_LANDSAT else 10.0
     if sensor == SENSOR_S2:
         return load_sentinel2_scene(
             item=item,
             bbox_4326=bbox_4326,
             bands=bands,
             target_epsg=target_epsg,
-            resolution=resolution,
+            resolution=safe_res,
             aoi_polygon_4326=aoi_polygon_4326,
         )
     if sensor == SENSOR_LANDSAT:
@@ -1738,7 +1752,7 @@ def load_scene(
             bbox_4326=bbox_4326,
             bands=bands,
             target_epsg=target_epsg,
-            resolution=resolution,
+            resolution=safe_res,
             aoi_polygon_4326=aoi_polygon_4326,
         )
     if sensor == SENSOR_S1:
@@ -1747,7 +1761,7 @@ def load_scene(
             bbox_4326=bbox_4326,
             polarizations=bands,
             target_epsg=target_epsg,
-            resolution=resolution,
+            resolution=safe_res,
             aoi_polygon_4326=aoi_polygon_4326,
         )
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")

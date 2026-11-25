@@ -138,6 +138,34 @@ def _notify_cloud_toast() -> None:
         pass
 
 
+def _set_last_sync_error(err: str | None) -> None:
+    """Record or clear the latest GitHub sync diagnostic message in Streamlit session state."""
+    try:
+        import streamlit as st
+
+        if err:
+            st.session_state["_gh_last_error"] = str(err)
+        else:
+            st.session_state.pop("_gh_last_error", None)
+    except Exception:
+        pass
+
+
+def _fetch_remote_sha(url: str, headers: dict[str, str], branch: str) -> str | None:
+    """Fetch the current blob SHA for a file on GitHub, returning None if absent."""
+    get_resp = requests.get(
+        url,
+        headers=headers,
+        params={"ref": branch},
+        timeout=_TIMEOUT_SEC,
+    )
+    if get_resp.status_code == 200:
+        payload_meta = get_resp.json()
+        if isinstance(payload_meta, dict):
+            return payload_meta.get("sha")
+    return None
+
+
 def github_push_file(
     local_rel_path: str,
     commit_message: str | None = None,
@@ -146,8 +174,8 @@ def github_push_file(
 ) -> bool:
     """Push a local file (relative to repository root) to GitHub via Contents API.
 
-    Returns ``True`` on HTTP 200/201 success, ``False`` if unconfigured, missing,
-    or if a network/API error occurs. Never raises.
+    Automatically retries once on HTTP ``409 Conflict`` (stale SHA) and stores any
+    failure reason in ``st.session_state["_gh_last_error"]`` without raising.
     """
     cfg = get_github_config()
     if not (cfg["token"] and cfg["repo"] and "/" in cfg["repo"]):
@@ -163,46 +191,63 @@ def github_push_file(
 
     try:
         raw_bytes = local_path.read_bytes()
-    except OSError:
+    except OSError as exc:
+        _set_last_sync_error(f"Local read error ({rel_posix}): {exc}")
         return False
 
     url = f"{_API_BASE}/repos/{cfg['repo']}/contents/{rel_posix}"
     headers = _build_headers(cfg["token"])
+    content_b64 = base64.b64encode(raw_bytes).decode("ascii")
+    msg = commit_message or f"chore(sync): update {rel_posix}"
 
-    # Fetch existing blob SHA if the file already exists on the branch
-    existing_sha: str | None = None
-    try:
-        get_resp = requests.get(
-            url,
-            headers=headers,
-            params={"ref": cfg["branch"]},
-            timeout=_TIMEOUT_SEC,
-        )
-        if get_resp.status_code == 200:
-            payload_meta = get_resp.json()
-            if isinstance(payload_meta, dict):
-                existing_sha = payload_meta.get("sha")
-    except Exception:
-        return False
+    last_err = ""
+    for attempt in range(2):
+        try:
+            existing_sha = _fetch_remote_sha(url, headers, cfg["branch"])
+        except Exception as exc:
+            _set_last_sync_error(f"GitHub GET error ({rel_posix}): {exc}")
+            return False
 
-    body: dict[str, Any] = {
-        "message": commit_message or f"chore(sync): update {rel_posix}",
-        "content": base64.b64encode(raw_bytes).decode("ascii"),
-        "branch": cfg["branch"],
-    }
-    if existing_sha:
-        body["sha"] = existing_sha
+        body: dict[str, Any] = {
+            "message": msg,
+            "content": content_b64,
+            "branch": cfg["branch"],
+        }
+        if existing_sha:
+            body["sha"] = existing_sha
 
-    try:
-        put_resp = requests.put(url, headers=headers, json=body, timeout=_TIMEOUT_SEC)
-        if put_resp.status_code in (200, 201):
-            if show_toast:
-                _notify_cloud_toast()
-            return True
-    except Exception:
-        return False
+        try:
+            put_resp = requests.put(url, headers=headers, json=body, timeout=_TIMEOUT_SEC)
+            if put_resp.status_code in (200, 201):
+                _set_last_sync_error(None)
+                if show_toast:
+                    _notify_cloud_toast()
+                return True
+            if put_resp.status_code == 409 and attempt == 0:
+                # Stale SHA conflict -> re-fetch fresh SHA and retry once
+                continue
+            try:
+                err_detail = str(put_resp.json().get("message") or "").strip()
+            except Exception:
+                err_detail = (put_resp.text or "")[:160].strip()
+            last_err = f"HTTP {put_resp.status_code} ({rel_posix}): {err_detail}"
+            break
+        except Exception as exc:
+            last_err = f"Network error ({rel_posix}): {exc}"
+            break
 
+    if last_err:
+        _set_last_sync_error(last_err)
     return False
+
+
+def pull_user_data_from_github(username: str) -> dict[str, bool]:
+    """Pull a user's ``profile.json``, ``projects.json``, ``map_layouts.json``, and ``last_session.json``."""
+    uname = str(username or "").strip().lower()
+    if not uname or not is_github_sync_configured():
+        return {}
+    files = ("profile.json", "projects.json", "map_layouts.json", "last_session.json")
+    return {fn: github_pull_file(f"data/users/{uname}/{fn}") for fn in files}
 
 
 def github_pull_file(remote_rel_path: str) -> bool:

@@ -18,7 +18,12 @@ import re
 import secrets
 from typing import Any
 
-from github_sync import github_push_file
+from github_sync import (
+    github_pull_file,
+    github_push_file,
+    is_github_sync_configured,
+    pull_user_data_from_github,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = _REPO_ROOT / "data"
@@ -179,6 +184,20 @@ def save_user_profile(
     return profile
 
 
+def merge_users_stores(
+    remote_store: dict[str, Any] | None,
+    local_store: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge remote and local ``auth_users.json`` stores without dropping any existing users."""
+    merged_users: dict[str, Any] = {}
+    for src in (local_store, remote_store):
+        if isinstance(src, dict) and isinstance(src.get("users"), dict):
+            for uname, rec in src["users"].items():
+                if isinstance(rec, dict) and uname:
+                    merged_users[str(uname)] = dict(rec)
+    return {"users": merged_users}
+
+
 def register_user(
     username: str,
     password: str,
@@ -187,7 +206,7 @@ def register_user(
     initial_prefs: dict[str, Any] | None = None,
     sync: bool = True,
 ) -> tuple[bool, str, dict[str, Any] | None]:
-    """Register a new optional user account.
+    """Register a new optional user account with pull-and-merge protection against overwriting remote users.
 
     Returns ``(ok, status_key, user_profile_or_none)``.
     """
@@ -199,7 +218,11 @@ def register_user(
     if not isinstance(password, str) or len(password) < 6:
         return False, "auth_err_password_short", None
 
-    store = _load_users_store()
+    local_before = _load_users_store()
+    if sync and is_github_sync_configured():
+        github_pull_file(AUTH_USERS_REL)
+    remote_after = _load_users_store()
+    store = merge_users_stores(remote_after, local_before)
     users = store.setdefault("users", {})
     if uname in users:
         return False, "auth_err_exists", None
@@ -229,6 +252,8 @@ def register_user(
 def authenticate_user(username: str, password: str) -> tuple[bool, str, dict[str, Any] | None]:
     """Authenticate an existing user by username and password.
 
+    Automatically pulls ``data/auth_users.json`` from GitHub if the user is not
+    found locally, and pulls the user's latest profile/projects upon login.
     Returns ``(ok, status_key, user_profile_or_none)``.
     """
     uname = normalize_username(username)
@@ -237,11 +262,23 @@ def authenticate_user(username: str, password: str) -> tuple[bool, str, dict[str
 
     store = _load_users_store()
     record = store.get("users", {}).get(uname)
+    if not isinstance(record, dict) and is_github_sync_configured():
+        # Pull latest auth_users.json from GitHub before concluding the user does not exist
+        local_before = store
+        if github_pull_file(AUTH_USERS_REL):
+            remote_after = _load_users_store()
+            store = merge_users_stores(remote_after, local_before)
+            record = store.get("users", {}).get(uname)
+
     if not isinstance(record, dict):
         return False, "auth_err_invalid_creds", None
 
     if not verify_password(password, str(record.get("password_hash") or "")):
         return False, "auth_err_invalid_creds", None
+
+    # Pull user's latest cloud profile, projects, map layouts, and last session on login
+    if is_github_sync_configured():
+        pull_user_data_from_github(uname)
 
     profile = load_user_profile(uname)
     if record.get("display_name") and not profile.get("display_name"):

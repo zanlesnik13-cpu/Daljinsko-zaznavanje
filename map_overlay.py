@@ -58,6 +58,17 @@ SLIPPY_BASEMAP_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Convert any optional numeric/string value to float safely without raising on None."""
+    if val is None:
+        return float(default)
+    try:
+        out = float(val)
+        return out if math.isfinite(out) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def expand_bbox_for_panning(
     bbox_4326: Sequence[float],
     buffer_factor: float = 0.35,
@@ -72,16 +83,16 @@ def expand_bbox_for_panning(
     if len(bbox_4326) != 4:
         raise ValueError(f"bbox_4326 must contain 4 values, got {len(bbox_4326)}.")
 
-    min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox_4326)
+    min_lon, min_lat, max_lon, max_lat = (_safe_float(v, 0.0) for v in bbox_4326)
     if min_lon >= max_lon or min_lat >= max_lat:
         return [min_lon, min_lat, max_lon, max_lat]
 
-    factor = max(0.0, float(buffer_factor))
+    factor = max(0.0, _safe_float(buffer_factor, 0.0))
     if factor == 0.0:
         return [min_lon, min_lat, max_lon, max_lat]
 
-    runtime_max = float(get_ram_limits()["max_area_km2"])
-    eff_max = min(float(max_area_km2), runtime_max) if max_area_km2 is not None else runtime_max
+    runtime_max = _safe_float(get_ram_limits().get("max_area_km2"), 1200.0)
+    eff_max = min(_safe_float(max_area_km2, runtime_max), runtime_max) if max_area_km2 is not None else runtime_max
 
     cur_area, _, _ = validate_aoi_size([min_lon, min_lat, max_lon, max_lat], max_area_km2=eff_max)
     safe_cap = eff_max * 0.95
@@ -106,8 +117,8 @@ def expand_bbox_for_panning(
             min(180.0, max_lon + width * eff_factor),
             min(85.0, max_lat + height * eff_factor),
         ]
-        cand_area, _, _ = validate_aoi_size(cand, max_area_km2=max_area_km2)
-        if cand_area <= float(max_area_km2):
+        cand_area, _, _ = validate_aoi_size(cand, max_area_km2=eff_max)
+        if cand_area <= eff_max:
             return cand
         eff_factor *= 0.8
 
