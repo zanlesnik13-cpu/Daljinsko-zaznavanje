@@ -426,19 +426,227 @@ def load_last_session(username: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# 3B. MULTI-CONVERSATION AI CHAT THREADS (data/users/<username>/ai_chats.json)
+# ---------------------------------------------------------------------------
+_MAX_CHAT_THREADS = 60
+
+_TITLE_FILLER_PREFIXES: tuple[str, ...] = (
+    "prosim izvedi analizo ",
+    "prosim naredi analizo ",
+    "izvedi analizo ",
+    "naredi analizo ",
+    "prosim analiziraj ",
+    "analiziraj ",
+    "prosim pokaži mi ",
+    "prosim pokazi mi ",
+    "pokaži mi ",
+    "pokazi mi ",
+    "pokaži ",
+    "pokazi ",
+    "izračunaj mi ",
+    "izracunaj mi ",
+    "izračunaj ",
+    "izracunaj ",
+    "please run an analysis of ",
+    "run an analysis of ",
+    "please analyze ",
+    "analyze ",
+    "show me ",
+    "show ",
+    "calculate ",
+)
+
+
+def _ai_chats_path(username: str) -> tuple[Path, str]:
+    uname = normalize_username(username)
+    return get_user_dir(uname) / "ai_chats.json", f"data/users/{uname}/ai_chats.json"
+
+
+def auto_title_from_prompt(prompt: str, max_len: int = 44) -> str:
+    """Derive a crisp, readable ~44-char thread title from the first user prompt."""
+    clean = " ".join(str(prompt or "").strip().split())
+    if not clean:
+        return "Nov pogovor"
+    low = clean.lower()
+    for pref in _TITLE_FILLER_PREFIXES:
+        if low.startswith(pref) and len(clean) > len(pref) + 3:
+            clean = clean[len(pref) :].strip()
+            break
+    clean = clean.strip(" .,;:!?\"'«»")
+    if not clean:
+        return "Nov pogovor"
+    clean = clean[0].upper() + clean[1:]
+    if len(clean) <= max_len:
+        return clean
+    cut = clean[: max_len - 1].rsplit(" ", 1)[0].strip()
+    if len(cut) < 12:
+        cut = clean[: max_len - 1].strip()
+    return cut + "…"
+
+
+def create_chat_thread(first_prompt: str = "", *, title: str | None = None) -> dict[str, Any]:
+    """Create a fresh AI chat thread dictionary."""
+    now_iso = _utc_now_iso()
+    clean_title = str(title).strip()[:60] if (title and str(title).strip()) else auto_title_from_prompt(first_prompt)
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "title": clean_title,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "pinned": False,
+        "messages": [],
+        "last_analysis_context": None,
+        "last_map_layout": None,
+    }
+
+
+def sanitize_chat_thread(thread: dict[str, Any]) -> dict[str, Any]:
+    """Strip all binary/base64 raster/GIF payloads from a thread dict while preserving text & KPIs."""
+    now_iso = _utc_now_iso()
+    tid = str(thread.get("id") or uuid.uuid4().hex[:8]).strip()[:32]
+    msgs = sanitize_chat_messages(thread.get("messages") or [])
+    raw_title = str(thread.get("title") or "").strip()
+    if not raw_title:
+        first_u = next((m["content"] for m in msgs if m.get("role") == "user" and m.get("content")), "")
+        raw_title = auto_title_from_prompt(first_u)
+    ctx_raw = thread.get("last_analysis_context")
+    layout_raw = thread.get("last_map_layout")
+    return {
+        "id": tid,
+        "title": raw_title[:60],
+        "created_at": str(thread.get("created_at") or now_iso),
+        "updated_at": str(thread.get("updated_at") or now_iso),
+        "pinned": bool(thread.get("pinned", False)),
+        "messages": msgs,
+        "last_analysis_context": sanitize_json_payload(ctx_raw) if isinstance(ctx_raw, dict) else None,
+        "last_map_layout": sanitize_json_payload(layout_raw) if isinstance(layout_raw, dict) else None,
+    }
+
+
+def sort_chat_threads(threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort chat threads by ``(pinned DESC, updated_at DESC)``."""
+    return sorted(
+        threads,
+        key=lambda th: (
+            1 if bool(th.get("pinned", False)) else 0,
+            str(th.get("updated_at") or th.get("created_at") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def load_user_chat_threads(username: str) -> list[dict[str, Any]]:
+    """Load all persisted AI chat threads for ``username``, sorted by ``(pinned DESC, updated_at DESC)``."""
+    uname = normalize_username(username)
+    if not uname:
+        return []
+    path, _ = _ai_chats_path(uname)
+    raw = _read_json_file(path, {"threads": []})
+    raw_threads = raw.get("threads", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+    cleaned = [sanitize_chat_thread(th) for th in raw_threads if isinstance(th, dict) and th.get("id")]
+    return sort_chat_threads(cleaned)[:_MAX_CHAT_THREADS]
+
+
+def save_user_chat_threads(
+    username: str,
+    threads: list[dict[str, Any]],
+    *,
+    sync: bool = True,
+    show_toast: bool = False,
+) -> list[dict[str, Any]]:
+    """Persist lightweight sanitized AI chat threads to ``data/users/<username>/ai_chats.json`` and GitHub Cloud."""
+    uname = normalize_username(username)
+    if not uname:
+        raise ValueError("Username must not be empty.")
+    dedup: dict[str, dict[str, Any]] = {}
+    for th in threads or []:
+        if not isinstance(th, dict):
+            continue
+        clean_th = sanitize_chat_thread(th)
+        dedup[clean_th["id"]] = clean_th
+    ordered = sort_chat_threads(list(dedup.values()))[:_MAX_CHAT_THREADS]
+    path, rel_path = _ai_chats_path(uname)
+    _write_json_file(path, {"version": 1, "username": uname, "threads": ordered})
+    if sync:
+        github_push_file(
+            rel_path,
+            commit_message=f"chore(chats): update AI chat history ({len(ordered)} threads) for {uname}",
+            show_toast=show_toast,
+        )
+    return ordered
+
+
+def rename_chat_thread(
+    username: str | None,
+    thread_id: str,
+    new_title: str,
+    *,
+    threads: list[dict[str, Any]] | None = None,
+    sync: bool = True,
+) -> list[dict[str, Any]]:
+    """Rename a chat thread by ``thread_id`` and persist if ``username`` is provided."""
+    clean_title = str(new_title or "").strip()[:60]
+    cur = list(threads) if threads is not None else (load_user_chat_threads(username) if username else [])
+    if not clean_title:
+        return sort_chat_threads(cur)
+    for th in cur:
+        if str(th.get("id")) == str(thread_id):
+            th["title"] = clean_title
+            th["updated_at"] = _utc_now_iso()
+            break
+    if username:
+        return save_user_chat_threads(username, cur, sync=sync, show_toast=False)
+    return sort_chat_threads(cur)
+
+
+def toggle_pin_chat_thread(
+    username: str | None,
+    thread_id: str,
+    *,
+    threads: list[dict[str, Any]] | None = None,
+    sync: bool = True,
+) -> list[dict[str, Any]]:
+    """Toggle ``pinned`` status of a chat thread and persist if ``username`` is provided."""
+    cur = list(threads) if threads is not None else (load_user_chat_threads(username) if username else [])
+    for th in cur:
+        if str(th.get("id")) == str(thread_id):
+            th["pinned"] = not bool(th.get("pinned", False))
+            break
+    if username:
+        return save_user_chat_threads(username, cur, sync=sync, show_toast=False)
+    return sort_chat_threads(cur)
+
+
+def delete_chat_thread(
+    username: str | None,
+    thread_id: str,
+    *,
+    threads: list[dict[str, Any]] | None = None,
+    sync: bool = True,
+) -> list[dict[str, Any]]:
+    """Delete a chat thread by ``thread_id`` and persist if ``username`` is provided."""
+    cur = list(threads) if threads is not None else (load_user_chat_threads(username) if username else [])
+    remaining = [th for th in cur if str(th.get("id")) != str(thread_id)]
+    if username:
+        return save_user_chat_threads(username, remaining, sync=sync, show_toast=False)
+    return sort_chat_threads(remaining)
+
+
+# ---------------------------------------------------------------------------
 # 4. 1-CLICK LOCAL JSON BACKUP & RESTORE BUNDLE
 # ---------------------------------------------------------------------------
 def export_user_bundle_json(username: str) -> bytes:
-    """Export a user's profile, projects, map layouts, and last session as UTF-8 JSON bytes."""
+    """Export a user's profile, projects, map layouts, AI chats, and last session as UTF-8 JSON bytes."""
     uname = normalize_username(username)
     bundle = {
-        "bundle_version": 1,
+        "bundle_version": 2,
         "app": "Daljinsko-zaznavanje",
         "exported_at": _utc_now_iso(),
         "username": uname,
         "profile": load_user_profile(uname),
         "projects": list_user_projects(uname),
         "map_layouts": list_map_layouts(uname),
+        "ai_chats": load_user_chat_threads(uname),
         "last_session": load_last_session(uname),
     }
     return (json.dumps(bundle, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -452,8 +660,8 @@ def import_user_bundle_json(
 ) -> dict[str, int]:
     """Import a previously exported JSON backup bundle for ``username`` and sync to GitHub Cloud.
 
-    Merges projects by ``id`` and map layouts by ``name``, updates profile preferences,
-    and restores ``last_session`` if present.
+    Merges projects by ``id``, map layouts by ``name``, and AI chat threads by ``id``,
+    updates profile preferences, and restores ``last_session`` if present.
     """
     uname = normalize_username(username)
     if not uname:
@@ -466,6 +674,7 @@ def import_user_bundle_json(
 
     imported_projects = 0
     imported_layouts = 0
+    imported_chats = 0
     restored_session = 0
 
     # 1. Profile preferences (keep current username intact)
@@ -536,7 +745,19 @@ def import_user_bundle_json(
                 show_toast=False,
             )
 
-    # 4. Last session
+    # 4. AI chat threads (merge by id)
+    chats_in = bundle.get("ai_chats")
+    if isinstance(chats_in, list) and chats_in:
+        existing_c = {str(th["id"]): th for th in load_user_chat_threads(uname)}
+        for th in chats_in:
+            if not isinstance(th, dict):
+                continue
+            clean_th = sanitize_chat_thread(th)
+            existing_c[clean_th["id"]] = clean_th
+            imported_chats += 1
+        save_user_chat_threads(uname, list(existing_c.values()), sync=sync, show_toast=False)
+
+    # 5. Last session
     ls_in = bundle.get("last_session")
     if isinstance(ls_in, dict) and (ls_in.get("aoi") or ls_in.get("settings") or ls_in.get("ai_chat_messages")):
         save_last_session(uname, ls_in, sync=sync, show_toast=False)
@@ -545,5 +766,6 @@ def import_user_bundle_json(
     return {
         "projects": imported_projects,
         "map_layouts": imported_layouts,
+        "ai_chats": imported_chats,
         "restored_session": restored_session,
     }

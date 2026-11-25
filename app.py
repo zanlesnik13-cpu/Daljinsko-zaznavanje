@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 import folium
@@ -93,6 +93,9 @@ from github_sync import (
     is_github_sync_configured,
 )
 from projekti import (
+    auto_title_from_prompt,
+    create_chat_thread,
+    delete_chat_thread,
     delete_map_layout,
     delete_user_project,
     export_user_bundle_json,
@@ -100,9 +103,14 @@ from projekti import (
     list_map_layouts,
     list_user_projects,
     load_last_session,
+    load_user_chat_threads,
+    rename_chat_thread,
     save_last_session,
     save_map_layout,
+    save_user_chat_threads,
     save_user_project,
+    sort_chat_threads,
+    toggle_pin_chat_thread,
 )
 from ai_pomocnik import (
     AI_EXAMPLE_PROMPTS,
@@ -1138,6 +1146,11 @@ def _init_session_state() -> None:
         "gemini_active_live_model": None,
         "ai_chat_messages": [],
         "ai_chat_results": {},
+        "ai_chat_threads": [],
+        "ai_active_thread_id": None,
+        "_ai_threads_loaded_for": "__uninitialized__",
+        "_ai_thread_runtime_cache": {},
+        "ws5_show_history_panel": True,
         "ai_last_analysis_context": None,
         "ai_pending_chat_prompt": None,
         "ai_pending_rerun_turn": None,
@@ -6569,6 +6582,164 @@ def build_collapsed_turn_label(
     return f'💬 #{num} · "{snippet}"{suffix}'
 
 
+def _ensure_ai_chat_threads_loaded(username: str | None) -> list[dict[str, Any]]:
+    """Ensure ``st.session_state['ai_chat_threads']`` and ``ai_active_thread_id`` are initialized for user/guest."""
+    owner_key = str(username or "__guest__")
+    if st.session_state.get("_ai_threads_loaded_for") != owner_key:
+        if username:
+            loaded = load_user_chat_threads(username)
+        else:
+            loaded = list(st.session_state.get("ai_chat_threads") or [])
+        st.session_state["ai_chat_threads"] = sort_chat_threads(loaded)
+        st.session_state["_ai_threads_loaded_for"] = owner_key
+        st.session_state["ai_active_thread_id"] = None
+
+    threads: list[dict[str, Any]] = list(st.session_state.get("ai_chat_threads") or [])
+    cur_msgs = list(st.session_state.get("ai_chat_messages") or [])
+    active_id = st.session_state.get("ai_active_thread_id")
+
+    # If active_id is missing or no longer exists, pick/create one cleanly
+    if not active_id or not any(str(th.get("id")) == str(active_id) for th in threads):
+        if cur_msgs:
+            first_u = next((str(m.get("content") or "") for m in cur_msgs if m.get("role") == "user"), "")
+            new_th = create_chat_thread(first_u)
+            new_th["messages"] = list(cur_msgs)
+            new_th["last_analysis_context"] = st.session_state.get("ai_last_analysis_context")
+            new_th["last_map_layout"] = st.session_state.get("ai_last_map_layout")
+            threads = sort_chat_threads([new_th] + threads)
+            st.session_state["ai_chat_threads"] = threads
+            st.session_state["ai_active_thread_id"] = new_th["id"]
+        elif threads:
+            first_th = threads[0]
+            st.session_state["ai_active_thread_id"] = first_th["id"]
+            st.session_state["ai_chat_messages"] = list(first_th.get("messages") or [])
+            st.session_state["ai_last_analysis_context"] = first_th.get("last_analysis_context")
+            st.session_state["ai_last_map_layout"] = first_th.get("last_map_layout")
+            rt_cache = st.session_state.get("_ai_thread_runtime_cache") or {}
+            cached = rt_cache.get(first_th["id"]) or {}
+            st.session_state["ai_chat_results"] = dict(cached.get("ai_chat_results") or {})
+            st.session_state["tab6_ai_result"] = cached.get("tab6_ai_result")
+        else:
+            fresh = create_chat_thread("")
+            threads = [fresh]
+            st.session_state["ai_chat_threads"] = threads
+            st.session_state["ai_active_thread_id"] = fresh["id"]
+    return list(st.session_state.get("ai_chat_threads") or [])
+
+
+def _snapshot_active_thread_to_store(username: str | None, *, sync_cloud: bool = False) -> None:
+    """Sync the active chat messages + runtime visual cache into ``ai_chat_threads`` and optionally GitHub Cloud."""
+    active_id = st.session_state.get("ai_active_thread_id")
+    if not active_id:
+        return
+    threads: list[dict[str, Any]] = list(st.session_state.get("ai_chat_threads") or [])
+    cur_msgs = list(st.session_state.get("ai_chat_messages") or [])
+    cur_ctx = st.session_state.get("ai_last_analysis_context")
+    cur_layout = st.session_state.get("ai_last_map_layout")
+
+    # Save runtime visual payloads (frames, overlays, GIFs) in-memory for instant in-session switching
+    rt_cache = dict(st.session_state.get("_ai_thread_runtime_cache") or {})
+    rt_cache[str(active_id)] = {
+        "ai_chat_results": dict(st.session_state.get("ai_chat_results") or {}),
+        "tab6_ai_result": st.session_state.get("tab6_ai_result"),
+        "ai_last_analysis_context": cur_ctx,
+        "ai_last_map_layout": cur_layout,
+    }
+    st.session_state["_ai_thread_runtime_cache"] = rt_cache
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    found = False
+    for th in threads:
+        if str(th.get("id")) == str(active_id):
+            th["messages"] = list(cur_msgs)
+            th["last_analysis_context"] = cur_ctx
+            th["last_map_layout"] = cur_layout
+            if cur_msgs:
+                th["updated_at"] = now_iso
+                cur_t = str(th.get("title") or "").strip()
+                if not cur_t or cur_t.lower() in ("nov pogovor", "new chat"):
+                    first_u = next(
+                        (str(m.get("content") or "") for m in cur_msgs if m.get("role") == "user"),
+                        "",
+                    )
+                    if first_u:
+                        th["title"] = auto_title_from_prompt(first_u)
+            found = True
+            break
+
+    if not found and cur_msgs:
+        first_u = next((str(m.get("content") or "") for m in cur_msgs if m.get("role") == "user"), "")
+        new_th = create_chat_thread(first_u)
+        new_th["id"] = str(active_id)
+        new_th["messages"] = list(cur_msgs)
+        new_th["last_analysis_context"] = cur_ctx
+        new_th["last_map_layout"] = cur_layout
+        threads.insert(0, new_th)
+
+    # Persist only non-empty threads to disk/GitHub (keep empty draft in session only)
+    st.session_state["ai_chat_threads"] = sort_chat_threads(threads)
+    if username and sync_cloud:
+        non_empty = [th for th in st.session_state["ai_chat_threads"] if th.get("messages")]
+        if non_empty:
+            saved = save_user_chat_threads(username, non_empty, sync=True, show_toast=False)
+            # Keep active empty draft if active thread has no messages yet
+            if not cur_msgs:
+                active_draft = next(
+                    (th for th in st.session_state["ai_chat_threads"] if str(th.get("id")) == str(active_id)),
+                    None,
+                )
+                if active_draft is not None and not any(str(x.get("id")) == str(active_id) for x in saved):
+                    saved = [active_draft] + saved
+            st.session_state["ai_chat_threads"] = saved
+
+
+def _activate_ai_chat_thread(thread_id: str, username: str | None) -> None:
+    """Switch active conversation to ``thread_id``, restoring in-session visuals instantaneously when cached."""
+    _snapshot_active_thread_to_store(username, sync_cloud=False)
+    threads: list[dict[str, Any]] = list(st.session_state.get("ai_chat_threads") or [])
+    target = next((th for th in threads if str(th.get("id")) == str(thread_id)), None)
+    if target is None:
+        return
+
+    rt_cache = st.session_state.get("_ai_thread_runtime_cache") or {}
+    cached = rt_cache.get(str(thread_id)) or {}
+
+    st.session_state["ai_active_thread_id"] = str(thread_id)
+    st.session_state["ai_chat_messages"] = list(target.get("messages") or [])
+    st.session_state["ai_chat_results"] = dict(cached.get("ai_chat_results") or {})
+    st.session_state["tab6_ai_result"] = cached.get("tab6_ai_result")
+    st.session_state["ai_last_analysis_context"] = (
+        cached.get("ai_last_analysis_context")
+        if cached.get("ai_last_analysis_context") is not None
+        else target.get("last_analysis_context")
+    )
+    st.session_state["ai_last_map_layout"] = (
+        cached.get("ai_last_map_layout")
+        if cached.get("ai_last_map_layout") is not None
+        else target.get("last_map_layout")
+    )
+    st.session_state["tab6_sent_to_carto"] = False
+    st.session_state["ai_pending_chat_prompt"] = None
+    st.session_state["ai_pending_rerun_turn"] = None
+    st.session_state["ai_editing_turn_idx"] = None
+    st.session_state["ai_show_all_turns"] = False
+
+
+def _start_new_ai_chat_thread(username: str | None) -> None:
+    """Create and activate a fresh empty chat thread WITHOUT deleting the current conversation."""
+    _snapshot_active_thread_to_store(username, sync_cloud=False)
+    threads: list[dict[str, Any]] = list(st.session_state.get("ai_chat_threads") or [])
+    # Reuse an existing empty draft at the top if present so clicking 'New chat' twice doesn't spam drafts
+    existing_empty = next((th for th in threads if not th.get("messages")), None)
+    if existing_empty is not None:
+        _activate_ai_chat_thread(str(existing_empty["id"]), username)
+        return
+    fresh = create_chat_thread("")
+    threads = [fresh] + threads
+    st.session_state["ai_chat_threads"] = threads
+    _activate_ai_chat_thread(str(fresh["id"]), username)
+
+
 def _render_ai_chat_turn(
     turn: dict[str, Any],
     *,
@@ -11686,6 +11857,12 @@ def main() -> None:
     elif active_ws == "ws_ai":
         _auth_u_ws5 = st.session_state.get("auth_user")
         _ws5_logged_in = isinstance(_auth_u_ws5, dict) and bool(_auth_u_ws5.get("username"))
+        _ws5_uname: str | None = str(_auth_u_ws5["username"]) if _ws5_logged_in else None
+
+        # Inicializiraj in naloži seznam pogovorov (za prijavljene uporabnike ali goste)
+        all_threads = _ensure_ai_chat_threads_loaded(_ws5_uname)
+        active_tid = str(st.session_state.get("ai_active_thread_id") or "")
+        saved_thread_count = sum(1 for th in all_threads if th.get("messages"))
 
         # Razreši aktivni Gemini model in ključ iz stranske vrstice (brez podvojenih widgetov)
         effective_gemini_model = resolve_gemini_model_id(
@@ -11699,111 +11876,287 @@ def main() -> None:
             else t("ai_ws5_pill_local", lang=lang)
         )
 
-        hdr_col, new_col = st.columns([3.2, 1.8], vertical_alignment="bottom")
-        with hdr_col:
+        # --- 1. Kompakten zgornji naslovni pas (☰ Pogovori + naslov + statusne značke) ---
+        tog_col, title_col, pills_col = st.columns([1.05, 2.75, 1.8], vertical_alignment="center")
+        with tog_col:
+            if st.button(
+                t("ai_hist_toggle_btn", lang=lang, n=saved_thread_count),
+                width="stretch",
+                key="ws5_toggle_history_btn",
+            ):
+                st.session_state["ws5_show_history_panel"] = not bool(
+                    st.session_state.get("ws5_show_history_panel", True)
+                )
+                st.rerun()
+        with title_col:
             st.subheader(t("ai_header"))
-            st.caption(t("ai_intro"))
-        with new_col:
+        with pills_col:
             pills_html_parts = [f'<span class="geo-badge">{model_status_pill}</span>']
             if _ws5_logged_in:
                 pills_html_parts.append(
                     f'<span class="geo-badge">{t("ai_chat_cloud_pill", lang=lang)}</span>'
                 )
+            else:
+                pills_html_parts.append(
+                    f'<span class="geo-badge">{t("ai_hist_guest_pill", lang=lang)}</span>'
+                )
             st.markdown(
-                '<div style="display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px;margin-bottom:6px;">'
+                '<div style="display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px;">'
                 + "".join(pills_html_parts)
                 + "</div>",
                 unsafe_allow_html=True,
             )
-            if st.button(
-                t("ai_chat_new_btn"),
-                width="stretch",
-                key="tab6_btn_new_chat",
-            ):
-                st.session_state["ai_chat_messages"] = []
-                st.session_state["ai_chat_results"] = {}
-                st.session_state["ai_last_analysis_context"] = None
-                st.session_state["ai_last_map_layout"] = None
-                st.session_state["tab6_ai_result"] = None
-                st.session_state["tab6_sent_to_carto"] = False
-                st.session_state["ai_pending_chat_prompt"] = None
-                st.session_state["ai_pending_rerun_turn"] = None
-                st.session_state["ai_editing_turn_idx"] = None
-                st.session_state["ai_show_all_turns"] = False
-                gc.collect()
-                st.rerun()
-            if _ws5_logged_in and st.session_state.get("ai_chat_messages"):
-                if st.button(
-                    t("ai_chat_save_proj_btn", lang=lang),
-                    width="stretch",
-                    key="tab6_btn_save_chat_proj",
-                ):
-                    _u5 = str(_auth_u_ws5["username"])
-                    _proj_auto_name = f"AI · {loc_label} ({date.today().isoformat()})"
-                    _p_pay = _collect_current_workspace_payload(
-                        center_lat=float(center_lat),
-                        center_lon=float(center_lon),
-                        bbox_4326=bbox_4326,
-                        aoi_polygon_4326=aoi_polygon_4326,
-                        loc_label=str(loc_label),
-                    )
-                    save_user_project(_u5, _proj_auto_name, "AI Assistant session", _p_pay, sync=True)
-                    _maybe_auto_save_session()
-                    st.toast(t("proj_saved_ok", lang=lang, name=_proj_auto_name))
 
-        # --- 1. Pozdravna kartica + klikabilni začetni primeri (ko je klepet prazen) ---
-        chat_messages: list[dict[str, Any]] = list(st.session_state.get("ai_chat_messages") or [])
-        if not chat_messages:
-            welcome_html = (
-                f'<div style="background:#F0FDFA;border:1px solid #99F6E4;border-left:4px solid #0F766E;'
-                f'border-radius:10px;padding:16px 18px;margin:6px 0 14px 0;">'
-                f'<div style="font-size:16px;font-weight:700;color:#0F172A;margin-bottom:6px;">'
-                f'🛰️ {t("ai_chat_welcome_title")}</div>'
-                f'<div style="font-size:13.5px;color:#334155;line-height:1.5;">'
-                f'{t("ai_chat_welcome_body")}</div>'
-                f'</div>'
-            )
-            st.markdown(welcome_html, unsafe_allow_html=True)
-            st.caption(t("ai_examples_label"))
-            ex_cols = st.columns(2)
-            ex_lang_k = "en" if lang == "en" else "sl"
-            for ex_idx, ex_item in enumerate(AI_EXAMPLE_PROMPTS):
-                ex_text = ex_item[ex_lang_k]
-                with ex_cols[ex_idx % 2]:
+        show_hist_panel = bool(st.session_state.get("ws5_show_history_panel", True))
+        if show_hist_panel:
+            col_hist, col_chat = st.columns([0.28, 0.72], gap="medium")
+        else:
+            col_hist = None
+            col_chat = st.container()
+
+        # --- 2A. Levi panel pogovorov (Gemini-slog) ---
+        if col_hist is not None:
+            with col_hist:
+                with st.container(border=True):
+                    st.markdown(f"**{t('ai_hist_panel_title', lang=lang)}**")
                     if st.button(
-                        ex_text,
+                        t("ai_hist_new_btn", lang=lang),
+                        type="primary",
                         width="stretch",
-                        key=f"tab6_ex_{ex_item['id']}",
+                        key="ws5_hist_new_chat_btn",
                     ):
-                        clean_ex = ex_text.split(" ", 1)[1] if " " in ex_text else ex_text
-                        st.session_state["ai_pending_chat_prompt"] = clean_ex
+                        _start_new_ai_chat_thread(_ws5_uname)
+                        gc.collect()
                         st.rerun()
 
-        # --- 2. Izris zgodovine večkrožnega pogovora (starejši krogi samodejno strnjeni, zadnja 2 odprta) ---
-        chat_turns = group_ai_chat_turns(chat_messages)
-        total_turns = len(chat_turns)
-        older_count = max(0, total_turns - KEEP_EXPANDED_TURNS)
-        show_all_turns = False
-        if older_count > 0:
-            show_all_turns = st.toggle(
-                t("ai_chat_show_all_turns", lang=lang, n=older_count),
-                key="ai_show_all_turns",
-            )
+                    display_threads = [
+                        th
+                        for th in all_threads
+                        if th.get("messages") or str(th.get("id")) == active_tid
+                    ]
+                    search_q_hist = ""
+                    if len(display_threads) >= 3:
+                        search_q_hist = st.text_input(
+                            "Search chats",
+                            placeholder=t("ai_hist_search_ph", lang=lang),
+                            label_visibility="collapsed",
+                            key="ws5_hist_search_input",
+                        ).strip().lower()
 
-        editing_turn_idx = st.session_state.get("ai_editing_turn_idx")
-        chat_results_map = st.session_state.get("ai_chat_results") or {}
-        for turn in chat_turns:
-            t_idx = int(turn["turn_idx"])
-            if t_idx < total_turns - KEEP_EXPANDED_TURNS:
-                exp_lbl = build_collapsed_turn_label(
-                    turn,
-                    chat_results=chat_results_map,
-                    lang=lang,
+                    filtered_threads = (
+                        [
+                            th
+                            for th in display_threads
+                            if search_q_hist in str(th.get("title") or "").lower()
+                            or any(
+                                search_q_hist in str(m.get("content") or "").lower()
+                                for m in (th.get("messages") or [])
+                            )
+                        ]
+                        if search_q_hist
+                        else display_threads
+                    )
+
+                    if not filtered_threads:
+                        st.caption(
+                            t("ai_hist_no_match", lang=lang)
+                            if search_q_hist
+                            else t("ai_hist_empty", lang=lang)
+                        )
+                    else:
+                        for th in filtered_threads:
+                            tid = str(th.get("id") or "")
+                            is_active_th = tid == active_tid
+                            is_pinned_th = bool(th.get("pinned", False))
+                            th_title = str(th.get("title") or "Nov pogovor").strip()
+                            if len(th_title) > 34:
+                                th_title_short = th_title[:33].rstrip() + "…"
+                            else:
+                                th_title_short = th_title
+                            pin_pref = "📌 " if is_pinned_th else ""
+                            n_turns_th = sum(
+                                1 for m in (th.get("messages") or []) if m.get("role") == "user"
+                            )
+                            upd_short = str(th.get("updated_at") or "")[:10]
+                            btn_lbl = (
+                                f"{pin_pref}{th_title_short}"
+                                if n_turns_th == 0
+                                else f"{pin_pref}{th_title_short} · {n_turns_th}"
+                            )
+
+                            row_main, row_menu = st.columns([0.82, 0.18], gap="small")
+                            with row_main:
+                                if st.button(
+                                    btn_lbl,
+                                    type="primary" if is_active_th else "secondary",
+                                    width="stretch",
+                                    help=f"{th_title} ({upd_short})" if upd_short else th_title,
+                                    key=f"ws5_th_open_{tid}",
+                                ):
+                                    if not is_active_th:
+                                        _activate_ai_chat_thread(tid, _ws5_uname)
+                                        st.rerun()
+                            with row_menu:
+                                with st.popover("⋮", width="stretch"):
+                                    new_nm = st.text_input(
+                                        t("ai_hist_rename_lbl", lang=lang),
+                                        value=th_title,
+                                        key=f"ws5_th_ren_in_{tid}",
+                                    )
+                                    if st.button(
+                                        t("ai_hist_rename_save", lang=lang),
+                                        width="stretch",
+                                        key=f"ws5_th_ren_save_{tid}",
+                                    ):
+                                        if str(new_nm or "").strip():
+                                            st.session_state["ai_chat_threads"] = rename_chat_thread(
+                                                _ws5_uname,
+                                                tid,
+                                                str(new_nm).strip(),
+                                                threads=list(st.session_state.get("ai_chat_threads") or []),
+                                                sync=bool(_ws5_logged_in),
+                                            )
+                                            st.rerun()
+
+                                    pin_lbl = (
+                                        t("ai_hist_unpin_btn", lang=lang)
+                                        if is_pinned_th
+                                        else t("ai_hist_pin_btn", lang=lang)
+                                    )
+                                    if st.button(
+                                        pin_lbl,
+                                        width="stretch",
+                                        key=f"ws5_th_pin_{tid}",
+                                    ):
+                                        st.session_state["ai_chat_threads"] = toggle_pin_chat_thread(
+                                            _ws5_uname,
+                                            tid,
+                                            threads=list(st.session_state.get("ai_chat_threads") or []),
+                                            sync=bool(_ws5_logged_in),
+                                        )
+                                        st.rerun()
+
+                                    if _ws5_logged_in and th.get("messages"):
+                                        if st.button(
+                                            t("ai_hist_save_proj_btn", lang=lang),
+                                            width="stretch",
+                                            key=f"ws5_th_save_proj_{tid}",
+                                        ):
+                                            _proj_auto_name = f"AI · {th_title[:36]} ({date.today().isoformat()})"
+                                            _p_pay = _collect_current_workspace_payload(
+                                                center_lat=float(center_lat),
+                                                center_lon=float(center_lon),
+                                                bbox_4326=bbox_4326,
+                                                aoi_polygon_4326=aoi_polygon_4326,
+                                                loc_label=str(loc_label),
+                                            )
+                                            _p_pay["ai_chat_messages"] = list(th.get("messages") or [])
+                                            save_user_project(
+                                                str(_ws5_uname),
+                                                _proj_auto_name,
+                                                f"AI chat: {th_title}",
+                                                _p_pay,
+                                                sync=True,
+                                            )
+                                            _maybe_auto_save_session()
+                                            st.toast(t("proj_saved_ok", lang=lang, name=_proj_auto_name))
+
+                                    if st.button(
+                                        t("ai_hist_delete_btn", lang=lang),
+                                        width="stretch",
+                                        key=f"ws5_th_del_{tid}",
+                                    ):
+                                        remaining = delete_chat_thread(
+                                            _ws5_uname,
+                                            tid,
+                                            threads=list(st.session_state.get("ai_chat_threads") or []),
+                                            sync=bool(_ws5_logged_in),
+                                        )
+                                        rt_c = dict(st.session_state.get("_ai_thread_runtime_cache") or {})
+                                        rt_c.pop(tid, None)
+                                        st.session_state["_ai_thread_runtime_cache"] = rt_c
+                                        st.session_state["ai_chat_threads"] = remaining
+                                        if tid == active_tid:
+                                            st.session_state["ai_active_thread_id"] = None
+                                            st.session_state["ai_chat_messages"] = []
+                                            st.session_state["ai_chat_results"] = {}
+                                            st.session_state["ai_last_analysis_context"] = None
+                                            st.session_state["ai_last_map_layout"] = None
+                                            st.session_state["tab6_ai_result"] = None
+                                            _ensure_ai_chat_threads_loaded(_ws5_uname)
+                                        st.rerun()
+
+        # --- 2B. Desni aktivni pogovor ---
+        chat_messages: list[dict[str, Any]] = list(st.session_state.get("ai_chat_messages") or [])
+        with col_chat:
+            active_thread_obj = next(
+                (th for th in (st.session_state.get("ai_chat_threads") or []) if str(th.get("id")) == active_tid),
+                None,
+            )
+            if not chat_messages:
+                welcome_html = (
+                    f'<div style="background:#F0FDFA;border:1px solid #99F6E4;border-left:4px solid #0F766E;'
+                    f'border-radius:10px;padding:16px 18px;margin:4px 0 14px 0;">'
+                    f'<div style="font-size:16px;font-weight:700;color:#0F172A;margin-bottom:6px;">'
+                    f'🛰️ {t("ai_chat_welcome_title")}</div>'
+                    f'<div style="font-size:13.5px;color:#334155;line-height:1.5;">'
+                    f'{t("ai_chat_welcome_body")}</div>'
+                    f'</div>'
                 )
-                with st.expander(exp_lbl, expanded=bool(show_all_turns or editing_turn_idx == t_idx)):
-                    _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+                st.markdown(welcome_html, unsafe_allow_html=True)
+                st.caption(t("ai_examples_label"))
+                ex_cols = st.columns(2)
+                ex_lang_k = "en" if lang == "en" else "sl"
+                for ex_idx, ex_item in enumerate(AI_EXAMPLE_PROMPTS):
+                    ex_text = ex_item[ex_lang_k]
+                    with ex_cols[ex_idx % 2]:
+                        if st.button(
+                            ex_text,
+                            width="stretch",
+                            key=f"tab6_ex_{ex_item['id']}",
+                        ):
+                            clean_ex = ex_text.split(" ", 1)[1] if " " in ex_text else ex_text
+                            st.session_state["ai_pending_chat_prompt"] = clean_ex
+                            st.rerun()
             else:
-                _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+                if active_thread_obj and active_thread_obj.get("title"):
+                    st.caption(f"💬 **{active_thread_obj['title']}**")
+
+                # Subtle hint when a cloud-restored conversation's interactive maps are not in RAM yet
+                chat_results_map = st.session_state.get("ai_chat_results") or {}
+                has_cloud_only_analysis = any(
+                    m.get("role") == "assistant"
+                    and m.get("action") in ("run_analysis", "generate_map")
+                    and (not m.get("result_id") or str(m.get("result_id")) not in chat_results_map)
+                    for m in chat_messages
+                )
+                if has_cloud_only_analysis:
+                    st.info(t("ai_hist_cloud_regen_hint", lang=lang))
+
+                # Izris zgodovine večkrožnega pogovora (starejši krogi samodejno strnjeni, zadnja 2 odprta)
+                chat_turns = group_ai_chat_turns(chat_messages)
+                total_turns = len(chat_turns)
+                older_count = max(0, total_turns - KEEP_EXPANDED_TURNS)
+                show_all_turns = False
+                if older_count > 0:
+                    show_all_turns = st.toggle(
+                        t("ai_chat_show_all_turns", lang=lang, n=older_count),
+                        key="ai_show_all_turns",
+                    )
+
+                editing_turn_idx = st.session_state.get("ai_editing_turn_idx")
+                for turn in chat_turns:
+                    t_idx = int(turn["turn_idx"])
+                    if t_idx < total_turns - KEEP_EXPANDED_TURNS:
+                        exp_lbl = build_collapsed_turn_label(
+                            turn,
+                            chat_results=chat_results_map,
+                            lang=lang,
+                        )
+                        with st.expander(exp_lbl, expanded=bool(show_all_turns or editing_turn_idx == t_idx)):
+                            _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+                    else:
+                        _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
 
         # --- 3. Spodnje pripeto vnosno polje za klepet (st.chat_input) + obdelava Uredi/Ponovi ---
         typed_prompt = st.chat_input(
@@ -12081,6 +12434,7 @@ def main() -> None:
 
                     ai_prog.empty()
                     ai_status.empty()
+                    _snapshot_active_thread_to_store(_ws5_uname, sync_cloud=bool(_ws5_logged_in))
                     _maybe_auto_save_session()
                     gc.collect()
                     st.rerun()
@@ -12098,6 +12452,7 @@ def main() -> None:
                             "fallback_note": "",
                         }
                     )
+                    _snapshot_active_thread_to_store(_ws5_uname, sync_cloud=bool(_ws5_logged_in))
                     st.error(err_msg)
                     st.rerun()
 

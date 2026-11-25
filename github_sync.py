@@ -242,11 +242,11 @@ def github_push_file(
 
 
 def pull_user_data_from_github(username: str) -> dict[str, bool]:
-    """Pull a user's ``profile.json``, ``projects.json``, ``map_layouts.json``, and ``last_session.json``."""
+    """Pull a user's ``profile.json``, ``projects.json``, ``map_layouts.json``, ``last_session.json``, and ``ai_chats.json``."""
     uname = str(username or "").strip().lower()
     if not uname or not is_github_sync_configured():
         return {}
-    files = ("profile.json", "projects.json", "map_layouts.json", "last_session.json")
+    files = ("profile.json", "projects.json", "map_layouts.json", "last_session.json", "ai_chats.json")
     return {fn: github_pull_file(f"data/users/{uname}/{fn}") for fn in files}
 
 
