@@ -219,6 +219,7 @@ from stac_loader import (
     SENSOR_S1,
     SENSOR_S2,
     TEMPORAL_INTERVAL_KEYS,
+    get_default_reliable_t1_index,
     YEARLY_SEASON_KEYS,
     YEARLY_SEASON_SPECS,
     filter_by_temporal_interval,
@@ -7720,14 +7721,25 @@ def _render_ai_chat_analysis_fragment(
 
         def _draw_ts_plotly_and_table() -> None:
             fig_ai_ts = go.Figure()
+            if "analysis_reliable" in ts_ai.columns:
+                _rel_m = ts_ai["analysis_reliable"].astype(bool)
+                ts_rel = ts_ai.loc[_rel_m].reset_index(drop=True)
+                ts_arch = ts_ai.loc[~_rel_m].reset_index(drop=True)
+                if len(ts_rel) < 2:
+                    ts_rel = ts_ai
+                    ts_arch = ts_ai.iloc[0:0]
+            else:
+                ts_rel = ts_ai
+                ts_arch = ts_ai.iloc[0:0]
+
             is_temporal_fusion = (
                 f_mode_show == "temporal_landsat_s2"
-                and "sensor_family" in ts_ai.columns
-                and ts_ai["sensor_family"].nunique() >= 2
+                and "sensor_family" in ts_rel.columns
+                and ts_rel["sensor_family"].nunique() >= 2
             )
             if is_temporal_fusion:
-                ts_ls_sub = ts_ai[ts_ai["sensor_family"].astype(str).str.contains("Landsat", case=False, na=False)]
-                ts_s2_sub = ts_ai[ts_ai["sensor_family"].astype(str).str.contains("Sentinel-2", case=False, na=False)]
+                ts_ls_sub = ts_rel[ts_rel["sensor_family"].astype(str).str.contains("Landsat", case=False, na=False)]
+                ts_s2_sub = ts_rel[ts_rel["sensor_family"].astype(str).str.contains("Sentinel-2", case=False, na=False)]
                 if not ts_ls_sub.empty:
                     fig_ai_ts.add_trace(
                         go.Scatter(
@@ -7768,20 +7780,35 @@ def _render_ai_chat_analysis_fragment(
             else:
                 fig_ai_ts.add_trace(
                     go.Scatter(
-                        x=ts_ai["date_str"],
-                        y=ts_ai["mean"],
+                        x=ts_rel["date_str"],
+                        y=ts_rel["mean"],
                         mode="lines+markers",
                         name=idx_lbl_ts,
                         line=dict(color="#0F766E", width=2.5),
                         marker=dict(size=7, color="#0F766E"),
                     )
                 )
-            if len(ts_ai) >= 3:
-                x_ord = np.arange(len(ts_ai), dtype=np.float64)
-                slope, intercept = np.polyfit(x_ord, ts_ai["mean"].to_numpy(dtype=np.float64), 1)
+            if not ts_arch.empty:
                 fig_ai_ts.add_trace(
                     go.Scatter(
-                        x=ts_ai["date_str"],
+                        x=ts_arch["date_str"],
+                        y=ts_arch["mean"],
+                        mode="markers",
+                        name=t("ai_ts_archive_trace", lang=lang),
+                        marker=dict(
+                            size=9,
+                            color="#94A3B8",
+                            symbol="diamond-open",
+                            line=dict(width=2, color="#64748B"),
+                        ),
+                    )
+                )
+            if len(ts_rel) >= 3:
+                x_ord = np.arange(len(ts_rel), dtype=np.float64)
+                slope, intercept = np.polyfit(x_ord, ts_rel["mean"].to_numpy(dtype=np.float64), 1)
+                fig_ai_ts.add_trace(
+                    go.Scatter(
+                        x=ts_rel["date_str"],
                         y=slope * x_ord + intercept,
                         mode="lines",
                         name="Trend",
@@ -7804,7 +7831,7 @@ def _render_ai_chat_analysis_fragment(
                 font=dict(color="#0F172A"),
             )
             st.plotly_chart(fig_ai_ts, width="stretch", key=f"ai_chat_ts_plotly_{result_id}")
-            tbl_cols = [c for c in ("date_str", "sensor_family", "platform", "mean", "median", "std", "valid_pct") if c in ts_ai.columns]
+            tbl_cols = [c for c in ("date_str", "sensor_family", "platform", "mean", "median", "std", "valid_pct", "quality_note") if c in ts_ai.columns]
             if tbl_cols:
                 st.dataframe(ts_ai[tbl_cols], width="stretch", hide_index=True, height=min(240, 42 + 35 * len(ts_ai)))
             if ai_res_show.get("csv_bytes"):
@@ -7830,6 +7857,9 @@ def _render_ai_chat_analysis_fragment(
 
             frame_dates = [str(f["date"]) for f in frames_list]
             n_fr = len(frames_list)
+            default_t1_idx = get_default_reliable_t1_index(frames_list)
+            if n_fr >= 2 and default_t1_idx >= n_fr - 1:
+                default_t1_idx = 0
             has_rgb_frames = any(bool(f.get("rgb_overlay_uri")) for f in frames_list)
             has_idx_frames = any(bool(f.get("index_overlay_uri")) for f in frames_list)
             extra_codes_avail: list[str] = []
@@ -7851,9 +7881,10 @@ def _render_ai_chat_analysis_fragment(
                 fr_i = frames_list[i]
                 plat_s = str(fr_i.get("platform") or "").strip()
                 base_s = f"{fr_i['date']} · {plat_s}" if plat_s else str(fr_i["date"])
+                arch_s = f" ({t('ai_frame_archive_tag', lang=lang)})" if fr_i.get("analysis_reliable") is False else ""
                 if fr_i.get("index_mean") is not None:
-                    return f"{base_s} ({idx_lbl_ts}={fr_i['index_mean']:.2f})"
-                return base_s
+                    return f"{base_s}{arch_s} ({idx_lbl_ts}={fr_i['index_mean']:.2f})"
+                return f"{base_s}{arch_s}"
 
             # --- TAB 1: Compare Any Two Dates (t1 ↔ t2) with Multi-Index Switcher ---
             with t_sw:
@@ -7862,7 +7893,7 @@ def _render_ai_chat_analysis_fragment(
                     idx_left = st.selectbox(
                         t("ai_mf_date_left", lang=lang),
                         options=list(range(n_fr)),
-                        index=0,
+                        index=default_t1_idx,
                         format_func=_frame_dropdown_label,
                         key=f"ai_mf_left_idx_{result_id}",
                     )
@@ -7977,7 +8008,7 @@ def _render_ai_chat_analysis_fragment(
                     delta_idx_t1 = st.selectbox(
                         t("ai_mf_delta_t1", lang=lang),
                         options=list(range(n_fr)),
-                        index=0,
+                        index=default_t1_idx,
                         format_func=_frame_dropdown_label,
                         key=f"ai_mf_delta_t1_{result_id}",
                     )
@@ -7992,7 +8023,7 @@ def _render_ai_chat_analysis_fragment(
 
                 fr_d1 = frames_list[int(delta_idx_t1)]
                 fr_d2 = frames_list[int(delta_idx_t2)]
-                is_default_pair = int(delta_idx_t1) == 0 and int(delta_idx_t2) == (n_fr - 1)
+                is_default_pair = int(delta_idx_t1) == default_t1_idx and int(delta_idx_t2) == (n_fr - 1)
 
                 ai_op_delta = st.slider(
                     t("opacity_layer_label"),
@@ -8284,9 +8315,14 @@ def _render_ai_chat_analysis_fragment(
                                 mean_lbl = str(st_mode)
                             if raw_img:
                                 cap_mean = f" · {mean_lbl}: {mean_val:.3f}" if mean_val is not None else ""
+                                cap_arch = (
+                                    f" ({t('ai_frame_archive_tag', lang=lang)})"
+                                    if fr_item.get("analysis_reliable") is False
+                                    else ""
+                                )
                                 st.image(
                                     raw_img,
-                                    caption=f"{fr_item['date']}{cap_mean}",
+                                    caption=f"{fr_item['date']}{cap_arch}{cap_mean}",
                                     width="stretch",
                                 )
 

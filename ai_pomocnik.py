@@ -87,6 +87,8 @@ from stac_loader import (
     SENSOR_LANDSAT,
     SENSOR_S1,
     SENSOR_S2,
+    assess_scene_analysis_reliability,
+    get_default_reliable_t1_index,
     load_scene,
     search_scenes,
 )
@@ -1694,16 +1696,30 @@ def build_analysis_context_dict(
         )
     elif kind in ("time_series", "time_series_and_comparison") and isinstance(result.get("ts_df"), pd.DataFrame):
         ts_df: pd.DataFrame = result["ts_df"]
-        n_obs = len(ts_df)
-        vals = ts_df["mean"].to_numpy(dtype=np.float64) if n_obs else np.array([], dtype=np.float64)
+        excluded_dates: list[str] = list(result.get("excluded_archive_dates") or [])
+        if "analysis_reliable" in ts_df.columns:
+            rel_mask = ts_df["analysis_reliable"].astype(bool)
+            for d_ex in ts_df.loc[~rel_mask, "date_str"].astype(str).tolist():
+                if d_ex not in excluded_dates:
+                    excluded_dates.append(d_ex)
+            rel_df = ts_df.loc[rel_mask].reset_index(drop=True)
+            if len(rel_df) < 2:
+                rel_df = ts_df
+        else:
+            rel_df = ts_df
+        excluded_dates = sorted(set(excluded_dates))
+        n_obs = len(rel_df)
+        vals = rel_df["mean"].to_numpy(dtype=np.float64) if n_obs else np.array([], dtype=np.float64)
         slope = None
         if n_obs >= 3:
             slope = round(float(np.polyfit(np.arange(n_obs, dtype=np.float64), vals, 1)[0]), 5)
         ctx.update(
             {
                 "n_dates": int(n_obs),
-                "date_start": str(ts_df["date_str"].iloc[0]) if n_obs else str(plan.get("start_date", "")),
-                "date_end": str(ts_df["date_str"].iloc[-1]) if n_obs else str(plan.get("end_date", "")),
+                "total_visual_dates": int(len(ts_df)),
+                "excluded_archive_dates": excluded_dates,
+                "date_start": str(rel_df["date_str"].iloc[0]) if n_obs else str(plan.get("start_date", "")),
+                "date_end": str(rel_df["date_str"].iloc[-1]) if n_obs else str(plan.get("end_date", "")),
                 "interval": str(plan.get("interval", "")),
                 "mean": round(float(np.nanmean(vals)), 4) if n_obs else None,
                 "min": round(float(np.nanmin(vals)), 4) if n_obs else None,
@@ -2013,6 +2029,22 @@ def execute_temporal_fusion(
         gc.collect()
 
     frames = sorted(frames, key=lambda fr: str(fr.get("date") or ""))
+    default_t1_idx = get_default_reliable_t1_index(frames)
+    if len(frames) >= 2 and default_t1_idx >= len(frames) - 1:
+        default_t1_idx = 0
+
+    excluded_archive_dates: list[str] = sorted(
+        {
+            str(f.get("date"))
+            for f in frames
+            if isinstance(f, dict) and f.get("analysis_reliable") is False and f.get("date")
+        }
+        | (
+            set(ts_df.loc[~ts_df["analysis_reliable"].astype(bool), "date_str"].astype(str).tolist())
+            if "analysis_reliable" in ts_df.columns
+            else set()
+        )
+    )
 
     # 5. Cross-resolution pixel-aligned Δ change map (water-aware for NDSI -> detects terminus-to-lake retreat!)
     diff_da = None
@@ -2031,7 +2063,7 @@ def execute_temporal_fusion(
     if len(frames) >= 2:
         _prog(0.88, "Usklajujem rastrski mreži (Landsat 30 m ↔ Sentinel-2) za karto sprememb Δ..." if lang == "sl" else "Aligning Landsat 30 m & Sentinel-2 grids for Δ change map...")
         dyn_out = compute_dynamic_frame_delta(
-            frames[0],
+            frames[default_t1_idx],
             frames[-1],
             target_epsg=target_epsg,
             index_name=layer_m,
@@ -2066,7 +2098,7 @@ def execute_temporal_fusion(
             delta_cmap = delta_out["delta_cmap"]
         if diff_da is not None:
             tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
-            tif_fname = f"AI_Fusion_Delta_{layer_m}_{plan['place_name']}_{frames[0]['date']}_to_{frames[-1]['date']}_EPSG{epsg_num}.tif"
+            tif_fname = f"AI_Fusion_Delta_{layer_m}_{plan['place_name']}_{frames[default_t1_idx]['date']}_to_{frames[-1]['date']}_EPSG{epsg_num}.tif"
 
     # 6. Unified Multi-Decade Timelapse GIFs
     rgb_pngs = [f["rgb_png_bytes"] for f in frames if f.get("rgb_png_bytes")]
@@ -2097,6 +2129,8 @@ def execute_temporal_fusion(
             "csv_bytes": csv_bytes,
             "csv_filename": csv_fname,
             "frames": frames,
+            "default_t1_index": default_t1_idx,
+            "excluded_archive_dates": excluded_archive_dates,
             "timelapse_rgb_gif_bytes": gif_rgb,
             "timelapse_index_gif_bytes": gif_idx,
             "comparison_rgb": None,
@@ -3001,8 +3035,11 @@ def execute_ai_plan(
             glacier_change_stats = mf_out.get("glacier_change_stats")
             mf_reps = list(mf_out.get("replacements") or [])
 
+            default_t1_idx_ss = int(mf_out.get("default_t1_index", get_default_reliable_t1_index(frames)))
+            if len(frames) >= 2 and default_t1_idx_ss >= len(frames) - 1:
+                default_t1_idx_ss = 0
             if len(frames) >= 2:
-                f0, f_last = frames[0], frames[-1]
+                f0, f_last = frames[default_t1_idx_ss], frames[-1]
                 if f0.get("rgb_overlay_uri") and f_last.get("rgb_overlay_uri"):
                     comp_rgb = {
                         "dates": [f0["date"], f_last["date"]],
@@ -3026,10 +3063,22 @@ def execute_ai_plan(
                     threshold=2.0 if sensor == SENSOR_S1 else (2.0 if layer_m == "LST" else 0.15),
                 )
                 tif_bytes = export_to_geotiff_bytes(diff_da, target_epsg=target_epsg)
-                r_d0 = frames[0]["date"] if frames else ts_dates_sorted[0]
+                r_d0 = frames[default_t1_idx_ss]["date"] if frames else ts_dates_sorted[0]
                 r_d1 = frames[-1]["date"] if frames else ts_dates_sorted[-1]
                 tif_fname = f"AI_Delta_{layer_m}_{plan['place_name']}_{r_d0}_to_{r_d1}_EPSG{epsg_num}.tif"
 
+        excluded_archive_dates_ss: list[str] = sorted(
+            {
+                str(f.get("date"))
+                for f in frames
+                if isinstance(f, dict) and f.get("analysis_reliable") is False and f.get("date")
+            }
+            | (
+                set(ts_df.loc[~ts_df["analysis_reliable"].astype(bool), "date_str"].astype(str).tolist())
+                if "analysis_reliable" in ts_df.columns
+                else set()
+            )
+        )
         result_kind = (
             "time_series_and_comparison"
             if (len(frames) >= 2 or comp_rgb is not None or comp_idx is not None)
@@ -3046,6 +3095,8 @@ def execute_ai_plan(
                 "csv_bytes": csv_bytes,
                 "csv_filename": csv_fname,
                 "frames": frames,
+                "default_t1_index": get_default_reliable_t1_index(frames),
+                "excluded_archive_dates": excluded_archive_dates_ss,
                 "timelapse_rgb_gif_bytes": gif_rgb_bytes,
                 "timelapse_index_gif_bytes": gif_idx_bytes,
                 "comparison_rgb": comp_rgb,
@@ -4570,20 +4621,37 @@ def _generate_local_conversational_reply(
             d2 = str(analysis_context.get("date_end", ""))
             mean_v = analysis_context.get("mean")
             slope = analysis_context.get("trend_slope_per_obs")
+            excl_arch = list(analysis_context.get("excluded_archive_dates") or [])
+            arch_note_sl = ""
+            arch_note_en = ""
+            if excl_arch:
+                arch_str = ", ".join(excl_arch[:4]) + (" …" if len(excl_arch) > 4 else "")
+                arch_note_sl = (
+                    f"\n- **Radiometrična zanesljivost:** Starejši ali nasičeni posnetki pred letom 1990 "
+                    f"(`{arch_str}`) so na voljo za vizualni pregled v primerjalniku, galeriji in Timelapse animaciji, "
+                    f"medtem ko kvantitativna analiza sprememb (Δ), trend in izračun površin temeljijo na "
+                    f"zanesljivejših podatkih od **`{d1}`** naprej."
+                )
+                arch_note_en = (
+                    f"\n- **Radiometric Reliability:** Earlier or saturated archive scenes (`{arch_str}`) remain "
+                    f"available for visual inspection in the comparator, gallery, and Timelapse animation, while the "
+                    f"quantitative change map (Δ), trend regression, and area statistics are computed from the "
+                    f"reliable baseline starting **`{d1}`**."
+                )
             if lang == "sl":
                 trend_txt = f" Linearni trend znaša **`{slope:+.4f}` na opazovanje**." if slope is not None else ""
                 return (
                     f"### Časovna vrsta **{idx}** za **{place}** (`{d1}` – `{d2}`)\n\n"
                     f"Iz satelitskega arhiva `{sensor}` (**{res_m} m**, **{crs}**) je bilo obdelanih **{n_d} kakovostnih datumov** (interval: `{analysis_context.get('interval', '')}` z istim letnim časom in samodejno zamenjavo oblačnih datumov).\n\n"
-                    f"- **Povprečna vrednost v obdobju:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{trend_txt}\n\n"
+                    f"- **Povprečna vrednost v obdobju:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{trend_txt}{arch_note_sl}\n\n"
                     f"**Predlogi za nadaljevanje:**\n"
                     f"- *»Napiši kratek povzetek tega trenda za moje poročilo.«*\n"
                     f"- *»Primerjaj {idx} za {place} med {d1[:4]} in {d2[:4]} z interaktivno zaveso.«*"
                 )
             return (
                 f"### **{idx}** Time Series for **{place}** (`{d1}` – `{d2}`)\n\n"
-                f"Processed **{n_d} valid dates** from `{sensor}` (**{res_m} m**, **{crs}**).\n\n"
-                f"- **Period Mean:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`)."
+                f"Processed **{n_d} reliable dates** from `{sensor}` (**{res_m} m**, **{crs}**).\n\n"
+                f"- **Period Mean:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{arch_note_en}"
             )
 
         if kind == "scene_rgb":
@@ -4834,13 +4902,27 @@ def generate_conversational_reply(
                 if is_multi_sensor
                 else ""
             )
+            archive_dates_ctx = (
+                list(analysis_context.get("excluded_archive_dates") or [])
+                if isinstance(analysis_context, dict)
+                else []
+            )
+            archive_instruction = (
+                "\n- **RADIOMETRIC RELIABILITY NOTE**: `excluded_archive_dates` is non-empty "
+                f"({', '.join(archive_dates_ctx[:5])}). Explicitly explain in Methodology/Interpretation that those "
+                "earlier pre-1990 or saturated archive scenes are kept available for visual inspection in the swipe "
+                "comparator, gallery, and Timelapse animation, while the quantitative change map (Δ), trend regression, "
+                "and area-loss statistics are computed strictly from the radiometrically reliable baseline (>= 1990)."
+                if archive_dates_ctx
+                else ""
+            )
             sys_prompt = (
                 f"You are an expert, insightful Geodetic & Remote Sensing (Earth Observation) AI specialist. "
                 f"Write a thorough, complete, well-structured report in clear, natural {lang_name} using clean Markdown.\n"
                 f"A real geodetic / satellite analysis was JUST executed for the user's request. Exact computed results are provided in JSON below.\n"
                 f"Organize your response into these 4 clear sections (with crisp headings in {lang_name}):\n"
                 f"1. **Ozadje dogodka in območja** (or Background & Geographic Context in EN): Concise, insightful geographic/historical context about the analyzed place or event (e.g., Mežiška dolina / Črna na Koroškem during the catastrophic August 2023 floods, Kras karst terrain during July 2022 wildfires, Triglav alpine glaciology, etc.).\n"
-                f"2. **Metodologija in podatki** (Methodology & Data): Exact sensor/dataset used, WHY it was chosen (e.g., Sentinel-1 SAR radar penetrates storm clouds; Sentinel-2 10 m optical; Landsat thermal ST_B10; Copernicus DEM 30 m; GNSS multi-constellation with 360° DEM+S2 obstruction mask), exact acquisition dates, spatial resolution, and projected metric CRS (`EPSG:3794` / local UTM).{fusion_instruction}\n"
+                f"2. **Metodologija in podatki** (Methodology & Data): Exact sensor/dataset used, WHY it was chosen (e.g., Sentinel-1 SAR radar penetrates storm clouds; Sentinel-2 10 m optical; Landsat thermal ST_B10; Copernicus DEM 30 m; GNSS multi-constellation with 360° DEM+S2 obstruction mask), exact acquisition dates, spatial resolution, and projected metric CRS (`EPSG:3794` / local UTM).{fusion_instruction}{archive_instruction}\n"
                 f"3. **Podrobna interpretacija rezultatov** (Detailed Interpretation of Results): Thoroughly explain EVERY key computed number from the JSON (`ha`, `km²`, `%`, min/mean/median/max, severity classes, snowline altitude, slope/relief, UHI cooling delta °C, or PDOP/satellite visibility & optimal windows), what those values physically mean on the ground, AND important scientific limitations/caveats. NEVER invent numbers not present in the JSON.\n"
                 f"4. **Predlogi za nadaljevanje** (Suggested Next Steps): 2–3 concrete follow-up analyses or questions the user can ask next in this chat."
             )

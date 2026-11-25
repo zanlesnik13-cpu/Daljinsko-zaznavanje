@@ -1857,3 +1857,81 @@ def load_copernicus_dem(
         logger.warning("Copernicus DEM 30 m streaming unavailable for bbox %s: %s", bbox_4326, exc)
         return None
 
+
+# ---------------------------------------------------------------------------
+# RADIOMETRIC QUALITY SCORING & RELIABLE BASELINE SELECTION (>= 1990)
+# ---------------------------------------------------------------------------
+MIN_RELIABLE_ANALYSIS_YEAR = 1990
+
+
+def compute_optical_saturation_pct(
+    ds: xr.Dataset | None,
+    sensor: str = SENSOR_S2,
+) -> float:
+    """Estimate % of finite optical pixels clipped/saturated (reflectance >= 0.99 across visible bands).
+
+    Detects bright-snow/glacier detector saturation typical of early Landsat 4/5/7 scenes.
+    Returns ``0.0`` for SAR datasets or when visible bands are unavailable.
+    """
+    if ds is None or str(sensor) == SENSOR_S1:
+        return 0.0
+    vis_bands = [b for b in ("B02", "B03", "B04") if b in ds.data_vars]
+    if not vis_bands:
+        return 0.0
+    try:
+        finite_mask = None
+        sat_mask = None
+        for b in vis_bands:
+            arr = np.asarray(ds[b].values, dtype=np.float32)
+            fin = np.isfinite(arr)
+            sat = fin & (arr >= np.float32(0.99))
+            finite_mask = fin if finite_mask is None else (finite_mask & fin)
+            sat_mask = sat if sat_mask is None else (sat_mask & sat)
+        total_fin = int(np.count_nonzero(finite_mask)) if finite_mask is not None else 0
+        if total_fin <= 0 or sat_mask is None:
+            return 0.0
+        return round(100.0 * float(np.count_nonzero(sat_mask)) / float(total_fin), 2)
+    except Exception:
+        return 0.0
+
+
+def assess_scene_analysis_reliability(
+    date_str: str,
+    sensor_family: str,
+    valid_pct: float,
+    saturated_pct: float = 0.0,
+    *,
+    min_reliable_year: int = MIN_RELIABLE_ANALYSIS_YEAR,
+) -> tuple[bool, str]:
+    """Classify whether a scene is radiometrically reliable for quantitative Δ maps & trends.
+
+    Rules:
+    1. ``year >= 1990`` (pre-1990 Landsat 4/5 TM scenes remain in visual archive stack).
+    2. ``valid_pct >= 80.0`` over the AOI.
+    3. ``saturated_pct <= 5.0`` (visible-band clipping/saturation check).
+
+    Returns ``(analysis_reliable, quality_note)``.
+    """
+    _ = sensor_family  # reserved for future sensor-specific calibration thresholds
+    try:
+        year = int(str(date_str or "").strip()[:4])
+    except Exception:
+        year = 2000
+
+    if year < int(min_reliable_year):
+        return False, "vizualni arhiv (<1990)"
+    if float(saturated_pct) > 5.0 or float(valid_pct) < 80.0:
+        return False, "nasičenost/šum"
+    return True, ""
+
+
+def get_default_reliable_t1_index(frames: Sequence[dict[str, Any]]) -> int:
+    """Return index of the earliest frame with ``analysis_reliable == True`` (falls back to ``0``)."""
+    if not frames:
+        return 0
+    for idx, fr in enumerate(frames):
+        if isinstance(fr, dict) and bool(fr.get("analysis_reliable", True)):
+            return int(idx)
+    return 0
+
+

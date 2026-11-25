@@ -41,7 +41,16 @@ from analize import (
 )
 from geodezija_crs import clip_to_aoi_polygon, get_parallel_workers
 from map_overlay import raster_to_map_overlay_png, render_diverging_change_overlay
-from stac_loader import SENSOR_LANDSAT, SENSOR_S1, SENSOR_S2, StacItemOrGroup, load_scene
+from stac_loader import (
+    SENSOR_LANDSAT,
+    SENSOR_S1,
+    SENSOR_S2,
+    StacItemOrGroup,
+    assess_scene_analysis_reliability,
+    compute_optical_saturation_pct,
+    get_default_reliable_t1_index,
+    load_scene,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +71,9 @@ TIME_SERIES_COLUMNS: list[str] = [
     "valid_pct",
     "valid_pixels",
     "valid_area_ha",
+    "saturated_pct",
+    "analysis_reliable",
+    "quality_note",
 ]
 
 
@@ -304,6 +316,18 @@ def extract_time_series(
                     )
                     continue
 
+                sat_pct = compute_optical_saturation_pct(masked_ds, sensor=sensor)
+                sensor_fam_ts = (
+                    "Landsat (30 m)"
+                    if sensor == SENSOR_LANDSAT
+                    else ("Sentinel-1 SAR" if sensor == SENSOR_S1 else "Sentinel-2 (10–20 m)")
+                )
+                rel_ok, q_note = assess_scene_analysis_reliability(
+                    date_str,
+                    sensor_fam_ts,
+                    valid_pct,
+                    saturated_pct=sat_pct,
+                )
                 row = {
                     "date": pd.Timestamp(dt_utc),
                     "date_str": date_str,
@@ -321,6 +345,9 @@ def extract_time_series(
                     "valid_pct": valid_pct,
                     "valid_pixels": stats["valid_pixels"],
                     "valid_area_ha": stats["valid_area_ha"],
+                    "saturated_pct": sat_pct,
+                    "analysis_reliable": rel_ok,
+                    "quality_note": q_note,
                 }
                 replaced_entry = None
                 if cand_idx > 0:
@@ -1998,6 +2025,7 @@ def build_multidate_visual_frames(
             except Exception as exc:
                 logger.warning("Complementary layer %s skipped for %s: %s", ex_code, act_date, exc)
 
+        sat_pct_fr = compute_optical_saturation_pct(ds_masked, sensor=sensor)
         if ds_masked is not ds_ep:
             del ds_masked
         del ds_ep
@@ -2009,6 +2037,12 @@ def build_multidate_visual_frames(
                 if sensor == SENSOR_LANDSAT
                 else ("Sentinel-1 SAR" if sensor == SENSOR_S1 else "Sentinel-2 (10–20 m)")
             )
+            rel_ok_fr, q_note_fr = assess_scene_analysis_reliability(
+                act_date,
+                sensor_fam,
+                float(clear_pct),
+                saturated_pct=sat_pct_fr,
+            )
             frames.append(
                 {
                     "date": act_date,
@@ -2018,6 +2052,9 @@ def build_multidate_visual_frames(
                     "platform": plat_lbl,
                     "resolution_m": res_int,
                     "clear_pct": round(float(clear_pct), 1),
+                    "saturated_pct": sat_pct_fr,
+                    "analysis_reliable": rel_ok_fr,
+                    "quality_note": q_note_fr,
                     "index_name": idx_key,
                     "index_mean": idx_mean,
                     "bounds_4326": bounds_4326,
@@ -2034,7 +2071,11 @@ def build_multidate_visual_frames(
                 }
             )
 
-    # Pixel-aligned Δ between earliest and latest clear frames (water-aware for NDSI!)
+    # Pixel-aligned Δ between earliest RADIOMETRICALLY RELIABLE (>=1990) and latest clear frames (water-aware for NDSI!)
+    default_t1_idx = get_default_reliable_t1_index(frames)
+    if len(frames) >= 2 and default_t1_idx >= len(frames) - 1:
+        default_t1_idx = 0
+
     diff_da: xr.DataArray | None = None
     delta_uri: str | None = None
     delta_bnds: list[list[float]] | None = None
@@ -2048,7 +2089,7 @@ def build_multidate_visual_frames(
     if len(frames) >= 2:
         try:
             dyn_init = compute_dynamic_frame_delta(
-                frames[0],
+                frames[default_t1_idx],
                 frames[-1],
                 target_epsg=target_epsg,
                 index_name=idx_key,
@@ -2100,6 +2141,7 @@ def build_multidate_visual_frames(
     gc.collect()
     return {
         "frames": frames,
+        "default_t1_index": default_t1_idx,
         "timelapse_rgb_gif_bytes": gif_rgb,
         "timelapse_index_gif_bytes": gif_idx,
         "da_first": da_first,
