@@ -1128,6 +1128,9 @@ def _init_session_state() -> None:
         "ai_chat_results": {},
         "ai_last_analysis_context": None,
         "ai_pending_chat_prompt": None,
+        "ai_pending_rerun_turn": None,
+        "ai_editing_turn_idx": None,
+        "ai_show_all_turns": False,
         "ai_api_verify_result": None,
         "ai_last_map_layout": None,
         # Tab 7 GNSS Mission Planning state
@@ -6455,6 +6458,191 @@ def _resolve_ai_target_carto_layer(target_layer: str, lang: str) -> dict[str, An
     return sources[0] if sources else None
 
 
+KEEP_EXPANDED_TURNS: int = 2
+
+
+def group_ai_chat_turns(chat_messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group flat ``ai_chat_messages`` into logical Q&A turns.
+
+    Each turn dictionary contains:
+    ``turn_idx``, ``user_msg_idx``, ``user_msg``, ``assistant_msg_idx``, ``assistant_msg``.
+    """
+    turns: list[dict[str, Any]] = []
+    for idx, msg in enumerate(chat_messages or []):
+        if not isinstance(msg, dict):
+            continue
+        role = "user" if msg.get("role") == "user" else "assistant"
+        if role == "user":
+            turns.append(
+                {
+                    "turn_idx": len(turns),
+                    "user_msg_idx": idx,
+                    "user_msg": msg,
+                    "assistant_msg_idx": None,
+                    "assistant_msg": None,
+                }
+            )
+        else:
+            if turns and turns[-1].get("assistant_msg") is None:
+                turns[-1]["assistant_msg_idx"] = idx
+                turns[-1]["assistant_msg"] = msg
+            else:
+                turns.append(
+                    {
+                        "turn_idx": len(turns),
+                        "user_msg_idx": None,
+                        "user_msg": None,
+                        "assistant_msg_idx": idx,
+                        "assistant_msg": msg,
+                    }
+                )
+    return turns
+
+
+def build_collapsed_turn_label(
+    turn: dict[str, Any],
+    *,
+    chat_results: dict[str, Any] | None = None,
+    lang: str = "sl",
+    max_prompt_chars: int = 75,
+) -> str:
+    """Build a concise, scannable expander header for an older collapsed AI chat turn."""
+    num = int(turn.get("turn_idx", 0)) + 1
+    user_msg = turn.get("user_msg") or {}
+    asst_msg = turn.get("assistant_msg") or {}
+
+    raw_prompt = " ".join(str(user_msg.get("content") or "").split())
+    if len(raw_prompt) > max_prompt_chars:
+        snippet = raw_prompt[: max(max_prompt_chars - 1, 10)].rstrip() + "…"
+    else:
+        snippet = raw_prompt or "…"
+
+    suffix = ""
+    res_id = asst_msg.get("result_id")
+    res_obj = (chat_results or {}).get(str(res_id)) if res_id else None
+    plan = asst_msg.get("plan") if isinstance(asst_msg.get("plan"), dict) else None
+
+    if isinstance(res_obj, dict) and res_obj.get("kind") == "carto_map":
+        l_cfg = res_obj.get("layout_config") or {}
+        m_title = str(l_cfg.get("title") or res_obj.get("stem") or t("ai_chat_map_badge", lang=lang)).strip()
+        if len(m_title) > 40:
+            m_title = m_title[:39].rstrip() + "…"
+        suffix = f" — 🗺️ {m_title}"
+    elif isinstance(res_obj, dict) or isinstance(plan, dict):
+        place = str(
+            (res_obj or {}).get("resolved_place")
+            or (plan or {}).get("place_name")
+            or ""
+        ).strip()
+        idx_tag = str(
+            (res_obj or {}).get("index_name")
+            or (plan or {}).get("index_name")
+            or (plan or {}).get("task_type")
+            or ""
+        ).strip()
+        s_date = str((plan or {}).get("start_date") or "").strip()
+        e_date = str((plan or {}).get("end_date") or "").strip()
+        period_tag = ""
+        if len(s_date) >= 4 and len(e_date) >= 4:
+            y1, y2 = s_date[:4], e_date[:4]
+            period_tag = y1 if y1 == y2 else f"{y1}–{y2}"
+        elif len(e_date) >= 4:
+            period_tag = e_date[:4]
+
+        meta_parts = [p for p in (idx_tag, period_tag) if p]
+        meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        if place or meta_str:
+            suffix = f" — 🛰️ {place}{meta_str}".rstrip()
+
+    return f'💬 #{num} · "{snippet}"{suffix}'
+
+
+def _render_ai_chat_turn(
+    turn: dict[str, Any],
+    *,
+    target_crs: str,
+    lang: str,
+) -> None:
+    """Render a single AI Q&A turn with inline Edit & Resend controls on the user message."""
+    t_idx = int(turn.get("turn_idx", 0))
+    user_msg = turn.get("user_msg")
+    user_msg_idx = turn.get("user_msg_idx")
+    asst_msg = turn.get("assistant_msg")
+
+    if isinstance(user_msg, dict):
+        user_text = str(user_msg.get("content") or "")
+        with st.chat_message("user"):
+            st.markdown(user_text)
+            if user_msg_idx is not None:
+                _sp_u, col_edit, col_resend = st.columns([6.4, 1.3, 1.3], gap="small")
+                with col_edit:
+                    if st.button(
+                        t("ai_turn_edit_btn", lang=lang),
+                        key=f"edit_btn_{t_idx}",
+                        width="stretch",
+                    ):
+                        st.session_state["ai_editing_turn_idx"] = t_idx
+                        st.rerun()
+                with col_resend:
+                    if st.button(
+                        t("ai_turn_resend_btn", lang=lang),
+                        key=f"resend_btn_{t_idx}",
+                        width="stretch",
+                    ):
+                        st.session_state["ai_editing_turn_idx"] = None
+                        st.session_state["ai_pending_rerun_turn"] = {
+                            "user_msg_idx": int(user_msg_idx),
+                            "prompt": user_text,
+                        }
+                        st.rerun()
+
+                if st.session_state.get("ai_editing_turn_idx") == t_idx:
+                    edited_val = st.text_area(
+                        t("ai_turn_edit_label", lang=lang),
+                        value=user_text,
+                        key=f"edit_ta_{t_idx}",
+                        height=90,
+                    )
+                    ec_send, ec_cancel, _ec_sp = st.columns([2.2, 1.3, 4.5], gap="small")
+                    with ec_send:
+                        if st.button(
+                            t("ai_turn_edit_send", lang=lang),
+                            type="primary",
+                            key=f"edit_submit_{t_idx}",
+                            width="stretch",
+                        ):
+                            clean_ed = str(edited_val or "").strip()
+                            if clean_ed:
+                                st.session_state["ai_editing_turn_idx"] = None
+                                st.session_state["ai_pending_rerun_turn"] = {
+                                    "user_msg_idx": int(user_msg_idx),
+                                    "prompt": clean_ed,
+                                }
+                                st.rerun()
+                    with ec_cancel:
+                        if st.button(
+                            t("ai_turn_edit_cancel", lang=lang),
+                            key=f"edit_cancel_{t_idx}",
+                            width="stretch",
+                        ):
+                            st.session_state["ai_editing_turn_idx"] = None
+                            st.rerun()
+
+    if isinstance(asst_msg, dict):
+        with st.chat_message("assistant"):
+            st.markdown(str(asst_msg.get("content") or ""))
+            fb_chat = str(asst_msg.get("fallback_note") or "").strip()
+            if fb_chat:
+                st.caption(f"ℹ️ {fb_chat}")
+            res_id = asst_msg.get("result_id")
+            if res_id:
+                _render_ai_chat_analysis_fragment(
+                    result_id=str(res_id),
+                    target_crs=target_crs,
+                    lang=lang,
+                )
+
+
 @st.fragment
 def _render_ai_chat_analysis_fragment(
     *,
@@ -8214,6 +8402,98 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
                                 st.rerun()
                             else:
                                 st.error(t(msg_key, lang=lang))
+
+        # Compact Gemini API & Model settings (accessible to both Guests and Logged-in users)
+        _render_sidebar_gemini_settings(lang)
+
+
+def _render_sidebar_gemini_settings(lang: str) -> tuple[str | None, str, str]:
+    """Render the compact collapsible '⚙️ Gemini API in model' panel inside the Sidebar Profile card."""
+    preset_ids: list[str] = [m["id"] for m in GEMINI_MODEL_OPTIONS]
+    mod_lbl_key = "label_en" if lang == "en" else "label_sl"
+    preset_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
+
+    if st.session_state.get("gemini_model") not in preset_ids:
+        st.session_state["gemini_model"] = DEFAULT_GEMINI_MODEL
+
+    with st.expander(t("ai_sidebar_gemini_expander", lang=lang), expanded=False):
+        st.text_input(
+            t("ai_key_input_label", lang=lang),
+            type="password",
+            key="tab6_gemini_key",
+        )
+
+        selected_mod_choice = _touch_selector(
+            t("ai_model_select_label", lang=lang),
+            options=preset_ids,
+            default=DEFAULT_GEMINI_MODEL,
+            format_func=lambda mid: preset_lbl_map.get(mid, mid),
+            key="gemini_model",
+            use_pills=True,
+        )
+
+        custom_mod_id = ""
+        if selected_mod_choice == "custom":
+            custom_mod_id = st.text_input(
+                t("ai_model_custom_label", lang=lang),
+                placeholder=t("ai_model_custom_placeholder", lang=lang),
+                key="gemini_custom_model",
+            )
+
+        effective_gemini_model = resolve_gemini_model_id(
+            str(selected_mod_choice or DEFAULT_GEMINI_MODEL),
+            custom_id=custom_mod_id,
+        )
+        cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
+
+        if cur_api_key:
+            st.caption(t("ai_sidebar_status_active", lang=lang, model=effective_gemini_model))
+        else:
+            st.caption(t("ai_sidebar_status_local", lang=lang))
+
+        if st.button(
+            t("ai_btn_verify_short", lang=lang),
+            width="stretch",
+            key="sb_btn_verify_gemini_key",
+        ):
+            if not cur_api_key:
+                st.session_state["ai_api_verify_result"] = {"status": "need_key"}
+            else:
+                try:
+                    v_res = verify_gemini_api_connection(cur_api_key, model=effective_gemini_model)
+                    st.session_state["ai_api_verify_result"] = {"status": "ok", **v_res}
+                except Exception as exc:
+                    st.session_state["ai_api_verify_result"] = {"status": "err", "error": str(exc)}
+
+        ver_state = st.session_state.get("ai_api_verify_result")
+        if isinstance(ver_state, dict):
+            v_st = ver_state.get("status")
+            if v_st == "need_key":
+                st.warning(t("ai_models_need_key", lang=lang))
+            elif v_st == "ok":
+                if ver_state.get("model_found"):
+                    st.success(
+                        t(
+                            "ai_verify_ok",
+                            lang=lang,
+                            model=ver_state.get("model", effective_gemini_model),
+                            n=int(ver_state.get("total_models", 0)),
+                        )
+                    )
+                else:
+                    st.warning(
+                        t(
+                            "ai_verify_model_missing",
+                            lang=lang,
+                            model=ver_state.get("model", effective_gemini_model),
+                            n=int(ver_state.get("total_models", 0)),
+                            fallback=ver_state.get("fallback", DEFAULT_GEMINI_MODEL),
+                        )
+                    )
+            elif v_st == "err":
+                st.error(t("ai_verify_err", lang=lang, err=ver_state.get("error", "")))
+
+    return cur_api_key, key_src, effective_gemini_model
 
 
 def _render_sidebar_projects_manager(
@@ -11274,18 +11554,35 @@ def main() -> None:
     elif active_ws == "ws_ai":
         _auth_u_ws5 = st.session_state.get("auth_user")
         _ws5_logged_in = isinstance(_auth_u_ws5, dict) and bool(_auth_u_ws5.get("username"))
-        hdr_col, new_col = st.columns([3.5, 1.3], vertical_alignment="bottom")
+
+        # Razreši aktivni Gemini model in ključ iz stranske vrstice (brez podvojenih widgetov)
+        effective_gemini_model = resolve_gemini_model_id(
+            str(st.session_state.get("gemini_model") or DEFAULT_GEMINI_MODEL),
+            custom_id=str(st.session_state.get("gemini_custom_model") or ""),
+        )
+        cur_api_key, _key_src_ws5 = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
+        model_status_pill = (
+            t("ai_ws5_pill_model", lang=lang, model=effective_gemini_model)
+            if cur_api_key
+            else t("ai_ws5_pill_local", lang=lang)
+        )
+
+        hdr_col, new_col = st.columns([3.2, 1.8], vertical_alignment="bottom")
         with hdr_col:
             st.subheader(t("ai_header"))
             st.caption(t("ai_intro"))
         with new_col:
+            pills_html_parts = [f'<span class="geo-badge">{model_status_pill}</span>']
             if _ws5_logged_in:
-                st.markdown(
-                    f'<div style="text-align:right;margin-bottom:4px;">'
+                pills_html_parts.append(
                     f'<span class="geo-badge">{t("ai_chat_cloud_pill", lang=lang)}</span>'
-                    f"</div>",
-                    unsafe_allow_html=True,
                 )
+            st.markdown(
+                '<div style="display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px;margin-bottom:6px;">'
+                + "".join(pills_html_parts)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
             if st.button(
                 t("ai_chat_new_btn"),
                 width="stretch",
@@ -11298,6 +11595,9 @@ def main() -> None:
                 st.session_state["tab6_ai_result"] = None
                 st.session_state["tab6_sent_to_carto"] = False
                 st.session_state["ai_pending_chat_prompt"] = None
+                st.session_state["ai_pending_rerun_turn"] = None
+                st.session_state["ai_editing_turn_idx"] = None
+                st.session_state["ai_show_all_turns"] = False
                 gc.collect()
                 st.rerun()
             if _ws5_logged_in and st.session_state.get("ai_chat_messages"):
@@ -11319,93 +11619,7 @@ def main() -> None:
                     _maybe_auto_save_session()
                     st.toast(t("proj_saved_ok", lang=lang, name=_proj_auto_name))
 
-        # --- 1. Nastavitve Gemini API (čist 6-gumbni izbirnik + kompakten gumb za preverjanje ključa) ---
-        with st.expander(t("ai_api_expander"), expanded=False):
-            # Vrstica 1: API ključ (polna širina)
-            st.text_input(
-                t("ai_key_input_label"),
-                type="password",
-                key="tab6_gemini_key",
-            )
-
-            # Vrstica 2: Čista vrstica 6 modelov (3.8 Flash privzeto | 3.6 Flash | 3.5 Flash | 4 Hydrogen | 2.5 Flash | Po meri)
-            preset_ids: list[str] = [m["id"] for m in GEMINI_MODEL_OPTIONS]
-            mod_lbl_key = "label_en" if lang == "en" else "label_sl"
-            preset_lbl_map = {m["id"]: m[mod_lbl_key] for m in GEMINI_MODEL_OPTIONS}
-
-            if st.session_state.get("gemini_model") not in preset_ids:
-                st.session_state["gemini_model"] = DEFAULT_GEMINI_MODEL
-
-            selected_mod_choice = _touch_selector(
-                t("ai_model_select_label"),
-                options=preset_ids,
-                default=DEFAULT_GEMINI_MODEL,
-                format_func=lambda mid: preset_lbl_map.get(mid, mid),
-                key="gemini_model",
-                use_pills=True,
-            )
-
-            custom_mod_id = ""
-            if selected_mod_choice == "custom":
-                custom_mod_id = st.text_input(
-                    t("ai_model_custom_label"),
-                    placeholder=t("ai_model_custom_placeholder"),
-                    key="gemini_custom_model",
-                )
-
-            effective_gemini_model = resolve_gemini_model_id(
-                str(selected_mod_choice or DEFAULT_GEMINI_MODEL),
-                custom_id=custom_mod_id,
-            )
-
-            # Vrstica 3: Kompakten gumb za preverjanje povezave API ključa (1-vrstična značka — brez 49-gumbne stene!)
-            cur_api_key, key_src = get_active_gemini_api_key(st.session_state.get("tab6_gemini_key"))
-            if st.button(
-                t("ai_btn_verify_key"),
-                width="stretch",
-                key="tab6_btn_verify_key",
-            ):
-                if not cur_api_key:
-                    st.session_state["ai_api_verify_result"] = {"status": "need_key"}
-                else:
-                    try:
-                        v_res = verify_gemini_api_connection(cur_api_key, model=effective_gemini_model)
-                        st.session_state["ai_api_verify_result"] = {"status": "ok", **v_res}
-                    except Exception as exc:
-                        st.session_state["ai_api_verify_result"] = {"status": "err", "error": str(exc)}
-
-            ver_state = st.session_state.get("ai_api_verify_result")
-            if isinstance(ver_state, dict):
-                v_st = ver_state.get("status")
-                if v_st == "need_key":
-                    st.warning(t("ai_models_need_key"))
-                elif v_st == "ok":
-                    if ver_state.get("model_found"):
-                        st.success(
-                            t(
-                                "ai_verify_ok",
-                                model=ver_state.get("model", effective_gemini_model),
-                                n=int(ver_state.get("total_models", 0)),
-                            )
-                        )
-                    else:
-                        st.warning(
-                            t(
-                                "ai_verify_model_missing",
-                                model=ver_state.get("model", effective_gemini_model),
-                                n=int(ver_state.get("total_models", 0)),
-                                fallback=ver_state.get("fallback", DEFAULT_GEMINI_MODEL),
-                            )
-                        )
-                elif v_st == "err":
-                    st.error(t("ai_verify_err", err=ver_state.get("error", "")))
-
-            if cur_api_key:
-                st.success(t("ai_status_gemini", source=key_src, model=effective_gemini_model))
-            else:
-                st.info(t("ai_status_local"))
-
-        # --- 2. Pozdravna kartica + klikabilni začetni primeri (ko je klepet prazen) ---
+        # --- 1. Pozdravna kartica + klikabilni začetni primeri (ko je klepet prazen) ---
         chat_messages: list[dict[str, Any]] = list(st.session_state.get("ai_chat_messages") or [])
         if not chat_messages:
             welcome_html = (
@@ -11433,33 +11647,60 @@ def main() -> None:
                         st.session_state["ai_pending_chat_prompt"] = clean_ex
                         st.rerun()
 
-        # --- 3. Izris celotne zgodovine večkrožnega pogovora (st.chat_message) ---
-        for msg_idx, msg in enumerate(chat_messages):
-            role = "user" if msg.get("role") == "user" else "assistant"
-            with st.chat_message(role):
-                st.markdown(str(msg.get("content") or ""))
-                fb_chat = str(msg.get("fallback_note") or "").strip()
-                if role == "assistant" and fb_chat:
-                    st.caption(f"ℹ️ {fb_chat}")
-                res_id = msg.get("result_id")
-                if role == "assistant" and res_id:
-                    _render_ai_chat_analysis_fragment(
-                        result_id=str(res_id),
-                        target_crs=target_crs,
-                        lang=lang,
-                    )
+        # --- 2. Izris zgodovine večkrožnega pogovora (starejši krogi samodejno strnjeni, zadnja 2 odprta) ---
+        chat_turns = group_ai_chat_turns(chat_messages)
+        total_turns = len(chat_turns)
+        older_count = max(0, total_turns - KEEP_EXPANDED_TURNS)
+        show_all_turns = False
+        if older_count > 0:
+            show_all_turns = st.toggle(
+                t("ai_chat_show_all_turns", lang=lang, n=older_count),
+                key="ai_show_all_turns",
+            )
 
-        # --- 4. Spodnje pripeto vnosno polje za klepet (st.chat_input) ---
+        editing_turn_idx = st.session_state.get("ai_editing_turn_idx")
+        chat_results_map = st.session_state.get("ai_chat_results") or {}
+        for turn in chat_turns:
+            t_idx = int(turn["turn_idx"])
+            if t_idx < total_turns - KEEP_EXPANDED_TURNS:
+                exp_lbl = build_collapsed_turn_label(
+                    turn,
+                    chat_results=chat_results_map,
+                    lang=lang,
+                )
+                with st.expander(exp_lbl, expanded=bool(show_all_turns or editing_turn_idx == t_idx)):
+                    _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+            else:
+                _render_ai_chat_turn(turn, target_crs=target_crs, lang=lang)
+
+        # --- 3. Spodnje pripeto vnosno polje za klepet (st.chat_input) + obdelava Uredi/Ponovi ---
         typed_prompt = st.chat_input(
             t("ai_chat_input_placeholder"),
             key="ws5_ai_chat_input",
         )
+        pending_rerun = st.session_state.pop("ai_pending_rerun_turn", None)
         pending_starter = st.session_state.pop("ai_pending_chat_prompt", None)
-        incoming_prompt = str(pending_starter or typed_prompt or "").strip()
+
+        if isinstance(pending_rerun, dict) and str(pending_rerun.get("prompt") or "").strip():
+            incoming_prompt = str(pending_rerun["prompt"]).strip()
+            cut_idx = max(0, int(pending_rerun.get("user_msg_idx", len(chat_messages))))
+            prior_history = list(st.session_state.get("ai_chat_messages") or [])[:cut_idx]
+            restored_ctx = None
+            res_store_cur = st.session_state.get("ai_chat_results") or {}
+            for prev_m in reversed(prior_history):
+                p_rid = prev_m.get("result_id")
+                if p_rid and p_rid in res_store_cur:
+                    p_obj = res_store_cur[p_rid]
+                    if isinstance(p_obj, dict) and isinstance(p_obj.get("analysis_context"), dict):
+                        restored_ctx = p_obj["analysis_context"]
+                        break
+            st.session_state["ai_last_analysis_context"] = restored_ctx
+        else:
+            incoming_prompt = str(pending_starter or typed_prompt or "").strip()
+            prior_history = list(st.session_state.get("ai_chat_messages") or [])
 
         if incoming_prompt:
             # Zapiši uporabnikovo sporočilo v zgodovino in ga takoj prikaži
-            prior_history = list(st.session_state.get("ai_chat_messages") or [])
             st.session_state["ai_chat_messages"] = prior_history + [
                 {"role": "user", "content": incoming_prompt}
             ]

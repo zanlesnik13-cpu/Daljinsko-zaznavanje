@@ -3798,7 +3798,7 @@ def _generate_local_conversational_reply(
                     f"\n*Kontekst zadnje analize ({analysis_context.get('resolved_place')}):* povprečje **{analysis_context.get('index_name')} = {st_c.get('mean', 0):.3f}**, veljavna površina **{st_c.get('valid_area_ha', 0):,.2f} ha**."
                 )
         parts.append(
-            "\n\n*ℹ️ Za popolno generativno razpravo v naravnem jeziku vnesite brezplačen Google Gemini API ključ v zgornjih nastavitvah (`⚙️ Nastavitve Gemini API`).*"
+            "\n\n*ℹ️ Za popolno generativno razpravo v naravnem jeziku vnesite brezplačen Google Gemini API ključ v stranski vrstici (`⚙️ Gemini API in model`).*"
         )
         return "\n".join(parts)
 
