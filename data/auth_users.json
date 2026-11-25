@@ -1,0 +1,16 @@
+{
+  "users": {
+    "zan123": {
+      "created_at": "2026-11-25T16:51:26Z",
+      "display_name": "Žan Rezar Lesnik",
+      "password_hash": "pbkdf2_sha256$120000$93d74f174b82bc4772a9dc22d66ed811$d98fdad2303c0c2ef00c07f3bb3896d30cc9a51ecd436ce9146cfce8b804470a",
+      "username": "zan123"
+    },
+    "zan123x": {
+      "created_at": "2026-11-25T09:20:47Z",
+      "display_name": "Žan Rezar Lesnik",
+      "password_hash": "pbkdf2_sha256$120000$fbe7f3be769aa563d78838886bbb036d$324b691be777aa0a5758fd8ca3e6d9e1c7eb48239f33402652cf9f800ea0c606",
+      "username": "zan123x"
+    }
+  }
+}
