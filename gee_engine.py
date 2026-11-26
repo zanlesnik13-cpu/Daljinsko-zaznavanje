@@ -24,6 +24,7 @@ import re
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -571,31 +572,59 @@ def gee_compute_index(image: Any, index_code: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Server-Side Harmonized Collection Builders
+# Server-Side Harmonized Collection Builders (Gap-Free Multi-Tile Composites)
 # ---------------------------------------------------------------------------
+def _build_gap_free_median(
+    col: Any,
+    cloud_prop: str,
+    mask_fn: Callable[[Any], Any],
+    raw_prep_fn: Callable[[Any], Any] | None = None,
+) -> Any:
+    """Build a two-tier cloud-filtered gap-free ``.median()`` composite across ALL tiles.
+
+    NEVER calls global ``.sort().limit(...)`` across the AOI, which would select all scenes
+    from a single corner MGRS/WRS-2 tile and leave the rest of a multi-tile AOI black.
+
+    - Tier 1: Cloud-masked median of scenes with ``cloud_prop < 30%`` across all tiles.
+    - Tier 2: Cloud-masked median of scenes with ``cloud_prop < 75%`` across all tiles.
+    - Tier 3 (optional): Unmasked median of scenes with ``cloud_prop < 40%`` to eliminate
+      any rare residual single-pixel cloud holes in tough tropical years.
+    """
+    tier1 = col.filter(ee.Filter.lt(cloud_prop, 30)).map(mask_fn).median()
+    tier2 = col.filter(ee.Filter.lt(cloud_prop, 75)).map(mask_fn).median()
+    composite = tier1.unmask(tier2)
+    if raw_prep_fn is not None:
+        raw_fallback = col.filter(ee.Filter.lt(cloud_prop, 40)).map(raw_prep_fn).median()
+        composite = composite.unmask(raw_fallback)
+    return composite
+
+
 def _gee_s2_composite(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, int]:
-    """Build fast cloud-masked Sentinel-2 SR Harmonized seasonal median composite (sorted & limited)."""
-    img, col_sz = _gee_s2_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    """Build gap-free cloud-masked Sentinel-2 SR Harmonized seasonal median composite."""
+    img, col_sz = _gee_s2_composite_lazy(region, start_iso, end_iso)
     cnt = int(col_sz.getInfo())
     if cnt == 0:
         return None, 0
-    return img, min(cnt, int(max_scenes))
+    return img, cnt
 
 
 def _gee_s2_composite_lazy(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, Any]:
-    """Pure server-side lazy S2 composite (NO .getInfo() round-trip; .sort().limit(6) before median)."""
+    """Pure server-side lazy S2 composite (NO .getInfo(), NO global .limit(); two-tier gap-free median)."""
+    def _scale_s2(img: Any) -> Any:
+        return (
+            img.select(["B2", "B3", "B4", "B8", "B11", "B12"], ["blue", "green", "red", "nir", "swir16", "swir22"])
+            .multiply(0.0001)
+            .clamp(0.0, 1.0)
+        )
+
     def _prep_s2(img: Any) -> Any:
         scl = img.select("SCL")
         mask = (
@@ -605,31 +634,24 @@ def _gee_s2_composite_lazy(
             .And(scl.neq(9))
             .And(scl.neq(10))
         )
-        optical = (
-            img.select(["B2", "B3", "B4", "B8", "B11", "B12"], ["blue", "green", "red", "nir", "swir16", "swir22"])
-            .multiply(0.0001)
-            .clamp(0.0, 1.0)
-        )
-        return optical.updateMask(mask)
+        return _scale_s2(img).updateMask(mask)
 
-    filtered = (
+    col = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
         .filterDate(start_iso, end_iso)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
     )
-    limited = filtered.sort("CLOUDY_PIXEL_PERCENTAGE").limit(int(max_scenes)).map(_prep_s2)
-    return limited.median().clip(region), filtered.size()
+    filtered_cnt = col.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 75)).size()
+    composite = _build_gap_free_median(col, "CLOUDY_PIXEL_PERCENTAGE", _prep_s2, raw_prep_fn=_scale_s2)
+    return composite.clip(region), filtered_cnt
 
 
 def _gee_landsat_composite_lazy(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, Any, str]:
-    """Pure server-side lazy Landsat C2 L2 composite (NO .getInfo() round-trip; .sort().limit(6) before median)."""
+    """Pure server-side lazy Landsat C2 L2 composite (NO .getInfo(), NO global .limit(); two-tier gap-free median)."""
     def _mask_qa(img: Any) -> Any:
         qa = img.select("QA_PIXEL")
         return (
@@ -638,8 +660,8 @@ def _gee_landsat_composite_lazy(
             .And(qa.bitwiseAnd(1 << 4).eq(0))
         )
 
-    def _prep_l57(img: Any) -> Any:
-        opt = (
+    def _scale_l57(img: Any) -> Any:
+        return (
             img.select(
                 ["SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"],
                 ["blue", "green", "red", "nir", "swir16", "swir22"],
@@ -648,10 +670,12 @@ def _gee_landsat_composite_lazy(
             .add(-0.2)
             .clamp(0.0, 1.0)
         )
-        return opt.updateMask(_mask_qa(img))
 
-    def _prep_l89(img: Any) -> Any:
-        opt = (
+    def _prep_l57(img: Any) -> Any:
+        return _scale_l57(img).updateMask(_mask_qa(img))
+
+    def _scale_l89(img: Any) -> Any:
+        return (
             img.select(
                 ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
                 ["blue", "green", "red", "nir", "swir16", "swir22"],
@@ -660,7 +684,9 @@ def _gee_landsat_composite_lazy(
             .add(-0.2)
             .clamp(0.0, 1.0)
         )
-        return opt.updateMask(_mask_qa(img))
+
+    def _prep_l89(img: Any) -> Any:
+        return _scale_l89(img).updateMask(_mask_qa(img))
 
     yr = int(start_iso[:4])
     if yr >= 2013:
@@ -675,6 +701,7 @@ def _gee_landsat_composite_lazy(
             )
         )
         prep_fn = _prep_l89
+        raw_fn = _scale_l89
         plat = "Landsat-8/9"
     else:
         raw_col = (
@@ -688,36 +715,33 @@ def _gee_landsat_composite_lazy(
             )
         )
         prep_fn = _prep_l57
+        raw_fn = _scale_l57
         plat = "Landsat-5/7"
 
-    filtered = raw_col.filter(ee.Filter.lt("CLOUD_COVER", 60))
-    limited = filtered.sort("CLOUD_COVER").limit(int(max_scenes)).map(prep_fn)
-    return limited.median().clip(region), filtered.size(), plat
+    filtered_cnt = raw_col.filter(ee.Filter.lt("CLOUD_COVER", 75)).size()
+    composite = _build_gap_free_median(raw_col, "CLOUD_COVER", prep_fn, raw_prep_fn=raw_fn)
+    return composite.clip(region), filtered_cnt, plat
 
 
 def _gee_landsat_composite(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, int, str]:
-    """Build fast cloud-masked Landsat C2 L2 seasonal median composite (sorted & limited to 6 scenes)."""
-    img, col_sz, plat = _gee_landsat_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    """Build gap-free cloud-masked Landsat C2 L2 seasonal median composite."""
+    img, col_sz, plat = _gee_landsat_composite_lazy(region, start_iso, end_iso)
     cnt = int(col_sz.getInfo())
     if cnt == 0:
         return None, 0, plat
-    return img, min(cnt, int(max_scenes)), plat
+    return img, cnt, plat
 
 
 def _gee_modis_composite_lazy(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, Any]:
-    """Pure server-side lazy MODIS MOD09A1 composite (NO .getInfo() round-trip; .limit(6))."""
+    """Pure server-side lazy MODIS MOD09A1 composite (NO .getInfo() round-trip, NO global .limit())."""
     def _prep_modis(img: Any) -> Any:
         return (
             img.select(
@@ -733,23 +757,20 @@ def _gee_modis_composite_lazy(
         .filterBounds(region)
         .filterDate(start_iso, end_iso)
     )
-    limited = col.limit(int(max_scenes)).map(_prep_modis)
-    return limited.median().clip(region), col.size()
+    return col.map(_prep_modis).median().clip(region), col.size()
 
 
 def _gee_modis_composite(
     region: Any,
     start_iso: str,
     end_iso: str,
-    *,
-    max_scenes: int = 6,
 ) -> tuple[Any, int]:
     """Build Terra MODIS MOD09A1 500 m 8-day SR seasonal median composite."""
-    img, col_sz = _gee_modis_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    img, col_sz = _gee_modis_composite_lazy(region, start_iso, end_iso)
     cnt = int(col_sz.getInfo())
     if cnt == 0:
         return None, 0
-    return img, min(cnt, int(max_scenes))
+    return img, cnt
 
 
 def _build_batched_yearly_stats_fc(
@@ -792,28 +813,40 @@ def _build_batched_yearly_stats_fc(
 
 
 def _season_date_window(year: int, target_season: str, center_lat: float) -> tuple[str, str]:
-    """Return ``(start_iso, end_iso)`` for the target season (hemisphere & tropical dry-season aware)."""
+    """Return ``(start_iso, end_iso)`` for the target season (hemisphere, tropical dry-season & current-year aware)."""
     s = str(target_season or "summer").strip().lower()
     if s == "glacier_ablation":
         if center_lat < -20.0:
-            return f"{year}-01-10", f"{year}-03-15"
-        return f"{year}-07-15", f"{year}-09-15"
-    if s == "winter":
-        return f"{year}-01-01", f"{year}-03-31"
-    if s == "spring":
-        return f"{year}-04-01", f"{year}-06-15"
-    if s == "autumn":
-        return f"{year}-09-15", f"{year}-11-30"
-    if center_lat <= -55.0:
+            start_iso, end_iso = f"{year}-01-10", f"{year}-03-15"
+        else:
+            start_iso, end_iso = f"{year}-07-15", f"{year}-09-15"
+    elif s == "winter":
+        start_iso, end_iso = f"{year}-01-01", f"{year}-03-31"
+    elif s == "spring":
+        start_iso, end_iso = f"{year}-04-01", f"{year}-06-15"
+    elif s == "autumn":
+        start_iso, end_iso = f"{year}-09-15", f"{year}-11-30"
+    elif center_lat <= -55.0:
         # Antarctic austral summer
-        return f"{year}-01-01", f"{year}-03-15"
-    if s == "dry" or (-25.0 < center_lat < 5.0):
-        # Southern/Equatorial tropical dry season (Amazon Basin: Jul 1 – Oct 15) for cloud-free composites
-        return f"{year}-07-01", f"{year}-10-15"
-    if center_lat <= -25.0:
-        return f"{year}-01-01", f"{year}-03-31"
-    # Default Northern Hemisphere summer
-    return f"{year}-06-15", f"{year}-09-15"
+        start_iso, end_iso = f"{year}-01-01", f"{year}-03-15"
+    elif s == "dry" or (-25.0 < center_lat < 5.0):
+        # Southern/Equatorial tropical dry season (Amazon / Rondônia: Jun 1 – Oct 15, 4.5 months)
+        start_iso, end_iso = f"{year}-06-01", f"{year}-10-15"
+    elif center_lat <= -25.0:
+        start_iso, end_iso = f"{year}-01-01", f"{year}-03-31"
+    else:
+        # Default Northern Hemisphere summer
+        start_iso, end_iso = f"{year}-06-15", f"{year}-09-15"
+
+    # Clamp current-year end_date to today UTC so GEE never queries future dates
+    now_utc = datetime.now(timezone.utc)
+    if int(year) >= now_utc.year:
+        today_iso = now_utc.strftime("%Y-%m-%d")
+        if end_iso > today_iso:
+            end_iso = today_iso
+        if start_iso >= end_iso:
+            start_iso = f"{now_utc.year}-01-01"
+    return start_iso, end_iso
 
 
 def select_gee_scale_for_area(area_km2: float, sensor_mode: str = "auto_fusion") -> int:
@@ -1009,7 +1042,8 @@ def gee_run_temporal_analysis(
     """Run fast server-side multi-year compositing, batched stats, parallel thumbnails & Δ stats on GEE.
 
     Architecture (typically ~15–25 s total):
-        1. Builds lazy server-side `.sort(cloud).limit(6).median()` composites for <= 7 sampled years.
+        1. Builds lazy server-side two-tier gap-free ``.median().unmask(...)`` composites across
+           ALL tiles (no global ``.limit()``) for <= 7 sampled years.
         2. Evaluates ALL yearly mean/median stats + scene counts in ONE batched ``ee.FeatureCollection.getInfo()``.
         3. Fetches lightweight 480 px thumbnails concurrently via ``ThreadPoolExecutor(max_workers=4)``,
            prioritizing ``t1`` (earliest reliable) and ``t2`` (latest) first, omitting redundant
@@ -1076,13 +1110,13 @@ def gee_run_temporal_analysis(
         mid_date = f"{yr}-08-01" if center_lat >= -20.0 else f"{yr}-02-01"
 
         if (sensor_mode == "modis" or use_modis_post_2000) and yr >= 2000:
-            comp_img, col_sz = _gee_modis_composite_lazy(region, w_start, w_end, max_scenes=6)
+            comp_img, col_sz = _gee_modis_composite_lazy(region, w_start, w_end)
             plat_lbl, sensor_fam = "MODIS Terra", "MODIS (500 m)"
         elif sensor_mode == "sentinel2" or (sensor_mode == "auto_fusion" and yr >= 2017):
-            comp_img, col_sz = _gee_s2_composite_lazy(region, w_start, w_end, max_scenes=6)
+            comp_img, col_sz = _gee_s2_composite_lazy(region, w_start, w_end)
             plat_lbl, sensor_fam = "Sentinel-2", "Sentinel-2 (10–20 m)"
         else:
-            comp_img, col_sz, plat_lbl = _gee_landsat_composite_lazy(region, w_start, w_end, max_scenes=6)
+            comp_img, col_sz, plat_lbl = _gee_landsat_composite_lazy(region, w_start, w_end)
             sensor_fam = "Landsat (30 m)"
 
         idx_img = gee_compute_index(comp_img, idx_key)
