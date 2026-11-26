@@ -274,27 +274,36 @@ _CONTINENTAL_POLAR_REGIONS: tuple[tuple[tuple[str, ...], str, float, float, int,
         ("grenland", "greenland", "jakobshavn", "ilulissat", "sermeq"),
         "Greenland Ice Sheet",
         72.0,
-        -40.0,
-        550_000,
+        -41.0,
+        750_000,
         1000,
         "NDSI",
     ),
     (
         ("antarktik", "antarctic", "thwaites", "pine island", "larsen"),
-        "West Antarctica (Thwaites / Peninsula)",
-        -75.0,
-        -106.0,
-        550_000,
+        "Antarctica (West Antarctic Ice Sheet)",
+        -75.5,
+        -90.0,
+        900_000,
         1000,
         "NDSI",
     ),
     (
-        ("amazon", "rondoni", "amazonsk"),
+        ("rondoni",),
         "Amazon Rainforest (Rondônia, Brazil)",
         -10.5,
         -62.5,
-        220_000,
+        250_000,
         500,
+        "NDVI",
+    ),
+    (
+        ("amazon", "amazonsk"),
+        "Amazon Rainforest Basin",
+        -6.5,
+        -62.0,
+        950_000,
+        1000,
         "NDVI",
     ),
 )
@@ -319,19 +328,25 @@ _KNOWN_GLOBAL_LANDMARKS: tuple[tuple[tuple[str, ...], str, float, float], ...] =
         ("grenland", "greenland", "jakobshavn"),
         "Greenland Ice Sheet",
         72.0,
-        -40.0,
+        -41.0,
     ),
     (
         ("antarktik", "antarctic", "thwaites"),
-        "West Antarctica (Thwaites / Peninsula)",
-        -75.0,
-        -106.0,
+        "Antarctica (West Antarctic Ice Sheet)",
+        -75.5,
+        -90.0,
     ),
     (
-        ("amazon", "rondoni", "amazonsk"),
+        ("rondoni",),
         "Amazon Rainforest (Rondônia, Brazil)",
         -10.5,
         -62.5,
+    ),
+    (
+        ("amazon", "amazonsk"),
+        "Amazon Rainforest Basin",
+        -6.5,
+        -62.0,
     ),
     (
         ("starbase", "boca chic", "spacex", "sapacex"),
@@ -903,10 +918,14 @@ def validate_and_normalize_plan(
     if sensor not in VALID_SENSORS:
         sensor = SENSOR_S2
 
+    gee_now = is_gee_ready()
     if cont_hit is not None or sensor in MODIS_SENSORS:
         sensor = SENSOR_MODIS_LST if index_name == "LST" else SENSOR_MODIS_SR
-        if start_d < date(2000, 2, 18):
+        # With GEE active, Landsat C2 L2 + S2/MODIS supports 1990+; without GEE, MODIS starts 2000-02-18
+        if not gee_now and start_d < date(2000, 2, 18):
             start_d = date(2000, 2, 18)
+        elif gee_now and start_d < date(1984, 1, 1):
+            start_d = date(1990, 1, 1)
         if cont_hit is not None and not raw_plan.get("index_name"):
             index_name = cont_hit[5]
     elif task_type == "disaster_flood" or index_name == "VV":
@@ -929,10 +948,11 @@ def validate_and_normalize_plan(
         radius_m = int(round(float(raw_plan.get("radius_m", cont_hit[3] if cont_hit else 4000))))
     except Exception:
         radius_m = cont_hit[3] if cont_hit else 4000
-    if is_modis_plan:
+    if is_modis_plan or cont_hit is not None:
         if cont_hit is not None and radius_m < 50_000:
             radius_m = cont_hit[3]
-        radius_m = int(np.clip(radius_m, 25_000, 1_200_000))
+        max_cont_r = 1_500_000 if gee_now else 1_200_000
+        radius_m = int(np.clip(radius_m, 25_000, max_cont_r))
     else:
         radius_m = int(np.clip(radius_m, 500, 12_000))
 
@@ -1303,9 +1323,13 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
     ) or is_expansion_change or ((end_d - start_d).days >= 400 and not (is_flood or is_fire or is_forest or is_change or is_dem or is_gnss))
 
     # If user asks about multi-year growth/expansion/retreat without explicit years, use a multi-year window
-    if (is_expansion_change or "skozi let" in norm_q or "over the years" in norm_q) and (end_d - start_d).days < 365:
+    _cont_local_hit = _detect_continental_polar_region(norm_q)
+    if (is_expansion_change or _cont_local_hit is not None or "skozi let" in norm_q or "over the years" in norm_q) and (end_d - start_d).days < 365:
         today_d = date.today()
-        if any(k in norm_q for k in ("ledenik", "glacier", "pasterz", "aral")):
+        if _cont_local_hit is not None:
+            start_d = date(1990, 1, 1) if is_gee_ready() else date(2000, 2, 18)
+            is_expansion_change = True
+        elif any(k in norm_q for k in ("ledenik", "glacier", "pasterz", "aral")):
             start_d = date(1985, 1, 1)
         else:
             start_d = date(2018, 1, 1)
@@ -3801,9 +3825,9 @@ Return STRICT JSON ONLY (no markdown fences) with this exact schema:
     "location": string (same unambiguous full place name),
     "lat": number | null (exact WGS84 latitude whenever you know the landmark/place, e.g. 25.9972 for SpaceX Starbase, 46.0569 for Ljubljana),
     "lon": number | null (exact WGS84 longitude whenever you know the landmark/place, e.g. -97.1561 for SpaceX Starbase, 14.5058 for Ljubljana),
-    "radius_m": integer (1000 to 10000, default 4000, use 5000-6000 for floods/wildfires),
-    "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc",
-    "sensors": ["sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc" | "cop-dem-glo-30"],
+    "radius_m": integer (1000 to 12000 for local sites, OR 200000 to 1200000 for regional/continental analyses such as Amazon, Greenland, Antarctica),
+    "sensor": "sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc" | "modis-09A1-061" | "modis-11A2-061",
+    "sensors": ["sentinel-2-l2a" | "landsat-c2-l2" | "sentinel-1-rtc" | "modis-09A1-061" | "cop-dem-glo-30"],
     "fusion_mode": "single" | "temporal_landsat_s2" | "synergy_sar_optical" | "synergy_optical_thermal" | "synergy_optical_dem",
     "fusion_rationale_sl": string (why these satellite systems were combined, empty if single),
     "fusion_rationale_en": string (why these satellite systems were combined, empty if single),
@@ -3814,11 +3838,17 @@ Return STRICT JSON ONLY (no markdown fences) with this exact schema:
     "end_date": "YYYY-MM-DD",
     "event_date": "YYYY-MM-DD",
     "interval": "Vsi posnetki" | "Vsakih 14 dni" | "Mesečno" | "Sezonsko (3 mes.)" | "Letno",
-    "resolution_m": 10 | 20 | 30 | 60,
+    "resolution_m": 10 | 20 | 30 | 60 | 500 | 1000,
+    "engine": "gee" | "stac",
     "explanation_sl": string (concise 1-2 sentence Slovenian plan note),
     "explanation_en": string (concise 1-2 sentence English plan note)
   }
 }
+
+CRITICAL CONTINENTAL & GOOGLE EARTH ENGINE (GEE) RULE:
+- NEVER return "ask_clarification" or refuse because a region is too large (Amazon rainforest, Greenland, Antarctica, Alps, Sahara, Slovenia)!
+- When GEE_ACTIVE=true: Execute continental/regional analyses DIRECTLY with action="run_analysis", task_type="time_series_and_comparison", engine="gee", large radius (Amazon Basin: lat=-6.5, lon=-62.0, radius_m=950000; Greenland: lat=72.0, lon=-41.0, radius_m=750000; Antarctica: lat=-75.5, lon=-90.0, radius_m=900000), and when the user says "skozi leta" / "over the years" without exact dates, automatically use start_date="1990-01-01" to today!
+- When GEE_ACTIVE=false: STILL execute continental queries directly (NEVER refuse!) using sensor="modis-09A1-061", engine="stac", start_date="2000-02-18" to today!
 
 ALL 11 SUPPORTED TASK TYPES FOR "run_analysis":
 - "disaster_flood": Floods/inundation/radar -> sensor="sentinel-1-rtc", index_name="VV".
@@ -4559,6 +4589,42 @@ def _route_user_message_local(
     }
 
 
+def _build_continental_gee_override_route(
+    message: str,
+    *,
+    lang: str = "sl",
+    used_model: str | None = None,
+    fb_sl: str = "",
+    fb_en: str = "",
+) -> dict[str, Any]:
+    """Deterministic continental route override so Amazon/Greenland/Antarctica NEVER get refused with clarify."""
+    raw_local = parse_eo_request_local(message)
+    raw_local["task_type"] = "time_series_and_comparison"
+    raw_local["include_comparison"] = True
+    plan = validate_and_normalize_plan(raw_local, engine="local", query=message)
+    plan["engine"] = "gee" if is_gee_ready() else "stac"
+    plan["user_query"] = message
+    plan["gemini_model"] = used_model
+    plan["fallback_note_sl"] = fb_sl
+    plan["fallback_note_en"] = fb_en
+    return {
+        "action": "run_analysis",
+        "intent": "run_analysis",
+        "plan": plan,
+        "fusion_mode": plan.get("fusion_mode", FUSION_SINGLE),
+        "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_MODIS_SR)]),
+        "fusion_rationale": plan.get("fusion_rationale_en" if lang == "en" else "fusion_rationale_sl", ""),
+        "layout_overrides": None,
+        "target_layer": "latest_ai",
+        "reset_layout": False,
+        "clarification_question": None,
+        "engine": "gee" if is_gee_ready() else "local",
+        "gemini_model": used_model,
+        "fallback_note_sl": fb_sl,
+        "fallback_note_en": fb_en,
+    }
+
+
 def route_user_message(
     message: str,
     chat_history: Sequence[dict[str, Any]] | None = None,
@@ -4570,6 +4636,8 @@ def route_user_message(
     lang: str = "sl",
 ) -> dict[str, Any]:
     """Route a user chat message into ``'run_analysis'``, ``'generate_map'``, ``'ask_clarification'``, or ``'chat_qa'``."""
+    gee_active = is_gee_ready()
+    cont_msg_hit = _detect_continental_polar_region(message)
     resolved_key, _ = get_active_gemini_api_key(api_key)
     if resolved_key:
         history_lines: list[str] = []
@@ -4590,6 +4658,7 @@ def route_user_message(
         lang_hint = "Slovenian" if lang == "sl" else "English"
         user_blob = (
             f"Today is {date.today().isoformat()}. Preferred language: {lang_hint}.\n"
+            f"GEE_ACTIVE={str(gee_active).lower()} (Google Earth Engine server-side backend for continental regions).\n"
             f"Last executed analysis context: {ctx_snippet}\n"
             f"Current active MapLayoutConfig: {map_snippet}\n"
             f"Recent chat history:\n" + ("\n".join(history_lines) if history_lines else "(empty)") + "\n\n"
@@ -4641,6 +4710,11 @@ def route_user_message(
                     raw_pl["task_type"] = "time_series_and_comparison"
                     raw_pl["include_comparison"] = True
                 plan = validate_and_normalize_plan(raw_pl, engine="gemini", query=message)
+                if gee_active and (cont_msg_hit is not None or _sfloat(plan.get("radius_m"), 0.0) >= 40_000.0):
+                    plan["engine"] = "gee"
+                else:
+                    plan["engine"] = str(raw_pl.get("engine") or "stac")
+                plan["user_query"] = message
                 plan["gemini_model"] = used_model
                 plan["fallback_note_sl"] = fb_sl
                 plan["fallback_note_en"] = fb_en
@@ -4655,12 +4729,17 @@ def route_user_message(
                     "target_layer": "latest_ai",
                     "reset_layout": False,
                     "clarification_question": None,
-                    "engine": "gemini",
+                    "engine": "gee" if plan.get("engine") == "gee" else "gemini",
                     "gemini_model": used_model,
                     "fallback_note_sl": fb_sl,
                     "fallback_note_en": fb_en,
                 }
             if action == "ask_clarification":
+                # Post-routing safeguard: NEVER refuse continental/polar queries (Amazon, Greenland, Antarctica)!
+                if cont_msg_hit is not None:
+                    return _build_continental_gee_override_route(
+                        message, lang=lang, used_model=used_model, fb_sl=fb_sl, fb_en=fb_en
+                    )
                 clar_q = str(parsed.get("clarification_question") or "").strip()
                 if clar_q:
                     return {
@@ -4691,6 +4770,9 @@ def route_user_message(
             }
         except Exception:
             pass
+
+    if cont_msg_hit is not None:
+        return _build_continental_gee_override_route(message, lang=lang)
 
     return _route_user_message_local(
         message,

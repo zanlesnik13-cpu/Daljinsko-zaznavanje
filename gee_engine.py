@@ -697,7 +697,7 @@ def _gee_modis_composite(region: Any, start_iso: str, end_iso: str) -> tuple[Any
 
 
 def _season_date_window(year: int, target_season: str, center_lat: float) -> tuple[str, str]:
-    """Return ``(start_iso, end_iso)`` for the target season (hemisphere-aware)."""
+    """Return ``(start_iso, end_iso)`` for the target season (hemisphere & tropical dry-season aware)."""
     s = str(target_season or "summer").strip().lower()
     if s == "glacier_ablation":
         if center_lat < -20.0:
@@ -709,13 +709,55 @@ def _season_date_window(year: int, target_season: str, center_lat: float) -> tup
         return f"{year}-04-01", f"{year}-06-15"
     if s == "autumn":
         return f"{year}-09-15", f"{year}-11-30"
-    if s == "dry" or center_lat < -5.0:
-        # Southern hemisphere dry/summer window (Jun–Sep for Amazon dry season, Jan–Mar for Antarctica)
-        if center_lat <= -55.0:
-            return f"{year}-01-01", f"{year}-03-15"
-        return f"{year}-06-15", f"{year}-09-30"
+    if center_lat <= -55.0:
+        # Antarctic austral summer
+        return f"{year}-01-01", f"{year}-03-15"
+    if s == "dry" or (-25.0 < center_lat < 5.0):
+        # Southern/Equatorial tropical dry season (Amazon Basin: Jul 1 – Oct 15) for cloud-free composites
+        return f"{year}-07-01", f"{year}-10-15"
+    if center_lat <= -25.0:
+        return f"{year}-01-01", f"{year}-03-31"
     # Default Northern Hemisphere summer
     return f"{year}-06-15", f"{year}-09-15"
+
+
+def select_gee_scale_and_mode(
+    bbox_4326: Sequence[float],
+    sensor_mode: str = "auto_fusion",
+) -> dict[str, Any]:
+    """Compute approximate AOI area in km² and pick a timeout-safe GEE server-side scale & tileScale.
+
+    - ``area <= 25,000 km²``: ``scale_m = 30``, ``tile_scale = 2``, ``thumb_dim = 768``
+    - ``25,000 < area <= 250,000 km²``: ``scale_m = 100``, ``tile_scale = 2``, ``thumb_dim = 768``
+    - ``250,000 < area <= 1,500,000 km²``: ``scale_m = 500``, ``tile_scale = 4``, ``thumb_dim = 700``
+    - ``area > 1,500,000 km²`` (Amazon Basin, Greenland, Antarctica): ``scale_m = 1000``,
+      ``tile_scale = 4``, ``thumb_dim = 640`` (uses MODIS 2000+ / Landsat <2000 when > 2M km²)
+    """
+    min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox_4326]
+    center_lat = 0.5 * (min_lat + max_lat)
+    h_km = abs(max_lat - min_lat) * 111.32
+    w_km = abs(max_lon - min_lon) * 111.32 * max(0.12, float(np.cos(np.radians(center_lat))))
+    area_km2 = max(1.0, h_km * w_km)
+
+    if area_km2 > 1_500_000.0:
+        scale_m, tile_scale, thumb_dim = 1000, 4, 640
+    elif area_km2 > 250_000.0:
+        scale_m, tile_scale, thumb_dim = 500, 4, 700
+    elif area_km2 > 25_000.0:
+        scale_m, tile_scale, thumb_dim = 100, 2, 768
+    else:
+        scale_m, tile_scale, thumb_dim = 30, 2, 768
+
+    if sensor_mode == "modis":
+        scale_m = max(scale_m, 500)
+    use_modis_post_2000 = bool(sensor_mode == "modis" or (sensor_mode == "auto_fusion" and area_km2 > 2_000_000.0))
+    return {
+        "area_km2": round(area_km2, 1),
+        "scale_m": int(scale_m),
+        "tile_scale": int(tile_scale),
+        "thumb_dim": int(thumb_dim),
+        "use_modis_post_2000": use_modis_post_2000,
+    }
 
 
 def _fetch_thumb_png(image: Any, vis_params: dict[str, Any], region: Any, max_dim: int = 768) -> bytes:
@@ -775,16 +817,12 @@ def gee_run_temporal_analysis(
     bounds_4326 = [[min_lat, min_lon], [max_lat, max_lon]]
     region = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat], None, False)
 
-    # Estimate AOI span to pick an efficient server-side reduction scale (30m–500m)
-    span_km = max(abs(max_lat - min_lat) * 111.0, abs(max_lon - min_lon) * 111.0 * max(0.15, np.cos(np.radians(center_lat))))
-    if sensor_mode == "modis" or span_km > 600.0:
-        reduce_scale = 500
-    elif span_km > 150.0:
-        reduce_scale = 120
-    elif span_km > 40.0:
-        reduce_scale = 60
-    else:
-        reduce_scale = 30
+    # Pick timeout-safe server-side reduction scale, tileScale, and thumbnail size from AOI area
+    scale_cfg = select_gee_scale_and_mode(bbox_4326, sensor_mode=sensor_mode)
+    reduce_scale = int(scale_cfg["scale_m"])
+    tile_scale = int(scale_cfg["tile_scale"])
+    thumb_dim = int(scale_cfg["thumb_dim"])
+    use_modis_post_2000 = bool(scale_cfg["use_modis_post_2000"])
 
     sy = max(1984, int(start_year))
     ey = max(sy, int(end_year))
@@ -838,7 +876,7 @@ def gee_run_temporal_analysis(
         plat_lbl = "MODIS"
         sensor_fam = "MODIS (500 m)"
 
-        if sensor_mode == "modis" or (sensor_mode == "auto_fusion" and span_km > 800.0 and yr >= 2000):
+        if (sensor_mode == "modis" or use_modis_post_2000) and yr >= 2000:
             comp_img, scene_cnt = _gee_modis_composite(region, w_start, w_end)
             plat_lbl = "MODIS Terra"
             sensor_fam = "MODIS (500 m)"
@@ -859,7 +897,7 @@ def gee_run_temporal_analysis(
         idx_img = gee_compute_index(comp_img, idx_key)
         comp_idx_img = gee_compute_index(comp_img, comp_idx)
 
-        # Server-side mean & median reduction
+        # Server-side mean & median reduction (tileScale prevents timeouts on multi-million km² regions)
         reducer = ee.Reducer.mean().combine(ee.Reducer.median(), sharedInputs=True)
         stats = idx_img.reduceRegion(
             reducer=reducer,
@@ -867,6 +905,7 @@ def gee_run_temporal_analysis(
             scale=reduce_scale,
             bestEffort=True,
             maxPixels=int(1e9),
+            tileScale=tile_scale,
         ).getInfo() or {}
         idx_mean = stats.get(f"{idx_key}_mean")
         idx_med = stats.get(f"{idx_key}_median")
@@ -884,9 +923,9 @@ def gee_run_temporal_analysis(
         idx_vis_p = {"min": vis_spec["min"], "max": vis_spec["max"], "palette": vis_spec["palette"]}
         comp_vis_p = {"min": comp_vis["min"], "max": comp_vis["max"], "palette": comp_vis["palette"]}
 
-        rgb_png_raw = _fetch_thumb_png(comp_img, rgb_vis, region, max_dim=768)
-        idx_png_raw = _fetch_thumb_png(idx_img, idx_vis_p, region, max_dim=768)
-        comp_png_raw = _fetch_thumb_png(comp_idx_img, comp_vis_p, region, max_dim=768)
+        rgb_png_raw = _fetch_thumb_png(comp_img, rgb_vis, region, max_dim=thumb_dim)
+        idx_png_raw = _fetch_thumb_png(idx_img, idx_vis_p, region, max_dim=thumb_dim)
+        comp_png_raw = _fetch_thumb_png(comp_idx_img, comp_vis_p, region, max_dim=thumb_dim)
 
         rgb_uri = _png_bytes_to_data_uri(rgb_png_raw)
         idx_uri = _png_bytes_to_data_uri(idx_png_raw)
@@ -983,7 +1022,7 @@ def gee_run_temporal_analysis(
             diff_img,
             {"min": -delta_lim, "max": delta_lim, "palette": d_pal},
             region,
-            max_dim=768,
+            max_dim=thumb_dim,
         )
         delta_uri = _png_bytes_to_data_uri(delta_png)
         delta_bnds = bounds_4326
@@ -1004,6 +1043,7 @@ def gee_run_temporal_analysis(
                 scale=reduce_scale,
                 bestEffort=True,
                 maxPixels=int(1e9),
+                tileScale=tile_scale,
             )
             .getInfo()
             or {}
@@ -1015,6 +1055,7 @@ def gee_run_temporal_analysis(
                 scale=reduce_scale,
                 bestEffort=True,
                 maxPixels=int(1e9),
+                tileScale=tile_scale,
             ).getInfo()
             or {}
         )
