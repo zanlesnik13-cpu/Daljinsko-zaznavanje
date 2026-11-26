@@ -5383,6 +5383,8 @@ def has_visual_plan(assistant_msg: dict[str, Any] | None) -> bool:
     action = str(assistant_msg.get("action") or "").strip().lower()
     if action in _NON_VISUAL_ACTIONS:
         return False
+    if isinstance(assistant_msg.get("replay_spec"), dict) and assistant_msg["replay_spec"]:
+        return True
     if action == "run_analysis":
         return True
     res_meta = assistant_msg.get("result_meta")
@@ -5396,21 +5398,169 @@ def has_visual_plan(assistant_msg: dict[str, Any] | None) -> bool:
     return False
 
 
+def _parse_epsg_int(raw_crs: Any, default: int = 3794) -> int:
+    """Extract integer EPSG code from 'EPSG:32633' or 32633 safely."""
+    if isinstance(raw_crs, int) and raw_crs > 0:
+        return raw_crs
+    m = re.search(r"(\d{4,5})", str(raw_crs or ""))
+    return int(m.group(1)) if m else int(default)
+
+
+def build_replay_spec(
+    plan: dict[str, Any],
+    ai_out: dict[str, Any],
+    user_prompt: str = "",
+) -> dict[str, Any]:
+    """Construct a complete, flat, 100% JSON-serializable ``replay_spec`` from resolved execution outputs."""
+    resolved_lat = _sfloat(ai_out.get("lat"), _sfloat(plan.get("lat"), 46.0569))
+    resolved_lon = _sfloat(ai_out.get("lon"), _sfloat(plan.get("lon"), 14.5058))
+    resolved_radius = _sfloat(plan.get("radius_m"), 4000.0)
+    raw_bbox = ai_out.get("bbox_4326")
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+        resolved_bbox = [float(x) for x in raw_bbox]
+    else:
+        b4326, _ = bbox_from_point_wgs84(resolved_lat, resolved_lon, resolved_radius)
+        resolved_bbox = [float(x) for x in b4326]
+
+    resolved_epsg = _parse_epsg_int(ai_out.get("crs") or plan.get("target_epsg") or plan.get("crs"), default=3794)
+    resolved_sensors = list(plan.get("sensors") or ([plan["sensor"]] if plan.get("sensor") else [SENSOR_S2]))
+    resolved_comp = list(ai_out.get("extra_indices") or plan.get("complementary_indices") or [])
+    resolved_season = str(plan.get("target_season") or _resolve_ai_target_season(plan))
+
+    return {
+        "version": 1,
+        "action": str(plan.get("task_type") or ai_out.get("kind") or "spectral_index"),
+        "location_name": str(ai_out.get("resolved_place") or plan.get("place_name") or plan.get("location_name") or ""),
+        "lat": round(float(resolved_lat), 6),
+        "lon": round(float(resolved_lon), 6),
+        "radius_m": float(resolved_radius),
+        "bbox_4326": resolved_bbox,
+        "target_epsg": int(resolved_epsg),
+        "start_date": str(plan.get("start_date") or ""),
+        "end_date": str(plan.get("end_date") or ""),
+        "target_season": resolved_season,
+        "interval": str(ai_out.get("adaptive_interval") or plan.get("interval") or "Letno"),
+        "primary_index": str(plan.get("index_name") or plan.get("primary_index") or "NDVI"),
+        "complementary_indices": [str(x) for x in resolved_comp],
+        "sensors": [str(x) for x in resolved_sensors],
+        "fusion_mode": str(plan.get("fusion_mode") or FUSION_SINGLE),
+        "resolution_m": int(_sint(plan.get("resolution_m"), 10)),
+        "max_cloud": int(_sint(plan.get("max_cloud"), 25)),
+        "engine": str(ai_out.get("engine") or plan.get("engine") or "stac"),
+        "user_prompt": str(user_prompt or plan.get("user_query") or ""),
+    }
+
+
+def _extract_coords_from_text(text: str) -> tuple[float, float] | None:
+    """Extract explicit WGS84 ``(lat, lon)`` coordinates from saved assistant narrative text or metadata."""
+    if not text:
+        return None
+    # Pattern 1: φ = 47.08637°, λ = 12.71840°  (or phi / lambda)
+    m_phi = re.search(
+        r"(?:φ|phi|lat(?:itude)?)\s*[=:]\s*([+-]?\d{1,2}[.,]\d+)\s*°?\s*([NS])?[,;\s]+(?:λ|lambda|lon(?:gitude)?)\s*[=:]\s*([+-]?\d{1,3}[.,]\d+)\s*°?\s*([EW])?",
+        text,
+        re.IGNORECASE,
+    )
+    if m_phi:
+        lat_v = float(m_phi.group(1).replace(",", "."))
+        lon_v = float(m_phi.group(3).replace(",", "."))
+        if m_phi.group(2) and m_phi.group(2).upper() == "S":
+            lat_v = -abs(lat_v)
+        if m_phi.group(4) and m_phi.group(4).upper() == "W":
+            lon_v = -abs(lon_v)
+        if -90.0 <= lat_v <= 90.0 and -180.0 <= lon_v <= 180.0:
+            return lat_v, lon_v
+
+    # Pattern 2: 47.08637° N, 12.71840° E
+    m_dms = re.search(
+        r"(\d{1,2}[.,]\d+)\s*°\s*([NS])\s*[,;\s]+(\d{1,3}[.,]\d+)\s*°\s*([EW])",
+        text,
+        re.IGNORECASE,
+    )
+    if m_dms:
+        lat_v = float(m_dms.group(1).replace(",", ".")) * (-1.0 if m_dms.group(2).upper() == "S" else 1.0)
+        lon_v = float(m_dms.group(3).replace(",", ".")) * (-1.0 if m_dms.group(4).upper() == "W" else 1.0)
+        if -90.0 <= lat_v <= 90.0 and -180.0 <= lon_v <= 180.0:
+            return lat_v, lon_v
+    return None
+
+
 def reconstruct_plan_without_llm(
     assistant_msg: dict[str, Any],
     user_prompt: str = "",
+    *,
+    lang: str = "sl",
 ) -> dict[str, Any]:
-    """Build a complete executable EO plan from saved ``replay_plan``/``plan`` with ZERO LLM calls.
+    """Build a complete executable EO plan from saved ``replay_spec`` / ``replay_plan`` with ZERO LLM calls.
 
-    Backward-compatible with older saved chats (from before ``replay_plan`` was persisted):
-    fills any missing fields strictly via the deterministic local parser
-    (``parse_eo_request_local``), NEVER calling Gemini.
+    Priority 1: Uses ``assistant_msg['replay_spec']`` directly (exact resolved ``lat``, ``lon``,
+        ``bbox_4326``, ``radius_m``, ``target_epsg``, dates, sensors, index, and engine) — NEVER
+        re-geocodes and NEVER falls back to Ljubljana!
+    Priority 2 (Legacy chats without ``replay_spec``): Extracts coordinates from saved assistant
+        text/metadata (e.g. ``φ = 47.08637°, λ = 12.71840°``) or known landmarks/continental regions
+        before running the deterministic local parser. Refuses to silently fall back to Ljubljana
+        if the prompt/text clearly refers to another location.
     """
+    # --- Priority 1: Exact saved replay_spec ---
+    spec = assistant_msg.get("replay_spec")
+    if isinstance(spec, dict) and spec.get("lat") is not None and spec.get("lon") is not None:
+        lat_v = float(spec["lat"])
+        lon_v = float(spec["lon"])
+        sensors_list = list(spec.get("sensors") or [SENSOR_S2])
+        prim_sensor = str(sensors_list[0]) if sensors_list else SENSOR_S2
+        prim_idx = str(spec.get("primary_index") or spec.get("index") or "NDVI").strip().upper()
+        task_t = str(spec.get("action") or spec.get("task_type") or "spectral_index").strip().lower()
+        if task_t not in VALID_TASKS:
+            task_t = "time_series_and_comparison" if spec.get("start_date") != spec.get("end_date") else "spectral_index"
+        raw_from_spec: dict[str, Any] = {
+            "task_type": task_t,
+            "place_name": str(spec.get("location_name") or ""),
+            "location": str(spec.get("location_name") or ""),
+            "lat": lat_v,
+            "lon": lon_v,
+            "radius_m": int(round(float(spec.get("radius_m") or 4000))),
+            "sensor": prim_sensor,
+            "sensors": sensors_list,
+            "index_name": prim_idx,
+            "start_date": str(spec.get("start_date") or ""),
+            "end_date": str(spec.get("end_date") or ""),
+            "interval": str(spec.get("interval") or "Letno"),
+            "resolution_m": int(_sint(spec.get("resolution_m"), 10)),
+            "include_comparison": task_t in ("time_series_and_comparison", "change_comparison"),
+            "fusion_mode": str(spec.get("fusion_mode") or FUSION_SINGLE),
+        }
+        prompt_for_spec = str(user_prompt or spec.get("user_prompt") or spec.get("location_name") or "").strip()
+        norm_plan = validate_and_normalize_plan(raw_from_spec, query=prompt_for_spec)
+        # Strictly lock resolved replay_spec coordinates, radius, bbox, CRS, and engine!
+        norm_plan["lat"] = lat_v
+        norm_plan["lon"] = lon_v
+        norm_plan["radius_m"] = int(round(float(spec.get("radius_m") or norm_plan["radius_m"])))
+        norm_plan["place_name"] = str(spec.get("location_name") or norm_plan.get("place_name") or "")
+        if isinstance(spec.get("bbox_4326"), (list, tuple)) and len(spec["bbox_4326"]) == 4:
+            norm_plan["bbox_4326"] = [float(x) for x in spec["bbox_4326"]]
+        if spec.get("target_epsg") is not None:
+            norm_plan["target_epsg"] = int(_parse_epsg_int(spec["target_epsg"]))
+        if spec.get("target_season"):
+            norm_plan["target_season"] = str(spec["target_season"])
+        if spec.get("complementary_indices") is not None:
+            norm_plan["complementary_indices"] = list(spec["complementary_indices"])
+        if spec.get("max_cloud") is not None:
+            norm_plan["max_cloud"] = int(_sint(spec["max_cloud"], 25))
+        norm_plan["engine"] = str(spec.get("engine") or "stac")
+        norm_plan["sensors"] = sensors_list
+        norm_plan["fusion_mode"] = str(spec.get("fusion_mode") or norm_plan.get("fusion_mode") or FUSION_SINGLE)
+        norm_plan["user_query"] = prompt_for_spec
+        norm_plan["user_prompt"] = prompt_for_spec
+        return norm_plan
+
+    # --- Priority 2: Legacy saved chats (no replay_spec yet) ---
     saved_raw = assistant_msg.get("replay_plan")
     if not isinstance(saved_raw, dict) or not saved_raw:
         saved_raw = assistant_msg.get("plan")
     saved: dict[str, Any] = dict(saved_raw) if isinstance(saved_raw, dict) else {}
 
+    content_txt = str(assistant_msg.get("content") or "")
+    meta_txt = json.dumps(assistant_msg.get("result_meta") or {}, ensure_ascii=False)
     prompt_txt = str(
         user_prompt
         or saved.get("user_prompt")
@@ -5418,7 +5568,12 @@ def reconstruct_plan_without_llm(
         or ""
     ).strip()
 
-    # Use deterministic local parser ONLY to fill gaps for older saved chats
+    # Scan saved assistant narrative & metadata for explicit coordinates or known landmarks
+    extracted_coords = _extract_coords_from_text(content_txt) or _extract_coords_from_text(meta_txt)
+    combined_search_txt = f"{prompt_txt} {content_txt[:800]}"
+    cont_legacy = _detect_continental_polar_region(combined_search_txt)
+    lm_legacy = _match_known_global_landmark(combined_search_txt)
+
     local_base: dict[str, Any] = {}
     if prompt_txt:
         try:
@@ -5431,7 +5586,15 @@ def reconstruct_plan_without_llm(
         if v is not None and v != "":
             merged[k] = v
 
-    # Map canonical replay aliases into validate_and_normalize_plan field names
+    if extracted_coords is not None and (merged.get("lat") is None or merged.get("lon") is None):
+        merged["lat"], merged["lon"] = extracted_coords
+    elif cont_legacy is not None and (merged.get("lat") is None or merged.get("lon") is None):
+        merged["place_name"], merged["lat"], merged["lon"], merged["radius_m"] = (
+            cont_legacy[0], cont_legacy[1], cont_legacy[2], cont_legacy[3]
+        )
+    elif lm_legacy is not None and (merged.get("lat") is None or merged.get("lon") is None):
+        merged["place_name"], merged["lat"], merged["lon"] = lm_legacy[0], lm_legacy[1], lm_legacy[2]
+
     if not merged.get("place_name") and merged.get("location_name"):
         merged["place_name"] = merged["location_name"]
     if not merged.get("index_name"):
@@ -5445,7 +5608,21 @@ def reconstruct_plan_without_llm(
 
     norm_plan = validate_and_normalize_plan(merged, query=prompt_txt or str(merged.get("place_name") or ""))
 
-    # Preserve explicit saved coordinates/bbox/CRS/engine/fusion_mode if present
+    # Guard: NEVER silently fall back to default Ljubljana on a legacy chat about another place!
+    norm_hay = _normalize_ascii(combined_search_txt)
+    if (
+        norm_plan.get("lat") is None
+        and _normalize_ascii(str(norm_plan.get("place_name") or "")) == "ljubljana"
+        and "ljubljan" not in norm_hay
+    ):
+        raise ValueError(
+            "Ta starejši pogovor še nima shranjenih natančnih koordinat (`replay_spec`). "
+            "Prosimo, kliknite gumb 🔁 Ponovi enkrat, da se koordinate trajno shranijo za prihodnje ponovne nalaganje brez AI."
+            if lang == "sl"
+            else "This legacy conversation does not have saved exact coordinates (`replay_spec`) yet. "
+            "Please click 🔁 Resend once so its exact coordinates are saved permanently for zero-LLM replay."
+        )
+
     for keep_k in ("lat", "lon", "bbox_4326", "target_epsg", "crs", "engine", "fusion_mode", "target_season", "complementary_indices"):
         if saved.get(keep_k) is not None and saved.get(keep_k) != "":
             norm_plan[keep_k] = saved[keep_k]
@@ -5462,13 +5639,14 @@ def replay_visual_analysis_no_llm(
     lang: str = "sl",
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
-    """Re-execute ONLY the satellite visual analysis using the saved plan — ZERO Gemini/LLM calls.
+    """Re-execute ONLY the satellite visual analysis using the saved ``replay_spec`` — ZERO Gemini/LLM calls.
 
     Restores ``frames``, ``delta_overlay_uri``, ``timelapse_rgb_gif_bytes``,
     ``timelapse_index_gif_bytes``, ``ts_df``, ``tif_bytes``, and ``analysis_context``
     while keeping the original saved assistant text untouched.
     """
-    plan = reconstruct_plan_without_llm(assistant_msg, user_prompt=user_prompt)
-    return execute_ai_plan(plan, lang=lang, progress_cb=progress_cb)
+    plan = reconstruct_plan_without_llm(assistant_msg, user_prompt=user_prompt, lang=lang)
+    explicit_epsg = f"EPSG:{_parse_epsg_int(plan['target_epsg'])}" if plan.get("target_epsg") else None
+    return execute_ai_plan(plan, target_epsg=explicit_epsg, lang=lang, progress_cb=progress_cb)
 
 

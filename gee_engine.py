@@ -760,16 +760,52 @@ def select_gee_scale_and_mode(
     }
 
 
-def _fetch_thumb_png(image: Any, vis_params: dict[str, Any], region: Any, max_dim: int = 768) -> bytes:
+def format_gee_error(exc: Exception | str, lang: str = "sl") -> str:
+    """Translate raw Google Earth Engine IAM/permission errors into clear actionable guidance."""
+    raw = str(exc or "").strip()
+    low = raw.lower()
+    is_perm = (
+        "thumbnails.create" in low
+        or "earthengine.thumbnails" in low
+        or ("permission" in low and ("denied" in low or "required" in low or "does not have" in low))
+        or ("403" in low and ("forbidden" in low or "earth engine" in low or "earthengine" in low))
+    )
+    if is_perm:
+        if lang == "en":
+            return (
+                "Google Earth Engine permission denied (IAM): Your Google Cloud Service Account needs the "
+                "**Earth Engine Resource Admin** (or **Earth Engine Resource Writer**) role in Google Cloud IAM "
+                "(*Viewer* is not sufficient for `thumbnails.create`). Open Google Cloud Console → IAM & Admin, "
+                "grant the role to your service account, and retry."
+            )
+        return (
+            "Google Earth Engine zavrnil dostop (IAM pravice): Vaš Google Cloud Service Account potrebuje vlogo "
+            "**Earth Engine Resource Admin** (ali **Earth Engine Resource Writer**) v Google Cloud IAM "
+            "(vloga *Viewer* ne zadostuje za `thumbnails.create`). Odprite Google Cloud Console → IAM & Admin, "
+            "dodelite vlogo svojemu Service Accountu in poskusite znova."
+        )
+    return raw
+
+
+def _fetch_thumb_png(
+    image: Any,
+    vis_params: dict[str, Any],
+    region: Any,
+    max_dim: int = 768,
+    lang: str = "sl",
+) -> bytes:
     """Download a lightweight PNG visualization from GEE ``getThumbURL``."""
     params = dict(vis_params)
     params["region"] = region
     params["dimensions"] = int(max_dim)
     params["format"] = "png"
-    url = image.getThumbURL(params)
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+    try:
+        url = image.getThumbURL(params)
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as exc:
+        raise RuntimeError(format_gee_error(exc, lang=lang)) from exc
 
 
 def _png_bytes_to_data_uri(png_bytes: bytes) -> str:
@@ -923,9 +959,9 @@ def gee_run_temporal_analysis(
         idx_vis_p = {"min": vis_spec["min"], "max": vis_spec["max"], "palette": vis_spec["palette"]}
         comp_vis_p = {"min": comp_vis["min"], "max": comp_vis["max"], "palette": comp_vis["palette"]}
 
-        rgb_png_raw = _fetch_thumb_png(comp_img, rgb_vis, region, max_dim=thumb_dim)
-        idx_png_raw = _fetch_thumb_png(idx_img, idx_vis_p, region, max_dim=thumb_dim)
-        comp_png_raw = _fetch_thumb_png(comp_idx_img, comp_vis_p, region, max_dim=thumb_dim)
+        rgb_png_raw = _fetch_thumb_png(comp_img, rgb_vis, region, max_dim=thumb_dim, lang=lang)
+        idx_png_raw = _fetch_thumb_png(idx_img, idx_vis_p, region, max_dim=thumb_dim, lang=lang)
+        comp_png_raw = _fetch_thumb_png(comp_idx_img, comp_vis_p, region, max_dim=thumb_dim, lang=lang)
 
         rgb_uri = _png_bytes_to_data_uri(rgb_png_raw)
         idx_uri = _png_bytes_to_data_uri(idx_png_raw)
@@ -1023,6 +1059,7 @@ def gee_run_temporal_analysis(
             {"min": -delta_lim, "max": delta_lim, "palette": d_pal},
             region,
             max_dim=thumb_dim,
+            lang=lang,
         )
         delta_uri = _png_bytes_to_data_uri(delta_png)
         delta_bnds = bounds_4326

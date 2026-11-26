@@ -180,6 +180,16 @@ def sanitize_chat_messages(messages: Any) -> list[dict[str, Any]]:
         if raw.get("fallback_note"):
             entry["fallback_note"] = str(raw["fallback_note"])[:500]
 
+        raw_spec = raw.get("replay_spec")
+        if isinstance(raw_spec, dict) and raw_spec:
+            spec_clean = {
+                str(k): sanitize_json_payload(v)
+                for k, v in raw_spec.items()
+                if v is not None
+            }
+            if spec_clean:
+                entry["replay_spec"] = spec_clean
+
         raw_replay = raw.get("replay_plan") if isinstance(raw.get("replay_plan"), dict) else raw.get("plan")
         compact_plan = _extract_compact_replay_plan(raw_replay)
         if isinstance(raw.get("plan"), dict):
@@ -199,7 +209,11 @@ def sanitize_chat_messages(messages: Any) -> list[dict[str, Any]]:
             }
             if compact_meta:
                 entry["result_meta"] = compact_meta
-        elif entry.get("action") == "run_analysis" or bool(compact_plan.get("task_type") or compact_plan.get("action")):
+        elif (
+            entry.get("action") == "run_analysis"
+            or bool(entry.get("replay_spec"))
+            or bool(compact_plan.get("task_type") or compact_plan.get("action"))
+        ):
             entry["result_meta"] = {"is_visual_analysis": True}
 
         cleaned.append(entry)

@@ -118,6 +118,7 @@ from ai_pomocnik import (
     GEMINI_MODEL_OPTIONS,
     apply_incremental_layout_overrides,
     build_analysis_context_dict,
+    build_replay_spec,
     execute_ai_plan,
     generate_conversational_reply,
     get_active_gemini_api_key,
@@ -13431,12 +13432,18 @@ def main() -> None:
                             "engine": str(ai_out.get("engine") or "stac"),
                             "user_prompt": str(incoming_prompt),
                         }
+                        replay_spec_payload = build_replay_spec(
+                            parsed_plan,
+                            ai_out,
+                            user_prompt=str(incoming_prompt),
+                        )
                         st.session_state["ai_chat_messages"].append(
                             {
                                 "role": "assistant",
                                 "content": str(reply_res.get("text") or ""),
                                 "action": "run_analysis",
                                 "plan": parsed_plan,
+                                "replay_spec": replay_spec_payload,
                                 "replay_plan": replay_plan_payload,
                                 "result_meta": {
                                     "is_visual_analysis": True,
