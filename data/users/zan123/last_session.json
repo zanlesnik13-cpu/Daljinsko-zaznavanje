@@ -1,24 +1,19 @@
 {
   "version": 1,
   "username": "zan123",
-  "saved_at": "2026-11-25T19:07:23Z",
+  "saved_at": "2026-11-26T18:36:54Z",
   "aoi": {
-    "location_name": "Pasterze, Heiligenblut, Bezirk Spittal an der Drau, Österreich",
-    "center_lat": 47.08637,
-    "center_lon": 12.718396,
-    "radius_m": 5000,
-    "bbox_4326": [
-      12.650598731591144,
-      47.04008369858899,
-      12.786082685524951,
-      47.13262218981185
-    ],
+    "location_name": "Ljubljana",
+    "center_lat": 46.1512,
+    "center_lon": 14.9955,
+    "radius_m": 2000,
+    "bbox_4326": null,
     "custom_polygon_geojson": null
   },
   "settings": {
     "sensor": "sentinel-2-l2a",
-    "start_date": "2026-05-26",
-    "end_date": "2026-11-25",
+    "start_date": "2026-05-27",
+    "end_date": "2026-11-26",
     "interval": "all",
     "target_season": "summer",
     "max_cloud_pct": 20,
@@ -37,7 +32,7 @@
     "show_title": true,
     "title": "",
     "subtitle": "",
-    "author": "Oddelek za geodezijo",
+    "author": "",
     "title_position": "top_left",
     "show_footer": true,
     "custom_note_text": "",
@@ -59,7 +54,7 @@
     "show_numeric_scale": true,
     "show_legend": true,
     "legend_position": "right_panel",
-    "legend_title": "RGB",
+    "legend_title": "",
     "show_metadata_in_legend": true,
     "show_inset_map": false,
     "inset_position": "right_panel_bottom",
@@ -69,20 +64,12 @@
   "ai_chat_messages": [
     {
       "role": "user",
-      "content": "Naredi analizo krčenja ledenika grosglockner v zadnjih 50 letih"
+      "content": "Naredi analizo krčenja amazonskega pragozda skozi leta"
     },
     {
       "role": "assistant",
-      "content": "### 1. Ozadje dogodka in območja\n\nLedenik **Pasterze** pod Velikim Klekom (*Großglockner*, 3.798 m n. v.) v osrčju narodnega parka Visoke Ture (*Hohe Tauern*) v Avstriji je največji ledenik v Vzhodnih Alpah. Njegova dinamika predstavlja enega najpomembnejših in najbolj spremljanih indikatorjev podnebnih sprememb v alpskem prostoru. \n\nV preteklih desetletjih je ledenik doživel dramatičen umik ledeniškega jezika, močno tanjšanje ledene mase ter razpad spodnjega dela v mrtev led, prekrit z debelo plastjo morenskega grušča. Dodaten geodinamični proces, značilen za umik ledenika Pasterze, je nastanek in hitra širitev proglacialnega jezera na območju, kjer se je ledenik umaknil iz globoke ledeniške kotanje. Za natančno oceno prostorske dinamike taljenja je bila izvedena satelitska analiza v radiju 5.000 m okoli osrednjega dela ledenika (φ=47,08637°, λ=12,71840°).\n\n---\n\n### 2. Metodologija in podatki\n\nZa analizo dinamike ledene odeje je bil uporabljen normirani diferenčni snežni indeks (**NDSI** – *Normalized Difference Snow Index*), ki temelji na spektralnem odboju v zelenem (Green) in kratkovalovnem infrardečem (SWIR) pasu:\n$$\\text{NDSI} = \\frac{\\rho_{\\text{Green}} - \\rho_{\\text{SWIR}}}{\\rho_{\\text{Green}} + \\rho_{\\text{SWIR}}}$$\nSnežna in ledena površina močno odbijata vidno svetlobo ter absorbirata SWIR sevanje, kar omogoča zanesljivo ločevanje ledu od okoliškega skalovja, vegetacije in vode.\n\n- **Prostorski koordinatni sistem**: Metrični UTM sistem `EPSG:32633` (WGS 84 / UTM cona 33N), ki omogoča natančne površinske izračune v hektarjih (ha) in kvadratnih kilometrih ($\\text{km}^2$).\n- **Časovno okno**: Pozno poletje (konec ablacije, avgust–september), ko se stali sezonski sneg in je razkrit dejanski obseg trajnega ledu in firna. Upoštevanih je 11 veljavnih časovnih rezin med 24. 8. 2009 in 15. 8. 2026.\n- **Prostorska ločljivost**: Usklajena na mrežo 30 m.\n\n#### 🛰️ Zakaj je bila uporabljena kombinacija več satelitskih sistemov\nZa analizo večdesetletnega časovnega niza je bila uporabljena hibridna fuzija misij **Landsat (Collection 2 Level-2)** in **Sentinel-2 (Level-2A)**:\n1. **Dolgoročni kontinuitetni arhiv**: Arhiv Landsat (30 m ločljivost) omogoča vpogled v zgodovinsko stanje pred letom 2015/2017, ko evropska konstelacija Sentinel-2 še ni delovala.\n2. **Visoka ločljivost sodobnih opazovanj**: Od leta 2017 naprej je integriran Sentinel-2 MSI (10–20 m izvorne ločljivosti), kar prinaša bistveno ostrejše razmejevanje ledeniških robov in novonastalih vodnih teles.\n3. **Kvantitativna struktura fuzije**:\n   - Skupno število primerjanih okvirjev: **10** (1 referenčni Landsat posnetek in 10 Sentinel-2 posnetkov).\n   - Leto prehoda med sistemoma: **2017**.\n4. **Znanstvene omejitve fuzije**: Spektralni filtri (bandpass) senzorjev Landsat (TM/ETM+/OLI) in Sentinel-2 MSI niso povsem identični v območju SWIR, zato so podatki radiometrično usklajeni (harmonizirani) na skupno metrično mrežo ločljivosti 30 m.\n\n---\n\n### 3. Podrobna interpretacija rezultatov\n\nAnaliza časovne vrste NDSI in prostorske razlike med začetnim in končnim stanjem razkriva intenzivno degradacijo ledeniške mase:\n\n| Parameter | Izračunana vrednost | Pomen na terenu |\n| :--- | :--- | :--- |\n| **Skupna izguba ledu** | **221,76 ha** ($2,22\\text{ km}^2$) | Skupna površina ledu, ki je nepovratno izginila v obravnavanem obdobju. |\n| **Izguba ledu v korist golega terena** | **157,68 ha** | Območje staljenega ledu, kjer so se razkrila gola morenska tla in skalne stene. |\n| **Novo proglacialno jezero / voda** | **64,08 ha** | Širitev vodnih teles v ledeniški kotanji (nastanek jezera ob umiku jezika). |\n| **Lokalni prirast ledu / firna** | **7,92 ha** | Omejeno območje v senčnih visokogorskih legah ali sprememba v pokritosti z morenskim drobirjem. |\n| **Povprečna sprememba indeksa ($\\Delta\\text{NDSI}$)** | **-0,1649** | Splošen upad spektralnega odboja ledu v celotnem območju analize. |\n| **Površina z zmanjšanjem NDSI** | **857,88 ha** | Širše območje zmanjšanja snežne/ledene odeje ter degradacije ledeniškega firna. |\n| **Površina s povečanjem NDSI** | **37,08 ha** | Manjša območja z mikroklimatsko obstojnimi snežnimi zaplatami. |\n| **Trend časovne vrste (naklon)** | **-0,02352 / opazovanje** | Statistično značilen negativen trend prisotnosti ledu in snega skozi celoten niz. |\n| **Razpon NDSI v območju** | od **-0,0365** do **0,7022** | Negativne vrednosti predstavljajo vodo in skale, visoke vrednosti čist led in firn. |\n\n#### Fizikalna razlaga procesov na terenu:\n1. **Dramatičen umik jezika**: Izguba kar **221,76 ha** ledeniške površine potrjuje, da se spodnji jezik Pasterze ne napaja več z zadostnimi količinami ledu iz akumulacijskega območja pod Grossglocknerjem.\n2. **Nastanek in rast proglacialnega jezera**: Izračunanih **64,08 ha** novih vodnih površin dokumentira hitro polnjenje kotanje pred čelom umikajočega se jezika z vodo odtaljenega ledu. Jezero z jezerskim valovanjem in toplotno kapaciteto vode dodatno pospešuje taljenje čela ledenika (*termična erozija*).\n3. **Znanstvena omejitev (supraglacialna morena)**: Na spodnjem delu ledenika Pasterze je obsežen del mrtvega ledu prekrit z debelo plastjo grušča. Optični sateliti (NDSI) grušč zaznajo kot golo skalo, čeprav se pod njim lahko nahaja še več metrov ledu. Zato NDSI zaznava predvsem umik čistega ledu in firna ter izpostavitev podlage.\n\n---\n\n### 4. Predlogi za nadaljevanje\n\nZa še podrobnejše razumevanje propadanja ledenika Pasterze lahko izvedemo naslednje analize:\n\n1. **Analiza geodetske masne bilance (višinske spremembe)**: Uporaba digitalnih modelov višin (npr. Copernicus DEM 30 m v primerjavi s starejšimi aerofotogrametričnimi podatki) za izračun izgubljene debeline ledu (v metrih) in skupne prostornine staljene vode ($\\text{km}^3$).\n2. **Radarska analiza premikov z metodo SAR (Sentinel-1)**: Izračun hitrosti tečenja ledeniškega jezika s tehniko sledenja premikom (*speckle tracking* / interferometrija), ki pokaže, ali se spodnji jezik sploh še premika ali pa gre za popolnoma statičen mrtev led.\n3. **Termalna analiza površinske temperature (Landsat TIRS / ST_B10)**: Ocena toplotnega stanja morenskega grušča na ledeniku in ugotavljanje, kje grušč deluje kot izolator in kje pospešuje taljenje ledu.",
-      "action": "run_analysis",
-      "plan": {
-        "task_type": "time_series_and_comparison",
-        "sensor": "landsat-c2-l2",
-        "start_date": "1984-06-01",
-        "end_date": "2026-10-01",
-        "radius_m": 5000,
-        "resolution_m": 30
-      }
+      "content": "Amazonski deževni pragozd obsega več kot 6 milijonov km², zato satelitska spektralna analiza z visoko ločljivostjo (10–30 m) zahteva izbiro konkretnega opazovalnega območja (premer do ~15–20 km) in časovnega obdobja. Za katero območje in obdobje bi želeli izvesti analizo časovne vrste krčenja gozdov?\n\nPredlogi:\n1. **Rondônia (območje Ariquemes / Jamari, Brazilija)** – znameniti vzorec t.i. »ribje kosti« (fishbone deforestation) od leta 1990 do 2024 (Landsat).\n2. **Pará (Novo Progresso vzdolž avtoceste BR-163, Brazilija)** – intenzivno sodobno žarišče krčenja gozda med 2017 in 2024 (Sentinel-2 NDVI primerjava).\n3. **Mato Grosso (Sinop / Alta Floresta, Brazilija)** – preobrazba pragozda v kmetijske površine in pašnike v obdobju 2000–2024.",
+      "action": "ask_clarification"
     }
   ]
 }
