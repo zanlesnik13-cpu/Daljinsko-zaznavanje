@@ -877,11 +877,36 @@ def select_gee_scale_for_area(area_km2: float, sensor_mode: str = "auto_fusion")
     return int(scale_m)
 
 
+def select_gee_sensor_for_year(
+    year: int,
+    aoi_area_km2: float,
+    sensor_mode: str = "auto_fusion",
+) -> str:
+    """Select the optimal GEE sensor family (``'modis'``, ``'sentinel2'``, or ``'landsat'``) for a year & AOI area.
+
+    - Continental (``aoi_area_km2 > 1,500,000 km²``) or explicit ``'modis'``: ``'modis'`` (``>= 2000``).
+    - Local/hotspot (``aoi_area_km2 <= 15,000 km²``) & ``year >= 2017`` (or explicit ``'sentinel2'``): ``'sentinel2'``.
+    - Regional (``15,000 < aoi_area_km2 <= 1,500,000 km²``) or ``year < 2017``: ``'landsat'``
+      (Landsat-5/7 ``< 2013``, Landsat-8/9 ``2013–2026`` — 5–10x faster than S2 on large regional AOIs,
+      preventing 2020–2026 timeouts and preserving radiometric consistency).
+    """
+    sm = str(sensor_mode or "auto_fusion").strip().lower()
+    a = float(aoi_area_km2)
+    yr = int(year)
+    if sm == "modis" or (sm == "auto_fusion" and a > 1_500_000.0):
+        return "modis" if yr >= 2000 else "landsat"
+    if sm == "sentinel2":
+        return "sentinel2"
+    if sm == "auto_fusion" and a <= 15_000.0 and yr >= 2017:
+        return "sentinel2"
+    return "landsat"
+
+
 def select_gee_scale_and_mode(
     bbox_4326: Sequence[float],
     sensor_mode: str = "auto_fusion",
 ) -> dict[str, Any]:
-    """Compute approximate AOI area in km² and pick a timeout-safe GEE server-side scale & tileScale."""
+    """Compute rectangular AOI area in km² and pick a timeout-safe GEE server-side scale & tileScale."""
     min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox_4326]
     center_lat = 0.5 * (min_lat + max_lat)
     h_km = abs(max_lat - min_lat) * 111.32
@@ -891,7 +916,7 @@ def select_gee_scale_and_mode(
     scale_m = select_gee_scale_for_area(area_km2, sensor_mode=sensor_mode)
     tile_scale = 4
     thumb_dim = 480
-    use_modis_post_2000 = bool(sensor_mode == "modis" or (sensor_mode == "auto_fusion" and area_km2 > 2_000_000.0))
+    use_modis_post_2000 = bool(sensor_mode == "modis" or (sensor_mode == "auto_fusion" and area_km2 > 1_500_000.0))
     return {
         "area_km2": round(area_km2, 1),
         "scale_m": int(scale_m),
@@ -1062,17 +1087,22 @@ def gee_run_temporal_analysis(
     region = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat], None, False)
 
     scale_cfg = select_gee_scale_and_mode(bbox_4326, sensor_mode=sensor_mode)
+    aoi_area_km2 = float(scale_cfg["area_km2"])
     reduce_scale = int(scale_cfg["scale_m"])
     tile_scale = int(scale_cfg["tile_scale"])
     thumb_dim = int(scale_cfg["thumb_dim"])
     use_modis_post_2000 = bool(scale_cfg["use_modis_post_2000"])
 
+    now_utc_yr = datetime.now(timezone.utc).year
     sy = max(1984, int(start_year))
-    ey = max(sy, int(end_year))
-    if sensor_mode == "modis":
+    ey = min(now_utc_yr, max(sy, int(end_year)))
+    if sensor_mode == "modis" or use_modis_post_2000:
+        # Terra MODIS launched Dec 1999; never query MODIS before year 2000
         sy = max(2000, sy)
+        ey = max(sy, ey)
     elif sensor_mode == "sentinel2":
         sy = max(2017, sy)
+        ey = max(sy, ey)
 
     all_years = list(range(sy, ey + 1))
     cap = max(2, min(int(max_frames), 7))
@@ -1080,7 +1110,14 @@ def gee_run_temporal_analysis(
         pick_idx = np.linspace(0, len(all_years) - 1, cap, dtype=int)
         sampled_years = sorted(set(all_years[i] for i in pick_idx))
     else:
-        sampled_years = all_years
+        sampled_years = list(all_years)
+
+    # If end_year is the current year and (end_year - 1) isn't sampled yet, include (end_year - 1)
+    # as a zero-extra-round-trip fallback candidate in the single batched stats call!
+    fallback_prev_yr: int | None = None
+    if ey >= now_utc_yr and (ey - 1) >= sy and (ey - 1) not in sampled_years:
+        fallback_prev_yr = ey - 1
+        sampled_years = sorted(set(sampled_years + [fallback_prev_yr]))
 
     if idx_key == "NDSI":
         comp_idx = "NDWI"
@@ -1108,11 +1145,14 @@ def gee_run_temporal_analysis(
     for yr in sampled_years:
         w_start, w_end = _season_date_window(yr, target_season, center_lat)
         mid_date = f"{yr}-08-01" if center_lat >= -20.0 else f"{yr}-02-01"
+        if mid_date > w_end:
+            mid_date = w_end
 
-        if (sensor_mode == "modis" or use_modis_post_2000) and yr >= 2000:
+        yr_sensor = select_gee_sensor_for_year(yr, aoi_area_km2, sensor_mode=sensor_mode)
+        if yr_sensor == "modis":
             comp_img, col_sz = _gee_modis_composite_lazy(region, w_start, w_end)
             plat_lbl, sensor_fam = "MODIS Terra", "MODIS (500 m)"
-        elif sensor_mode == "sentinel2" or (sensor_mode == "auto_fusion" and yr >= 2017):
+        elif yr_sensor == "sentinel2":
             comp_img, col_sz = _gee_s2_composite_lazy(region, w_start, w_end)
             plat_lbl, sensor_fam = "Sentinel-2", "Sentinel-2 (10–20 m)"
         else:
@@ -1169,6 +1209,12 @@ def gee_run_temporal_analysis(
         sp["idx_med_f"] = round(float(imed_val if imed_val is not None else im_val), 4)
         valid_specs.append(sp)
 
+    # If the current year succeeded and we included a backup (ey - 1) that pushed us over cap, drop the backup
+    if fallback_prev_yr is not None and len(valid_specs) > cap:
+        valid_yrs_set = {int(sp["year"]) for sp in valid_specs}
+        if ey in valid_yrs_set and fallback_prev_yr in valid_yrs_set:
+            valid_specs = [sp for sp in valid_specs if int(sp["year"]) != fallback_prev_yr]
+
     if not valid_specs:
         raise RuntimeError(
             "Google Earth Engine ni našel uporabnih ne-oblačnih mozaikov za izbrano obdobje in območje."
@@ -1176,7 +1222,7 @@ def gee_run_temporal_analysis(
             else "Google Earth Engine found no usable cloud-free composites for the selected period and region."
         )
 
-    # Identify t1 (earliest reliable >= 1990) and t2 (latest) and prioritize them FIRST!
+    # Identify t1 (earliest reliable >= 1990) and t2 (latest) and prioritize t2 & t1 FIRST!
     t1_pos = 0
     for idx_i, sp in enumerate(valid_specs):
         if sp["is_reliable"]:
@@ -1185,9 +1231,9 @@ def gee_run_temporal_analysis(
     t2_pos = len(valid_specs) - 1
     endpoint_years = {valid_specs[t1_pos]["year"], valid_specs[t2_pos]["year"]}
 
-    priority_order = [valid_specs[t1_pos]]
-    if t2_pos != t1_pos:
-        priority_order.append(valid_specs[t2_pos])
+    priority_order = [valid_specs[t2_pos]]
+    if t1_pos != t2_pos:
+        priority_order.append(valid_specs[t1_pos])
     for idx_i, sp in enumerate(valid_specs):
         if idx_i not in (t1_pos, t2_pos):
             priority_order.append(sp)
@@ -1417,6 +1463,7 @@ def gee_run_temporal_analysis(
             "t1_mean": frames[default_t1_idx]["index_mean"],
             "t2_mean": frames[-1]["index_mean"],
             "delta_mean": round(delta_mean_v, 4),
+            "mean": round(delta_mean_v, 4),
             "threshold": thr,
             "decrease_area_km2": round(dec_km2, 2),
             "decrease_area_ha": round(dec_km2 * 100.0, 1),
@@ -1442,6 +1489,15 @@ def gee_run_temporal_analysis(
     except Exception as exc:
         logger.warning("GEE timelapse GIF compilation skipped: %s", exc)
 
+    actual_sensors = sorted({str(f.get("platform") or f.get("sensor_family") or "").strip() for f in frames if f and (f.get("platform") or f.get("sensor_family"))})
+    actual_start_date = str(frames[0]["date"]) if frames else ""
+    actual_end_date = str(frames[-1]["date"]) if frames else ""
+    actual_aoi_area_km2 = (
+        round(float(change_summary["total_valid_km2"]), 1)
+        if isinstance(change_summary, dict) and float(change_summary.get("total_valid_km2") or 0.0) > 0.0
+        else round(float(aoi_area_km2), 1)
+    )
+
     _prog(1.0, "GEE obdelava zaključena." if lang == "sl" else "GEE processing complete.")
 
     return {
@@ -1462,4 +1518,9 @@ def gee_run_temporal_analysis(
         "timelapse_index_gif_bytes": gif_idx,
         "extra_indices": [comp_idx],
         "reduce_scale_m": reduce_scale,
+        "actual_sensors": actual_sensors,
+        "actual_start_date": actual_start_date,
+        "actual_end_date": actual_end_date,
+        "actual_resolution_m": reduce_scale,
+        "actual_aoi_area_km2": actual_aoi_area_km2,
     }

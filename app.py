@@ -7512,6 +7512,51 @@ def render_interactive_timelapse_panel(
         )
 
 
+def format_ts_delta_kpi(
+    idx_label: str,
+    ts_df: pd.DataFrame | None,
+    change_summary: dict[str, Any] | None = None,
+    *,
+    lang: str = "sl",
+) -> tuple[str, str, str | None]:
+    """Return ``(card_label, main_value_str, sub_delta_str)`` for the 4th time-series KPI card.
+
+    Guarantees that a card labeled ``Δ <INDEX>`` ALWAYS displays the signed difference
+    (``t2 - t1`` from ``change_summary['delta_mean']`` / ``change_summary['mean']`` or
+    ``ts_df['mean'].iloc[-1] - ts_df['mean'].iloc[0]``), never the series average, with
+    ``Povp.: <mean>`` / ``Mean: <mean>`` as a neutral sub-label. If only a single date
+    exists (no Δ), labels the card ``Povprečje <INDEX>`` / ``Mean <INDEX>``.
+    """
+    cs = change_summary if isinstance(change_summary, dict) else {}
+    mean_val: float | None = None
+    if isinstance(ts_df, pd.DataFrame) and not ts_df.empty and "mean" in ts_df.columns:
+        vals = pd.to_numeric(ts_df["mean"], errors="coerce").dropna()
+        if not vals.empty:
+            mean_val = float(vals.mean())
+
+    delta_val: float | None = None
+    if cs.get("delta_mean") is not None:
+        delta_val = float(cs["delta_mean"])
+    elif cs.get("mean") is not None:
+        delta_val = float(cs["mean"])
+    elif isinstance(ts_df, pd.DataFrame) and len(ts_df) >= 2 and "mean" in ts_df.columns:
+        vals = pd.to_numeric(ts_df["mean"], errors="coerce").dropna()
+        if len(vals) >= 2:
+            delta_val = float(vals.iloc[-1]) - float(vals.iloc[0])
+
+    if delta_val is not None:
+        sub_lbl = (
+            f"{'Povp.' if lang == 'sl' else 'Mean'}: {mean_val:.3f}"
+            if mean_val is not None
+            else None
+        )
+        return f"Δ {idx_label}", f"{delta_val:+.3f}", sub_lbl
+
+    avg_lbl = f"{'Povprečje' if lang == 'sl' else 'Mean'} {idx_label}"
+    avg_val = f"{mean_val:.3f}" if mean_val is not None else "—"
+    return avg_lbl, avg_val, None
+
+
 @st.fragment
 def _render_ai_chat_analysis_fragment(
     *,
@@ -7608,11 +7653,18 @@ def _render_ai_chat_analysis_fragment(
         else t("ai_plan_engine_local")
     )
     fb_note = pl.get("fallback_note_en" if lang == "en" else "fallback_note_sl") or ""
-    period_txt = (
-        pl["event_date"]
-        if pl["task_type"].startswith("disaster_") or pl["task_type"] == "gnss_plan"
-        else ("Copernicus GLO-30" if pl["task_type"] == "terrain_dem" else f"{pl['start_date']} → {pl['end_date']}")
-    )
+    _actual_s_pills = list(ai_res_show.get("actual_sensors") or [])
+    _actual_d1 = str(ai_res_show.get("actual_start_date") or "").strip()
+    _actual_d2 = str(ai_res_show.get("actual_end_date") or "").strip()
+    _actual_res_m = int(ai_res_show.get("actual_resolution_m") or pl.get("resolution_m", 10))
+    if _actual_d1 and _actual_d2 and not (pl["task_type"].startswith("disaster_") or pl["task_type"] in ("gnss_plan", "terrain_dem")):
+        period_txt = f"{_actual_d1} → {_actual_d2}"
+    else:
+        period_txt = (
+            pl["event_date"]
+            if pl["task_type"].startswith("disaster_") or pl["task_type"] == "gnss_plan"
+            else ("Copernicus GLO-30" if pl["task_type"] == "terrain_dem" else f"{pl['start_date']} → {pl['end_date']}")
+        )
     f_mode_show = str(pl.get("fusion_mode") or "single")
     fusion_badge_map = {
         "temporal_landsat_s2": t("ai_fusion_badge_temporal", lang=lang),
@@ -7621,7 +7673,9 @@ def _render_ai_chat_analysis_fragment(
         "synergy_optical_dem": t("ai_fusion_badge_opt_dem", lang=lang),
     }
     fusion_badge_txt = fusion_badge_map.get(f_mode_show, "")
-    if ai_kind_show == "terrain_dem":
+    if _actual_s_pills:
+        ai_sensor_short = " + ".join(_actual_s_pills)
+    elif ai_kind_show == "terrain_dem":
         ai_sensor_short = "Copernicus DEM 30 m"
     elif ai_kind_show == "gnss_plan":
         ai_sensor_short = "GPS + Galileo + GLONASS"
@@ -7656,7 +7710,7 @@ def _render_ai_chat_analysis_fragment(
         f'<span style="background:#F0FDFA;color:#0F766E;border:1px solid #99F6E4;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📍 {t("ai_plan_place")}: {ai_res_show.get("resolved_place", pl["place_name"])} ({pl["radius_m"]} m)</span>'
         f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">🛰️ {t("ai_plan_sensor")}: {ai_sensor_short}</span>'
         f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📅 {t("ai_plan_period")}: {period_txt}</span>'
-        f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📐 {t("ai_plan_crs")}: {ai_crs_show} · {pl["resolution_m"]} m</span>'
+        f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📐 {t("ai_plan_crs")}: {ai_crs_show} · {_actual_res_m} m</span>'
         f'<span style="background:#FFFFFF;color:#475569;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:11.5px;">{eng_lbl}</span>'
         f'</div>'
     )
@@ -8306,10 +8360,8 @@ def _render_ai_chat_analysis_fragment(
             d_val = float(ts_ai["mean"].iloc[-1]) - float(ts_ai["mean"].iloc[0])
             trend_str = f"{d_val:+.3f}"
 
-        delta_str = (
-            f"{float(cs_ts['mean']):+.3f}"
-            if (isinstance(cs_ts, dict) and cs_ts.get("mean") is not None)
-            else f"{ts_ai['mean'].mean():.3f}"
+        kpi4_lbl, kpi4_val, kpi4_sub = format_ts_delta_kpi(
+            idx_lbl_ts, ts_ai, cs_ts, lang=lang
         )
 
         d_start_s = str(ts_ai["date_str"].iloc[0])
@@ -8325,8 +8377,10 @@ def _render_ai_chat_analysis_fragment(
         m2.metric("Obdobje t1 → t2" if lang == "sl" else "Period t1 → t2", period_kpi)
         m3.metric("Trend", trend_str)
         m4.metric(
-            (f"Δ {idx_lbl_ts}" if cs_ts else ("Povprečje" if lang == "sl" else "Mean")),
-            delta_str,
+            kpi4_lbl,
+            kpi4_val,
+            delta=kpi4_sub,
+            delta_color="off",
         )
         m5.metric(t("ai_plan_crs"), format_crs_label(ai_crs_show, short=True))
 
@@ -13591,6 +13645,11 @@ def main() -> None:
                                     "engine": str(ai_out.get("engine") or "stac"),
                                     "resolved_place": str(ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""),
                                     "crs": str(ai_out.get("crs") or ""),
+                                    "used_sensors": list(ai_out.get("actual_sensors") or parsed_plan.get("sensors") or []),
+                                    "used_date_start": str(ai_out.get("actual_start_date") or parsed_plan.get("start_date") or ""),
+                                    "used_date_end": str(ai_out.get("actual_end_date") or parsed_plan.get("end_date") or ""),
+                                    "used_scale_m": int(ai_out.get("actual_resolution_m") or parsed_plan.get("resolution_m", 10)),
+                                    "actual_aoi_area_km2": ai_out.get("actual_aoi_area_km2"),
                                 },
                                 "result_id": res_key,
                                 "fallback_note": fb_note_str,

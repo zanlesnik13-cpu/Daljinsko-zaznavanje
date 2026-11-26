@@ -291,12 +291,39 @@ _CONTINENTAL_POLAR_REGIONS: tuple[tuple[tuple[str, ...], str, float, float, int,
         "NDSI",
     ),
     (
+        ("ariquemes", "br-364", "br 364"),
+        "Rondônia (Ariquemes / BR-364, Brazil)",
+        -9.91,
+        -63.04,
+        50_000,
+        150,
+        "NDVI",
+    ),
+    (
+        ("novo progresso",),
+        "Novo Progresso (Pará, Brazil)",
+        -7.14,
+        -55.41,
+        50_000,
+        150,
+        "NDVI",
+    ),
+    (
+        ("sinop", "alta floresta"),
+        "Sinop / Alta Floresta (Mato Grosso, Brazil)",
+        -10.85,
+        -55.75,
+        50_000,
+        150,
+        "NDVI",
+    ),
+    (
         ("rondoni",),
         "Amazon Rainforest (Rondônia, Brazil)",
         -10.5,
         -62.5,
         250_000,
-        500,
+        300,
         "NDVI",
     ),
     (
@@ -337,6 +364,24 @@ _KNOWN_GLOBAL_LANDMARKS: tuple[tuple[tuple[str, ...], str, float, float], ...] =
         "Antarctica (West Antarctic Ice Sheet)",
         -75.5,
         -90.0,
+    ),
+    (
+        ("ariquemes", "br-364", "br 364"),
+        "Rondônia (Ariquemes / BR-364, Brazil)",
+        -9.91,
+        -63.04,
+    ),
+    (
+        ("novo progresso",),
+        "Novo Progresso (Pará, Brazil)",
+        -7.14,
+        -55.41,
+    ),
+    (
+        ("sinop", "alta floresta"),
+        "Sinop / Alta Floresta (Mato Grosso, Brazil)",
+        -10.85,
+        -55.75,
     ),
     (
         ("rondoni",),
@@ -1625,27 +1670,134 @@ def _default_geocode_place(place_name: str) -> tuple[float, float, str] | None:
     return None
 
 
+def reconcile_executed_metadata(
+    plan: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Overwrite planned sensor/date/scale/area metadata with strict ground truth from executed frames.
+
+    Prevents hallucinations such as reporting planned ``MODIS (500 m)`` for a ``1990–2025`` run
+    that actually executed on ``Landsat-5/7 (GEE)`` + ``Landsat-8/9 (GEE)``.
+    """
+    frames = [f for f in (result.get("frames") or []) if isinstance(f, dict)]
+    used_sensors: list[str] = list(result.get("actual_sensors") or [])
+    if not used_sensors and frames:
+        used_sensors = sorted(
+            {
+                str(f.get("platform") or f.get("sensor_family") or "").strip()
+                for f in frames
+                if (f.get("platform") or f.get("sensor_family"))
+            }
+        )
+    if not used_sensors and isinstance(result.get("ts_df"), pd.DataFrame) and not result["ts_df"].empty:
+        tdf = result["ts_df"]
+        if "platform" in tdf.columns:
+            used_sensors = sorted({str(v).strip() for v in tdf["platform"].dropna().tolist() if str(v).strip()})
+        elif "sensor_family" in tdf.columns:
+            used_sensors = sorted({str(v).strip() for v in tdf["sensor_family"].dropna().tolist() if str(v).strip()})
+
+    used_start = str(result.get("actual_start_date") or "").strip()
+    used_end = str(result.get("actual_end_date") or "").strip()
+    if frames:
+        if not used_start:
+            used_start = str(frames[0].get("date") or "").strip()
+        if not used_end:
+            used_end = str(frames[-1].get("date") or "").strip()
+    elif isinstance(result.get("ts_df"), pd.DataFrame) and not result["ts_df"].empty and "date_str" in result["ts_df"].columns:
+        if not used_start:
+            used_start = str(result["ts_df"]["date_str"].iloc[0]).strip()
+        if not used_end:
+            used_end = str(result["ts_df"]["date_str"].iloc[-1]).strip()
+
+    used_scale_m = result.get("actual_resolution_m") or result.get("reduce_scale_m")
+    if used_scale_m is None and frames:
+        res_vals = [f.get("resolution_m") for f in frames if f.get("resolution_m")]
+        if res_vals:
+            used_scale_m = int(round(float(res_vals[-1])))
+    if used_scale_m is None:
+        used_scale_m = plan.get("resolution_m", 10)
+    used_scale_m = int(round(float(used_scale_m)))
+
+    used_aoi_km2 = result.get("actual_aoi_area_km2")
+    if not used_aoi_km2:
+        cs = result.get("change_summary") or {}
+        if isinstance(cs, dict) and float(cs.get("total_valid_km2") or 0.0) > 0.0:
+            used_aoi_km2 = round(float(cs["total_valid_km2"]), 1)
+    if not used_aoi_km2:
+        bb = result.get("bbox_4326")
+        if isinstance(bb, (list, tuple)) and len(bb) == 4:
+            min_lon, min_lat, max_lon, max_lat = [float(v) for v in bb]
+            c_lat = 0.5 * (min_lat + max_lat)
+            h_km = abs(max_lat - min_lat) * 111.32
+            w_km = abs(max_lon - min_lon) * 111.32 * max(0.12, float(np.cos(np.radians(c_lat))))
+            used_aoi_km2 = round(max(1.0, h_km * w_km), 1)
+        else:
+            rad_m = float(plan.get("radius_m") or 0.0)
+            if rad_m > 0.0:
+                used_aoi_km2 = round(((2.0 * rad_m) ** 2) / 1e6, 1)
+
+    # Strictly overwrite planned fields with executed ground truth
+    if used_sensors:
+        result["actual_sensors"] = list(used_sensors)
+        plan["sensors"] = list(used_sensors)
+        plan["sensor_display"] = " + ".join(used_sensors)
+        low_s = " ".join(used_sensors).lower()
+        if "modis" not in low_s:
+            if "sentinel-2" in low_s and "landsat" in low_s:
+                plan["sensor"] = SENSOR_S2
+            elif "landsat" in low_s:
+                plan["sensor"] = SENSOR_LANDSAT
+            elif "sentinel-2" in low_s:
+                plan["sensor"] = SENSOR_S2
+            elif "sentinel-1" in low_s:
+                plan["sensor"] = SENSOR_S1
+    if used_start:
+        result["actual_start_date"] = used_start
+        plan["start_date"] = used_start
+    if used_end:
+        result["actual_end_date"] = used_end
+        plan["end_date"] = used_end
+    result["actual_resolution_m"] = used_scale_m
+    plan["resolution_m"] = used_scale_m
+    if used_aoi_km2:
+        result["actual_aoi_area_km2"] = float(used_aoi_km2)
+        plan["actual_aoi_area_km2"] = float(used_aoi_km2)
+
+    return {
+        "used_sensors": used_sensors,
+        "used_date_start": used_start,
+        "used_date_end": used_end,
+        "used_scale_m": used_scale_m,
+        "actual_aoi_area_km2": float(used_aoi_km2) if used_aoi_km2 else None,
+        "aoi_geometry_type": "rectangular",
+    }
+
+
 def build_technical_summary(
     plan: dict[str, Any],
     result: dict[str, Any],
     lang: str = "sl",
 ) -> str:
     """Build a crisp copy-ready geodetic technical summary for seminar/thesis reports."""
+    gt = reconcile_executed_metadata(plan, result)
     crs = result.get("crs", CRS_D96TM)
     task = plan["task_type"]
     place = result.get("resolved_place", plan["place_name"])
-    sensor = plan["sensor"]
-    res_m = plan["resolution_m"]
+    sensor = " + ".join(gt["used_sensors"]) if gt["used_sensors"] else plan["sensor"]
+    res_m = gt["used_scale_m"] or plan["resolution_m"]
+    aoi_km2 = gt.get("actual_aoi_area_km2")
 
     lines: list[str] = []
     if lang == "sl":
         lines.append("=== TEHNIČNI POVZETEK GEODETSKE ANALIZE (DALJINSKO ZAZNAVANJE) ===")
-        lines.append(f"Območje (AOI): {place} (φ={result['lat']:.5f}°, λ={result['lon']:.5f}°, radij={plan['radius_m']} m)")
+        area_s = f", pravokotni AOI≈{aoi_km2:,.1f} km²" if aoi_km2 else f", polovična stranica={plan['radius_m']} m"
+        lines.append(f"Območje (AOI): {place} (φ={result['lat']:.5f}°, λ={result['lon']:.5f}°{area_s})")
         lines.append(f"Koordinatni sistem (CRS): {crs} | Prostorska ločljivost: {res_m} m")
         lines.append(f"Senzor: {sensor} | Analiza: {task} ({plan['index_name']})")
     else:
         lines.append("=== GEODETIC REMOTE SENSING TECHNICAL SUMMARY ===")
-        lines.append(f"Area of Interest (AOI): {place} (φ={result['lat']:.5f}°, λ={result['lon']:.5f}°, radius={plan['radius_m']} m)")
+        area_s = f", rectangular AOI≈{aoi_km2:,.1f} km²" if aoi_km2 else f", half-width={plan['radius_m']} m"
+        lines.append(f"Area of Interest (AOI): {place} (φ={result['lat']:.5f}°, λ={result['lon']:.5f}°{area_s})")
         lines.append(f"Coordinate Reference System: {crs} | Spatial Resolution: {res_m} m")
         lines.append(f"Sensor: {sensor} | Analysis: {task} ({plan['index_name']})")
 
@@ -1665,14 +1817,14 @@ def build_technical_summary(
     elif task in ("time_series", "time_series_and_comparison"):
         ts_df: pd.DataFrame = result["ts_df"]
         n_obs = len(ts_df)
-        d1 = str(ts_df["date_str"].iloc[0]) if n_obs else plan["start_date"]
-        d2 = str(ts_df["date_str"].iloc[-1]) if n_obs else plan["end_date"]
+        d1 = gt["used_date_start"] or (str(ts_df["date_str"].iloc[0]) if n_obs else plan["start_date"])
+        d2 = gt["used_date_end"] or (str(ts_df["date_str"].iloc[-1]) if n_obs else plan["end_date"])
         mean_val = float(ts_df["mean"].mean()) if n_obs else float("nan")
         if lang == "sl":
             lines.append(f"Obdobje časovne vrste: {d1} – {d2} ({n_obs} veljavnih datumov, interval: {plan['interval']})")
             lines.append(f"Povprečna vrednost {plan['index_name']}: {mean_val:.3f}")
             if result.get("engine") == "gee":
-                lines.append(f"Pogon obdelave: Google Earth Engine (strežniška obdelava, projekt: {result.get('gee_project_id') or 'GEE'})")
+                lines.append("Pogon obdelave: Google Earth Engine (strežniška obdelava)")
                 cs = result.get("change_summary") or {}
                 if cs.get("decrease_area_km2") is not None:
                     lines.append(
@@ -1686,7 +1838,7 @@ def build_technical_summary(
             lines.append(f"Time Series Span: {d1} – {d2} ({n_obs} valid dates, interval: {plan['interval']})")
             lines.append(f"Mean {plan['index_name']} value: {mean_val:.3f}")
             if result.get("engine") == "gee":
-                lines.append(f"Processing Engine: Google Earth Engine (server-side processing, project: {result.get('gee_project_id') or 'GEE'})")
+                lines.append("Processing Engine: Google Earth Engine (server-side processing)")
                 cs = result.get("change_summary") or {}
                 if cs.get("decrease_area_km2") is not None:
                     lines.append(
@@ -1781,11 +1933,18 @@ def build_technical_summary(
         else:
             lines.append(f"Scene Date: {result.get('date_str', '')} ({result.get('tile', '')})")
 
-    lines.append(
-        "Vir podatkov: Copernicus / USGS (Microsoft Planetary Computer STAC)"
-        if lang == "sl"
-        else "Data Source: Copernicus / USGS (Microsoft Planetary Computer STAC)"
-    )
+    if result.get("engine") == "gee":
+        lines.append(
+            "Vir podatkov: USGS / Copernicus (Google Earth Engine)"
+            if lang == "sl"
+            else "Data Source: USGS / Copernicus (Google Earth Engine)"
+        )
+    else:
+        lines.append(
+            "Vir podatkov: Copernicus / USGS (Microsoft Planetary Computer STAC)"
+            if lang == "sl"
+            else "Data Source: Copernicus / USGS (Microsoft Planetary Computer STAC)"
+        )
     return "\n".join(lines)
 
 
@@ -1815,30 +1974,40 @@ def build_analysis_context_dict(
     result: dict[str, Any],
 ) -> dict[str, Any]:
     """Extract a clean, JSON-serializable structured summary of any executed EO/geodetic analysis for chat memory."""
+    gt = reconcile_executed_metadata(plan, result)
     kind = str(result.get("kind", ""))
+    used_sensors = list(gt["used_sensors"] or [str(plan.get("sensor", SENSOR_S2))])
     ctx: dict[str, Any] = {
         "kind": kind,
+        "engine": str(result.get("engine") or "stac"),
         "place_name": str(plan.get("place_name", "")),
         "resolved_place": str(result.get("resolved_place", plan.get("place_name", ""))),
         "lat": round(_sfloat(result.get("lat"), 0.0), 5),
         "lon": round(_sfloat(result.get("lon"), 0.0), 5),
         "radius_m": _sint(plan.get("radius_m"), 4000),
+        "aoi_geometry_type": "rectangular",
+        "actual_aoi_area_km2": gt.get("actual_aoi_area_km2"),
         "crs": str(result.get("crs", CRS_D96TM)),
-        "sensor": str(plan.get("sensor", SENSOR_S2)),
-        "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_S2)]),
+        "sensor": " + ".join(used_sensors),
+        "sensors": used_sensors,
+        "used_sensors": used_sensors,
         "fusion_mode": str(plan.get("fusion_mode") or FUSION_SINGLE),
         "fusion_rationale_sl": str(plan.get("fusion_rationale_sl") or ""),
         "fusion_rationale_en": str(plan.get("fusion_rationale_en") or ""),
-        "resolution_m": _sint(plan.get("resolution_m"), 10),
+        "resolution_m": _sint(gt.get("used_scale_m"), _sint(plan.get("resolution_m"), 10)),
+        "used_scale_m": _sint(gt.get("used_scale_m"), _sint(plan.get("resolution_m"), 10)),
         "task_type": str(plan.get("task_type", "")),
         "index_name": str(plan.get("index_name", "")),
-        "start_date": str(plan.get("start_date", "")),
-        "end_date": str(plan.get("end_date", "")),
+        "start_date": str(gt.get("used_date_start") or plan.get("start_date", "")),
+        "end_date": str(gt.get("used_date_end") or plan.get("end_date", "")),
+        "used_date_start": str(gt.get("used_date_start") or plan.get("start_date", "")),
+        "used_date_end": str(gt.get("used_date_end") or plan.get("end_date", "")),
         "event_date": str(plan.get("event_date", "")),
         "technical_summary": str(result.get("technical_summary", "")),
     }
     if isinstance(result.get("synergy_metrics"), dict) and result["synergy_metrics"]:
-        ctx["synergy_metrics"] = dict(result["synergy_metrics"])
+        clean_syn = {k: v for k, v in result["synergy_metrics"].items() if k != "gee_project_id"}
+        ctx["synergy_metrics"] = clean_syn
 
     if kind == "disaster" and isinstance(result.get("disaster_result"), dict):
         dis = result["disaster_result"]
@@ -1955,14 +2124,23 @@ def build_analysis_context_dict(
                 "first_val": round(float(fin_vals[0]), 4) if fin_vals.size else None,
                 "last_val": round(float(fin_vals[-1]), 4) if fin_vals.size else None,
                 "trend_slope_per_obs": slope,
-                "has_visual_comparison": bool(result.get("comparison_rgb") or result.get("comparison_index")),
+                "has_visual_comparison": bool(result.get("comparison_rgb") or result.get("comparison_index") or len(result.get("frames") or []) >= 2),
             }
         )
         cs_ts = result.get("change_summary") or {}
         if cs_ts:
-            ctx["delta_mean"] = round(_sfloat(cs_ts.get("mean"), 0.0), 4)
-            ctx["pos_area_ha"] = round(_sfloat(cs_ts.get("pos_area_ha"), 0.0), 2)
-            ctx["neg_area_ha"] = round(_sfloat(cs_ts.get("neg_area_ha"), 0.0), 2)
+            d_m = cs_ts.get("delta_mean") if cs_ts.get("delta_mean") is not None else cs_ts.get("mean")
+            ctx["delta_mean"] = round(_sfloat(d_m, 0.0), 4)
+            if cs_ts.get("decrease_area_km2") is not None:
+                ctx["decrease_area_km2"] = round(_sfloat(cs_ts.get("decrease_area_km2"), 0.0), 2)
+                ctx["decrease_area_ha"] = round(_sfloat(cs_ts.get("decrease_area_ha"), 0.0), 1)
+                ctx["decrease_pct"] = round(_sfloat(cs_ts.get("decrease_pct"), 0.0), 2)
+                ctx["increase_area_km2"] = round(_sfloat(cs_ts.get("increase_area_km2"), 0.0), 2)
+                ctx["increase_pct"] = round(_sfloat(cs_ts.get("increase_pct"), 0.0), 2)
+                ctx["total_valid_km2"] = round(_sfloat(cs_ts.get("total_valid_km2"), 0.0), 2)
+            else:
+                ctx["pos_area_ha"] = round(_sfloat(cs_ts.get("pos_area_ha"), 0.0), 2)
+                ctx["neg_area_ha"] = round(_sfloat(cs_ts.get("neg_area_ha"), 0.0), 2)
         g_stats = result.get("glacier_change_stats")
         if isinstance(g_stats, dict) and g_stats:
             ctx["glacier_change_stats"] = dict(g_stats)
@@ -3114,15 +3292,17 @@ def execute_ai_plan(
                 _ts_gee = gee_res["ts_df"]
                 _csv_gee = _ts_gee.to_csv(index=False).encode("utf-8-sig")
                 _csv_fn_gee = f"GEE_{_idx_for_gee}_{plan['place_name']}_{_sy_gee}_{_ey_gee}.csv"
+                _actual_s_list = list(gee_res.get("actual_sensors") or [])
+                _actual_s_str = " + ".join(_actual_s_list) if _actual_s_list else "Landsat C2 L2 / Sentinel-2 SR"
                 base_out["plan"]["fusion_rationale_sl"] = (
-                    "Za visokonatančno obdelavo velikega območja je bila uporabljena strežniška platforma "
-                    "**Google Earth Engine (GEE)** (Landsat C2 L2 + Sentinel-2 SR / MODIS), ki izračuna "
-                    "sezonske mediano-mozaike, Δ spremembe in površine v km² neposredno na Googlovih strežnikih."
+                    f"Za visokonatančno obdelavo območja je bila uporabljena strežniška platforma "
+                    f"**Google Earth Engine (GEE)** ({_actual_s_str}), ki izračuna "
+                    f"sezonske mediano-mozaike, Δ spremembe in površine v km² neposredno na Googlovih strežnikih."
                 )
                 base_out["plan"]["fusion_rationale_en"] = (
-                    "Server-side **Google Earth Engine (GEE)** processing (Landsat C2 L2 + Sentinel-2 SR / MODIS) "
-                    "was used for high-accuracy large-scale computation of seasonal median composites, Δ change maps, "
-                    "and exact pixelArea() statistics in km² directly on Google's servers."
+                    f"Server-side **Google Earth Engine (GEE)** processing ({_actual_s_str}) "
+                    f"was used for high-accuracy large-scale computation of seasonal median composites, Δ change maps, "
+                    f"and exact pixelArea() statistics in km² directly on Google's servers."
                 )
                 base_out.update(
                     {
@@ -3149,17 +3329,24 @@ def execute_ai_plan(
                         "delta_vmin": gee_res["delta_vmin"],
                         "delta_vmax": gee_res["delta_vmax"],
                         "delta_cmap": gee_res["delta_cmap"],
+                        "reduce_scale_m": gee_res.get("reduce_scale_m", 60),
+                        "actual_sensors": _actual_s_list,
+                        "actual_start_date": gee_res.get("actual_start_date", ""),
+                        "actual_end_date": gee_res.get("actual_end_date", ""),
+                        "actual_resolution_m": gee_res.get("actual_resolution_m", gee_res.get("reduce_scale_m", 60)),
+                        "actual_aoi_area_km2": gee_res.get("actual_aoi_area_km2"),
                         "synergy_metrics": {
                             "fusion_type": "gee_server_side",
                             "engine": "gee",
-                            "gee_project_id": gee_res.get("gee_project_id", ""),
+                            "used_sensors": _actual_s_list,
                             "reduce_scale_m": gee_res.get("reduce_scale_m", 60),
                             "total_frames": len(gee_res["frames"]),
                         },
                     }
                 )
-                base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
-                base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
+                reconcile_executed_metadata(base_out["plan"], base_out)
+                base_out["technical_summary"] = build_technical_summary(base_out["plan"], base_out, lang=lang)
+                base_out["analysis_context"] = build_analysis_context_dict(base_out["plan"], base_out)
                 _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
                 return base_out
         if _user_asked_gee and not is_gee_ready():
@@ -5321,10 +5508,16 @@ def generate_conversational_reply(
                 f"You are an expert, insightful Geodetic & Remote Sensing (Earth Observation) AI specialist. "
                 f"Write a thorough, complete, well-structured report in clear, natural {lang_name} using clean Markdown.\n"
                 f"A real geodetic / satellite analysis was JUST executed for the user's request. Exact computed results are provided in JSON below.\n"
+                f"STRICT FACTUALITY RULES (NEVER VIOLATE):\n"
+                f"- State ONLY the exact `used_sensors` and `used_date_start` → `used_date_end` provided in the JSON. "
+                f"NEVER mention `MODIS` if `used_sensors` are `Landsat` / `Sentinel-2`, and NEVER claim MODIS existed before year 2000 (Terra MODIS launched in Dec 1999)!\n"
+                f"- State the AOI geometry accurately as a **pravokotno/kvadratno analizno območje** (rectangular/square AOI) with exact area `actual_aoi_area_km2` km² (matching the raster pixel area used in `%` change calculations) — NEVER describe it as a circular area (`π r²`)!\n"
+                f"- NEVER print internal Google Cloud project IDs (e.g. `project-bb8eae96-...`) in the narrative — simply write **Google Earth Engine**.\n"
+                f"- NEVER invent numbers not present in the JSON.\n"
                 f"Organize your response into these 4 clear sections (with crisp headings in {lang_name}):\n"
-                f"1. **Ozadje dogodka in območja** (or Background & Geographic Context in EN): Concise, insightful geographic/historical context about the analyzed place or event (e.g., Mežiška dolina / Črna na Koroškem during the catastrophic August 2023 floods, Kras karst terrain during July 2022 wildfires, Triglav alpine glaciology, etc.).\n"
-                f"2. **Metodologija in podatki** (Methodology & Data): Exact sensor/dataset used, WHY it was chosen (e.g., Sentinel-1 SAR radar penetrates storm clouds; Sentinel-2 10 m optical; Landsat thermal ST_B10; Copernicus DEM 30 m; GNSS multi-constellation with 360° DEM+S2 obstruction mask), exact acquisition dates, spatial resolution, and projected metric CRS (`EPSG:3794` / local UTM).{fusion_instruction}{archive_instruction}\n"
-                f"3. **Podrobna interpretacija rezultatov** (Detailed Interpretation of Results): Thoroughly explain EVERY key computed number from the JSON (`ha`, `km²`, `%`, min/mean/median/max, severity classes, snowline altitude, slope/relief, UHI cooling delta °C, or PDOP/satellite visibility & optimal windows), what those values physically mean on the ground, AND important scientific limitations/caveats. NEVER invent numbers not present in the JSON.\n"
+                f"1. **Ozadje dogodka in območja** (or Background & Geographic Context in EN): Concise, insightful geographic/historical context about the analyzed place or event.\n"
+                f"2. **Metodologija in podatki** (Methodology & Data): Exact `used_sensors`, WHY they were chosen, exact `used_date_start` → `used_date_end`, spatial resolution (`used_scale_m` m), rectangular AOI area (`actual_aoi_area_km2` km²), and projected metric CRS.{fusion_instruction}{archive_instruction}\n"
+                f"3. **Podrobna interpretacija rezultatov** (Detailed Interpretation of Results): Thoroughly explain EVERY key computed number from the JSON (`ha`, `km²`, `%`, min/mean/median/max, `delta_mean`, severity classes, snowline altitude, slope/relief, UHI cooling delta °C, or PDOP/satellite visibility & optimal windows), what those values physically mean on the ground, AND important scientific limitations/caveats.\n"
                 f"4. **Predlogi za nadaljevanje** (Suggested Next Steps): 2–3 concrete follow-up analyses or questions the user can ask next in this chat."
             )
         else:
