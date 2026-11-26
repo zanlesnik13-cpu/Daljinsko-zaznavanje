@@ -252,6 +252,7 @@ from relief import (
 from gee_engine import (
     GEE_SUPPORTED_INDICES,
     disconnect_gee,
+    ensure_gee_initialized,
     gee_run_temporal_analysis,
     get_gee_status,
     init_gee,
@@ -9258,22 +9259,31 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
 
 def _render_sidebar_gee_settings(lang: str) -> None:
     """Render compact collapsible '🌍 Google Earth Engine (Opcijsko)' expander in Sidebar."""
-    if not st.session_state.get("_gee_auto_init_done"):
-        st.session_state["_gee_auto_init_done"] = True
+    if not st.session_state.get("_gee_secrets_checked"):
+        st.session_state["_gee_secrets_checked"] = True
         try:
-            init_gee()
+            ensure_gee_initialized()
         except Exception:
             pass
 
     st_gee = get_gee_status()
     connected = bool(st_gee.get("connected"))
     proj_cur = str(st_gee.get("project_id") or "")
+    mode_cur = str(st_gee.get("mode") or "none")
+    err_cur = str(st_gee.get("error") or "")
 
     with st.expander(t("gee_sidebar_expander", lang=lang), expanded=False):
         if connected:
-            st.markdown(f"**{t('gee_status_connected', lang=lang, project=proj_cur or 'GEE')}**")
+            proj_badge = (
+                f"Streamlit Secrets · {proj_cur or 'GEE'}"
+                if mode_cur == "secrets_service_account"
+                else (proj_cur or "GEE")
+            )
+            st.markdown(f"**{t('gee_status_connected', lang=lang, project=proj_badge)}**")
         else:
             st.caption(t("gee_status_disconnected", lang=lang))
+            if err_cur:
+                st.caption(f"⚠️ {err_cur}")
         st.caption(t("gee_tooltip", lang=lang))
 
         gee_proj_in = st.text_input(
@@ -9600,6 +9610,12 @@ def main() -> None:
     _init_session_state()
     _inject_tablet_readonly_dropdowns()
     github_restore_all_on_startup()
+    if not st.session_state.get("_gee_secrets_checked"):
+        st.session_state["_gee_secrets_checked"] = True
+        try:
+            ensure_gee_initialized()
+        except Exception:
+            pass
 
     # Apply any queued widget-bound state updates strictly BEFORE any sidebar/workspace widgets instantiate
     pending_w_state = st.session_state.pop("_pending_widget_state", None)

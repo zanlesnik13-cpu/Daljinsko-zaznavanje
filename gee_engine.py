@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module-level connection state (safe, lightweight, never persists secrets)
 # ---------------------------------------------------------------------------
+_GEE_AUTO_ATTEMPTED: bool = False
 _GEE_STATE: dict[str, Any] = {
     "connected": False,
     "project_id": "",
@@ -168,31 +170,64 @@ GEE_DELTA_PALETTES: dict[str, list[str]] = {
 
 
 def _read_secret_or_env(key: str) -> Any:
-    """Safely read a secret from Streamlit secrets or environment variables."""
+    """Safely read a secret from Streamlit ``st.secrets`` or environment variables."""
     try:
         import streamlit as st
 
-        if key in st.secrets:
-            return st.secrets[key]
+        val = st.secrets.get(key, None)
+        if val is not None:
+            return val
     except Exception:
-        pass
+        try:
+            import streamlit as st
+
+            if key in st.secrets:
+                return st.secrets[key]
+        except Exception:
+            pass
     return os.environ.get(key)
 
 
+def _normalize_sa_dict(data: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Convert a Mapping/AttrDict into a clean dict with normalized PEM newlines in ``private_key``."""
+    out = {str(k): v for k, v in data.items()}
+    email = str(out.get("client_email") or "").strip()
+    raw_pk = out.get("private_key")
+    if not email or not raw_pk:
+        return None
+    pk_norm = str(raw_pk).replace("\\n", "\n").strip()
+    if not pk_norm.endswith("\n"):
+        pk_norm += "\n"
+    out["client_email"] = email
+    out["private_key"] = pk_norm
+    if "type" not in out:
+        out["type"] = "service_account"
+    return out
+
+
 def _parse_service_account_payload(
-    raw_json: str | dict[str, Any] | None,
+    raw_json: str | Mapping[str, Any] | None,
 ) -> tuple[str | None, str | None, str | None]:
-    """Extract ``(client_email, json_str, project_id)`` from a service-account JSON string or dict."""
+    """Extract ``(client_email, json_str, project_id)`` from a service-account JSON string or Mapping/AttrDict."""
     if raw_json is None:
         return None, None, None
     data: dict[str, Any] | None = None
-    if isinstance(raw_json, dict):
-        data = dict(raw_json)
+    if isinstance(raw_json, Mapping):
+        data = _normalize_sa_dict(raw_json)
     elif isinstance(raw_json, str):
         txt = raw_json.strip()
+        # Strip accidental triple-quote wrappers pasted from TOML examples
+        for q in ("'''", '"""'):
+            if txt.startswith(q) and txt.endswith(q) and len(txt) >= 6:
+                txt = txt[3:-3].strip()
         if not txt:
             return None, None, None
-        data = json.loads(txt)
+        try:
+            parsed = json.loads(txt)
+        except json.JSONDecodeError:
+            parsed = json.loads(txt, strict=False)
+        if isinstance(parsed, Mapping):
+            data = _normalize_sa_dict(parsed)
     if not isinstance(data, dict):
         return None, None, None
     email = str(data.get("client_email") or "").strip()
@@ -200,6 +235,46 @@ def _parse_service_account_payload(
         return None, None, None
     proj = str(data.get("project_id") or "").strip() or None
     return email, json.dumps(data), proj
+
+
+def _load_secrets_credentials() -> tuple[dict[str, Any] | None, str]:
+    """Read and normalize GEE service-account credentials and project ID from ``st.secrets`` / env.
+
+    Supports:
+        - ``GEE_SERVICE_ACCOUNT_JSON`` as a raw JSON string (including TOML ``'''...'''`` with ``\\n``)
+          or as a parsed TOML table / Streamlit ``AttrDict`` (``Mapping``).
+        - ``GEE_SERVICE_ACCOUNT_EMAIL`` + ``GEE_PRIVATE_KEY``.
+        - ``GEE_PROJECT_ID`` (falling back to ``project_id`` inside the JSON itself).
+
+    Returns ``(creds_dict_or_None, project_id_str)``.
+    """
+    secret_proj = str(_read_secret_or_env("GEE_PROJECT_ID") or "").strip()
+    raw_sa = _read_secret_or_env("GEE_SERVICE_ACCOUNT_JSON")
+    if raw_sa is not None and raw_sa != "":
+        try:
+            email, json_str, sa_proj = _parse_service_account_payload(raw_sa)
+            if email and json_str:
+                creds_dict = json.loads(json_str)
+                eff_proj = secret_proj or sa_proj or ""
+                return creds_dict, eff_proj
+        except Exception as exc:
+            logger.warning("Failed to parse GEE_SERVICE_ACCOUNT_JSON from secrets: %s", exc)
+
+    sa_email = str(_read_secret_or_env("GEE_SERVICE_ACCOUNT_EMAIL") or "").strip()
+    sa_key = str(_read_secret_or_env("GEE_PRIVATE_KEY") or "").strip()
+    if sa_email and sa_key:
+        creds_dict = _normalize_sa_dict(
+            {
+                "type": "service_account",
+                "client_email": sa_email,
+                "private_key": sa_key,
+                "project_id": secret_proj,
+            }
+        )
+        if creds_dict is not None:
+            return creds_dict, secret_proj
+
+    return None, secret_proj
 
 
 def _has_local_ee_credentials() -> bool:
@@ -210,7 +285,7 @@ def _has_local_ee_credentials() -> bool:
 
 def init_gee(
     project_id: str | None = None,
-    service_account_json: str | dict[str, Any] | None = None,
+    service_account_json: str | Mapping[str, Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     """Initialize Google Earth Engine using 3 optional authentication paths.
@@ -224,7 +299,8 @@ def init_gee(
     Never raises unhandled exceptions; returns a status dict with keys:
     ``connected``, ``project_id``, ``mode``, ``error``.
     """
-    global _GEE_STATE
+    global _GEE_STATE, _GEE_AUTO_ATTEMPTED
+    _GEE_AUTO_ATTEMPTED = True
 
     if _GEE_STATE["connected"] and not force and not service_account_json and not project_id:
         return dict(_GEE_STATE)
@@ -239,7 +315,7 @@ def init_gee(
         return dict(_GEE_STATE)
 
     req_proj = str(project_id or "").strip()
-    secret_proj = str(_read_secret_or_env("GEE_PROJECT_ID") or "").strip()
+    sec_creds, secret_proj = _load_secrets_credentials()
 
     # Path 1: Explicit / session-level Service Account JSON
     if service_account_json:
@@ -270,48 +346,12 @@ def init_gee(
             return dict(_GEE_STATE)
 
     # Path 2: Streamlit Secrets / Env Service Account
-    raw_sa = _read_secret_or_env("GEE_SERVICE_ACCOUNT_JSON")
-    if raw_sa:
+    if sec_creds is not None:
         try:
-            email, json_str, sa_proj = _parse_service_account_payload(raw_sa)
-            if email and json_str:
-                eff_proj = req_proj or secret_proj or sa_proj
-                creds = ee.ServiceAccountCredentials(email, key_data=json_str)
-                if eff_proj:
-                    ee.Initialize(credentials=creds, project=eff_proj)
-                else:
-                    ee.Initialize(credentials=creds)
-                _GEE_STATE = {
-                    "connected": True,
-                    "project_id": eff_proj or "secrets-service-account",
-                    "mode": "secrets_service_account",
-                    "error": "",
-                }
-                return dict(_GEE_STATE)
-        except Exception as exc:
-            logger.warning("GEE secrets service-account auth failed: %s", exc)
-            _GEE_STATE = {
-                "connected": False,
-                "project_id": req_proj or secret_proj,
-                "mode": "none",
-                "error": str(exc),
-            }
-            return dict(_GEE_STATE)
-
-    sa_email = str(_read_secret_or_env("GEE_SERVICE_ACCOUNT_EMAIL") or "").strip()
-    sa_key = str(_read_secret_or_env("GEE_PRIVATE_KEY") or "").strip()
-    if sa_email and sa_key:
-        try:
-            eff_proj = req_proj or secret_proj
-            payload = json.dumps(
-                {
-                    "type": "service_account",
-                    "client_email": sa_email,
-                    "private_key": sa_key.replace("\\n", "\n"),
-                    "project_id": eff_proj,
-                }
-            )
-            creds = ee.ServiceAccountCredentials(sa_email, key_data=payload)
+            email = str(sec_creds["client_email"])
+            json_str = json.dumps(sec_creds)
+            eff_proj = req_proj or secret_proj or str(sec_creds.get("project_id") or "").strip()
+            creds = ee.ServiceAccountCredentials(email, key_data=json_str)
             if eff_proj:
                 ee.Initialize(credentials=creds, project=eff_proj)
             else:
@@ -324,7 +364,7 @@ def init_gee(
             }
             return dict(_GEE_STATE)
         except Exception as exc:
-            logger.warning("GEE email+key service-account auth failed: %s", exc)
+            logger.warning("GEE secrets service-account auth failed: %s", exc)
             _GEE_STATE = {
                 "connected": False,
                 "project_id": req_proj or secret_proj,
@@ -366,9 +406,21 @@ def init_gee(
     return dict(_GEE_STATE)
 
 
+def ensure_gee_initialized() -> bool:
+    """Auto-initialize GEE once from ``st.secrets`` / env / local creds if not yet attempted."""
+    global _GEE_AUTO_ATTEMPTED
+    if _GEE_STATE.get("connected"):
+        return True
+    if _GEE_AUTO_ATTEMPTED:
+        return False
+    res = init_gee()
+    return bool(res.get("connected"))
+
+
 def disconnect_gee() -> dict[str, Any]:
     """Reset the active GEE session state (returns to Planetary Computer default)."""
-    global _GEE_STATE
+    global _GEE_STATE, _GEE_AUTO_ATTEMPTED
+    _GEE_AUTO_ATTEMPTED = True
     _GEE_STATE = {
         "connected": False,
         "project_id": "",
@@ -380,11 +432,17 @@ def disconnect_gee() -> dict[str, Any]:
 
 def is_gee_ready() -> bool:
     """Return True if Google Earth Engine is initialized and ready for server-side runs."""
-    return bool(_EE_IMPORT_OK and ee is not None and _GEE_STATE.get("connected"))
+    if not _EE_IMPORT_OK or ee is None:
+        return False
+    if not _GEE_STATE.get("connected") and not _GEE_AUTO_ATTEMPTED:
+        ensure_gee_initialized()
+    return bool(_GEE_STATE.get("connected"))
 
 
 def get_gee_status() -> dict[str, Any]:
     """Return a copy of the current GEE connection status dict."""
+    if _EE_IMPORT_OK and ee is not None and not _GEE_STATE.get("connected") and not _GEE_AUTO_ATTEMPTED:
+        ensure_gee_initialized()
     return {
         "connected": bool(_GEE_STATE.get("connected")),
         "project_id": str(_GEE_STATE.get("project_id") or ""),
