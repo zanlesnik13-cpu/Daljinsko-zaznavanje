@@ -100,6 +100,7 @@ from gee_engine import (
     GEE_SUPPORTED_INDICES,
     gee_run_temporal_analysis,
     is_gee_ready,
+    is_transient_gee_timeout,
 )
 
 # ---------------------------------------------------------------------------
@@ -3074,68 +3075,90 @@ def execute_ai_plan(
             _ey_gee = _parse_iso_date(plan.get("end_date"), date.today()).year
             _gee_sensor_mode = "modis" if (_sfloat(plan.get("radius_m"), 0.0) >= 400_000.0 and _sy_gee >= 2000) else "auto_fusion"
             _gee_season = _resolve_ai_target_season(plan)
-            gee_res = gee_run_temporal_analysis(
-                bbox_4326=bbox_4326,
-                start_year=_sy_gee,
-                end_year=_ey_gee,
-                index_code=_idx_for_gee,
-                sensor_mode=_gee_sensor_mode,
-                target_season=_gee_season,
-                max_frames=9,
-                progress_cb=progress_cb,
-                lang=lang,
-            )
-            _ts_gee = gee_res["ts_df"]
-            _csv_gee = _ts_gee.to_csv(index=False).encode("utf-8-sig")
-            _csv_fn_gee = f"GEE_{_idx_for_gee}_{plan['place_name']}_{_sy_gee}_{_ey_gee}.csv"
-            base_out["plan"]["fusion_rationale_sl"] = (
-                "Za visokonatančno obdelavo velikega območja je bila uporabljena strežniška platforma "
-                "**Google Earth Engine (GEE)** (Landsat C2 L2 + Sentinel-2 SR / MODIS), ki izračuna "
-                "sezonske mediano-mozaike, Δ spremembe in površine v km² neposredno na Googlovih strežnikih."
-            )
-            base_out["plan"]["fusion_rationale_en"] = (
-                "Server-side **Google Earth Engine (GEE)** processing (Landsat C2 L2 + Sentinel-2 SR / MODIS) "
-                "was used for high-accuracy large-scale computation of seasonal median composites, Δ change maps, "
-                "and exact pixelArea() statistics in km² directly on Google's servers."
-            )
-            base_out.update(
-                {
-                    "kind": "time_series_and_comparison" if len(gee_res["frames"]) >= 2 else "time_series",
-                    "engine": "gee",
-                    "gee_project_id": gee_res.get("gee_project_id", ""),
-                    "adaptive_interval": "Letno",
-                    "relevant_layers": ["RGB", _idx_for_gee] + list(gee_res.get("extra_indices") or []),
-                    "extra_indices": list(gee_res.get("extra_indices") or []),
-                    "ts_df": _ts_gee,
-                    "csv_bytes": _csv_gee,
-                    "csv_filename": _csv_fn_gee,
-                    "frames": gee_res["frames"],
-                    "default_t1_index": gee_res["default_t1_index"],
-                    "excluded_archive_dates": gee_res["excluded_archive_dates"],
-                    "timelapse_rgb_gif_bytes": gee_res["timelapse_rgb_gif_bytes"],
-                    "timelapse_index_gif_bytes": gee_res["timelapse_index_gif_bytes"],
-                    "comparison_rgb": None,
-                    "comparison_index": None,
-                    "comparison_result": None,
-                    "change_summary": gee_res["change_summary"],
-                    "delta_overlay_uri": gee_res["delta_overlay_uri"],
-                    "delta_overlay_bounds": gee_res["delta_overlay_bounds"],
-                    "delta_vmin": gee_res["delta_vmin"],
-                    "delta_vmax": gee_res["delta_vmax"],
-                    "delta_cmap": gee_res["delta_cmap"],
-                    "synergy_metrics": {
-                        "fusion_type": "gee_server_side",
+            gee_res: dict[str, Any] | None = None
+            try:
+                gee_res = gee_run_temporal_analysis(
+                    bbox_4326=bbox_4326,
+                    start_year=_sy_gee,
+                    end_year=_ey_gee,
+                    index_code=_idx_for_gee,
+                    sensor_mode=_gee_sensor_mode,
+                    target_season=_gee_season,
+                    max_frames=9,
+                    progress_cb=progress_cb,
+                    lang=lang,
+                )
+            except Exception as _gee_exc:
+                _est_area_km2 = ((2.0 * _sfloat(plan.get("radius_m"), 0.0)) ** 2) / 1e6
+                _can_fallback_stac = bool(
+                    is_transient_gee_timeout(_gee_exc)
+                    and (
+                        _est_area_km2 <= 1_500.0
+                        or sensor in MODIS_SENSORS
+                        or _detect_continental_polar_region(_q_norm_gee, str(plan.get("place_name") or "")) is not None
+                    )
+                )
+                if not _can_fallback_stac:
+                    raise
+                base_out["gee_fallback_note"] = (
+                    "ℹ️ Google Earth Engine je presegel časovno omejitev; analiza je bila samodejno izvedena prek Planetary Computer (STAC)."
+                    if lang == "sl"
+                    else "ℹ️ Google Earth Engine timed out; the analysis was automatically completed via Planetary Computer (STAC)."
+                )
+                gee_res = None
+
+            if isinstance(gee_res, dict):
+                _ts_gee = gee_res["ts_df"]
+                _csv_gee = _ts_gee.to_csv(index=False).encode("utf-8-sig")
+                _csv_fn_gee = f"GEE_{_idx_for_gee}_{plan['place_name']}_{_sy_gee}_{_ey_gee}.csv"
+                base_out["plan"]["fusion_rationale_sl"] = (
+                    "Za visokonatančno obdelavo velikega območja je bila uporabljena strežniška platforma "
+                    "**Google Earth Engine (GEE)** (Landsat C2 L2 + Sentinel-2 SR / MODIS), ki izračuna "
+                    "sezonske mediano-mozaike, Δ spremembe in površine v km² neposredno na Googlovih strežnikih."
+                )
+                base_out["plan"]["fusion_rationale_en"] = (
+                    "Server-side **Google Earth Engine (GEE)** processing (Landsat C2 L2 + Sentinel-2 SR / MODIS) "
+                    "was used for high-accuracy large-scale computation of seasonal median composites, Δ change maps, "
+                    "and exact pixelArea() statistics in km² directly on Google's servers."
+                )
+                base_out.update(
+                    {
+                        "kind": "time_series_and_comparison" if len(gee_res["frames"]) >= 2 else "time_series",
                         "engine": "gee",
                         "gee_project_id": gee_res.get("gee_project_id", ""),
-                        "reduce_scale_m": gee_res.get("reduce_scale_m", 120),
-                        "total_frames": len(gee_res["frames"]),
-                    },
-                }
-            )
-            base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
-            base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
-            _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
-            return base_out
+                        "adaptive_interval": "Letno",
+                        "relevant_layers": ["RGB", _idx_for_gee] + list(gee_res.get("extra_indices") or []),
+                        "extra_indices": list(gee_res.get("extra_indices") or []),
+                        "ts_df": _ts_gee,
+                        "csv_bytes": _csv_gee,
+                        "csv_filename": _csv_fn_gee,
+                        "frames": gee_res["frames"],
+                        "default_t1_index": gee_res["default_t1_index"],
+                        "excluded_archive_dates": gee_res["excluded_archive_dates"],
+                        "timelapse_rgb_gif_bytes": gee_res["timelapse_rgb_gif_bytes"],
+                        "timelapse_index_gif_bytes": gee_res["timelapse_index_gif_bytes"],
+                        "comparison_rgb": None,
+                        "comparison_index": None,
+                        "comparison_result": None,
+                        "change_summary": gee_res["change_summary"],
+                        "delta_overlay_uri": gee_res["delta_overlay_uri"],
+                        "delta_overlay_bounds": gee_res["delta_overlay_bounds"],
+                        "delta_vmin": gee_res["delta_vmin"],
+                        "delta_vmax": gee_res["delta_vmax"],
+                        "delta_cmap": gee_res["delta_cmap"],
+                        "synergy_metrics": {
+                            "fusion_type": "gee_server_side",
+                            "engine": "gee",
+                            "gee_project_id": gee_res.get("gee_project_id", ""),
+                            "reduce_scale_m": gee_res.get("reduce_scale_m", 60),
+                            "total_frames": len(gee_res["frames"]),
+                        },
+                    }
+                )
+                base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+                base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
+                _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
+                return base_out
         if _user_asked_gee and not is_gee_ready():
             base_out["gee_fallback_note"] = (
                 "Opomba: Google Earth Engine še ni nastavljen v stranski vrstici, zato je bila analiza samodejno izvedena prek Microsoft Planetary Computer (STAC/MODIS)."
