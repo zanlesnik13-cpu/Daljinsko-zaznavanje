@@ -6,7 +6,7 @@
       "id": "eae1f24f",
       "title": "Krčenja amazonskega pragozda skozi leta",
       "created_at": "2026-11-26T18:32:28Z",
-      "updated_at": "2026-11-26T19:07:45Z",
+      "updated_at": "2026-11-26T20:47:03Z",
       "pinned": false,
       "messages": [
         {
@@ -129,6 +129,15 @@
             "resolved_place": "Amazon Rainforest Basin",
             "crs": "EPSG:32720"
           }
+        },
+        {
+          "role": "user",
+          "content": "Lahko analiziraš predlagano vročo točko"
+        },
+        {
+          "role": "assistant",
+          "content": "Katero vročo točko krčenja pragozda v Amazoniji bi želeli podrobno analizirati v visoki ločljivosti (Landsat/Sentinel-2)? Predlagam tri najbolj reprezentativna območja t.i. loka krčenja (Arc of Deforestation):\n1. **Rondônia (Ariquemes / BR-364)** – ikoničen vzorec krčenja v obliki ribje kosti vzdolž cestnih koridorjev,\n2. **Novo Progresso, Pará (koridor BR-163)** – žarišče nedavnega obsežnega sekanja in požarov za pašnike,\n3. **Sinop / Alta Floresta (Mato Grosso)** – intenzivna preobrazba gozda v obsežne monokulture soje.",
+          "action": "ask_clarification"
         }
       ],
       "last_analysis_context": {
@@ -182,7 +191,7 @@
       "id": "8a5754de",
       "title": "Krčenja ledenika grosglockner v zadnjih 50…",
       "created_at": "2026-11-25T18:42:57Z",
-      "updated_at": "2026-11-26T18:54:15Z",
+      "updated_at": "2026-11-26T20:46:13Z",
       "pinned": false,
       "messages": [
         {
