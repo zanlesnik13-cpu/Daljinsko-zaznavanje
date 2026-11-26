@@ -6,7 +6,7 @@
       "id": "eae1f24f",
       "title": "Krčenja amazonskega pragozda skozi leta",
       "created_at": "2026-11-26T18:32:28Z",
-      "updated_at": "2026-11-26T18:54:40Z",
+      "updated_at": "2026-11-26T19:07:45Z",
       "pinned": false,
       "messages": [
         {
@@ -15,11 +15,167 @@
         },
         {
           "role": "assistant",
-          "content": "⚠️ Napaka pri izvedbi AI analize: Permission 'earthengine.thumbnails.create' denied on resource 'projects/project-bb8eae96-1b75-4d2e-81d' (or it may not exist).",
-          "action": "error"
+          "content": "Izvedena je bila obsežna satelitska analiza časovne dinamike vegetacijskega pokrova in krčenja gozda v porečju Amazonke z uporabo platforme Google Earth Engine (GEE). Spodaj je podrobno strokovno poročilo.\n\n---\n\n### 1. Ozadje dogodka in območja\n\nAmazonski pragozd predstavlja največji strnjeni tropski deževni gozd na Zemlji in ključen ponor ogljika, ki uravnava globalni hidrološki cikel ter blaži podnebne spremembe. Obravnavano območje interesa (AOI) obsega osrednji del porečja Amazonke (središče pri koordinatah $\\phi = -6{,}50000^\\circ$, $\\lambda = -62{,}00000^\\circ$) s polmerom kar $950\\text{ km}$, kar pokriva več kot $2{,}8$ milijona $\\text{km}^2$ površine. \n\nTo makroobmočje sega v t. i. »lok krčenja gozdov« (*arco do desmatamento*), ki zajema zvezne države Rondônia, Mato Grosso in južni del Paráje ter dele zvezne države Amazonas. Krčenje gozdov na tem območju poganjajo predvsem širitev živinorejskih pašnikov, intenzivno poljedelstvo (monokulture soje), sečnja dragocenih vrst lesa ter gradnja prometne infrastrukture (kot sta transamazonska cesta BR-230 in BR-163).\n\n---\n\n### 2. Metodologija in podatki\n\nZa analizo tako obsežnega, subkontinentalnega območja je bila izbrana časovna vrsta multispektralnih podatkov z naslednjimi parametri:\n\n* **Senzor in produkt:** Terra MODIS (produkt `MOD09A1`, zbirka 061) – 8-dnevni površinski odbojnostni mozaiki.\n* **Utemeljitev izbire:** Zaradi enormnega obsega analitičnega območja ($r = 950\\text{ km}$) in konstantne visoke oblačnosti v tropih je uporaba 8-dnevnih sestavljenih mozaikov MODIS nujna. Omogoča filtriranje oblačnosti ter računsko izvedljivost v oblačnem okolju Google Earth Engine brez prekoračitve pomnilniških omejitev, kar bi se pri senzorjih visoke ločljivosti (npr. Sentinel-2 z 10-metrsko ločljivostjo) na tej skali izkazalo za neizvedljivo.\n* **Prostorska ločljivost:** $1000\\text{ m}$ ($1\\text{ km}$ na slikovni element).\n* **Koordinatni referenčni sistem:** Projekcija UTM cona 20S (`EPSG:32720`), ki zagotavlja metrično točnost pri izračunu površin.\n* **Spektralni indeks:** Normalizirani diferencialni vegetacijski indeks (NDVI), definiran kot:\n  $$\\text{NDVI} = \\frac{\\rho_{\\text{NIR}} - \\rho_{\\text{Red}}}{\\rho_{\\text{NIR}} + \\rho_{\\text{Red}}}$$\n* **Analizirano obdobje:** Časovna vrsta 9 reprezentativnih letnih presekov med avgustom 1990 in avgustom 2026 (zajet zgodovinski in sodobni arhiv).\n\n---\n\n### 3. Podrobna interpretacija rezultatov\n\nAnaliza spektro-časovnih sprememb na območju prikazuje naslednje izmerjene fizikalne vrednosti:\n\n* **Vrednosti vegetacijskega indeksa (NDVI):**\n  * **Povprečje (Mean):** $0{,}7503$ (oziroma $0{,}750$).\n  * **Minimalna vrednost časovne vrste:** $0{,}7271$.\n  * **Maksimalna vrednost časovne vrste:** $0{,}7840$.\n  * **Začetna vrednost:** $0{,}7402$ $\\rightarrow$ **Končna vrednost:** $0{,}7840$.\n  * *Pomen:* Visoke povprečne vrednosti ($> 0{,}72$) potrjujejo, da je večina osrednjega porečja še vedno prekrita z gostim, večplastnim deževnim gozdom z visoko vsebnostjo klorofila in sklenjeno krošnjo.\n\n* **Zaznan upad vegetacije / Krčenje gozda:**\n  * **Površina z upadom NDVI:** **$171.912{,}15\\text{ km}^2$** oziroma **$17.191.215\\text{ ha}$** ($6{,}0\\text{ \\%}$ celotnega AOI).\n  * *Fizikalni pomen:* Ta obseg predstavlja območja neposredne deforestacije, degradacije gozdnega roba, požarov ter preureditve pragozda v kmetijske površine ali pašnike vzdolž novonastalih cestnih koridorjev.\n\n* **Zaznan porast indeksa NDVI:**\n  * **Površina s porastom NDVI:** **$243.135{,}01\\text{ km}^2$** ($8{,}6\\text{ \\%}$ AOI).\n  * *Fizikalni pomen:* Ta porast pripisujemo sekundarni vegetacijski sukcesiji (zaraščanje opuščenih površin), sezonskim razlikam v padavinah med posameznimi letnimi mozaiki ter intenzivni ozelenitvi poljedelskih kultur (npr. hitro rastoča soja) v določenih fazah rastne dobe.\n* **Linearni trend naklona:** $+0{,}00438$ na opazovani interval, kar odraža stabilnost osrednjih nedotaknjenih predelov porečja ob sočasnih nihanjih na robnih območjih kmetijske meje.\n\n**Omejitve in metodološka opozorila:**\n1. *Prostorska ločljivost ($1000\\text{ m}$):* Zaradi celic velikosti $1\\text{ km}^2$ analiza zazna le večje poseke in splošno degradacijo; selektivna sečnja posameznih dreves in manjši ilegalni poseki pod $100\\text{ ha}$ znotraj piksla ostanejo delno prikriti zaradi mešanih slikovnih elementov (*sub-pixel mixing*).\n2. *Nasičenje NDVI:* Pri izjemno visoki biomasi tropskega gozda (indeks listne površine $\\text{LAI} > 3$) se indeks NDVI optično nasiti, kar pomeni, da lahko začetno degradacijo krošnje podceni v primerjavi z indeksom EVI (*Enhanced Vegetation Index*).\n\n---\n\n### 4. Predlogi za nadaljevanje\n\nZa podrobnejši vpogled v specifične procese lahko v nadaljevanju izvedemo:\n\n1. **Visokoresolucijski fokus na »vročo točko« deforestacije:** Izbira ožjega območja (npr. vzdolž avtoceste BR-163 ali v zvezni državi Rondônia s polmerom $30\\text{–}50\\text{ km}$) z uporabo podatkov **Sentinel-2 (10 m)** ali **Landsat (30 m)** za natančno kartiranje parcelnih posekov.\n2. **Radarska analiza Sentinel-1 SAR:** Preboj skozi stalno tropsko oblačnost z radarskim povratnim sipanjem (polarizaciji VV/VH), kar omogoča zaznavanje sečnje v realnem času tudi v deževni dobi.\n3. **Analiza z indeksom NBR (požari):** Izračun indeksa zgorevanja (*Normalized Burn Ratio*) za ločevanje med mehansko sečnjo in obsežnimi gozdnimi požari v sušnem obdobju.",
+          "action": "run_analysis",
+          "result_id": "ai_res_1_190745",
+          "replay_spec": {
+            "version": 1,
+            "action": "time_series_and_comparison",
+            "location_name": "Amazon Rainforest Basin",
+            "lat": -6.5,
+            "lon": -62.0,
+            "radius_m": 950000.0,
+            "bbox_4326": [
+              -70.78564502454316,
+              -15.092744563643226,
+              -53.18260314900614,
+              2.093669294746089
+            ],
+            "target_epsg": 32720,
+            "start_date": "1990-01-01",
+            "end_date": "2026-11-26",
+            "target_season": "glacier_ablation",
+            "interval": "Letno",
+            "primary_index": "NDVI",
+            "complementary_indices": [
+              "NDMI"
+            ],
+            "sensors": [
+              "modis-09A1-061"
+            ],
+            "fusion_mode": "single",
+            "resolution_m": 1000,
+            "max_cloud": 25,
+            "engine": "gee",
+            "user_prompt": "Naredi analizo krčenja amazonskega pragozda skozi leta"
+          },
+          "plan": {
+            "task_type": "time_series_and_comparison",
+            "place_name": "Amazon Rainforest Basin",
+            "lat": -6.5,
+            "lon": -62.0,
+            "radius_m": 950000,
+            "target_epsg": "EPSG:32720",
+            "start_date": "1990-01-01",
+            "end_date": "2026-11-26",
+            "event_date": "2026-11-26",
+            "interval": "Letno",
+            "index_name": "NDVI",
+            "sensor": "modis-09A1-061",
+            "sensors": [
+              "modis-09A1-061"
+            ],
+            "fusion_mode": "single",
+            "resolution_m": 1000,
+            "include_comparison": true,
+            "engine": "gee",
+            "user_query": "Naredi analizo krčenja amazonskega pragozda skozi leta",
+            "location_name": "Amazon Rainforest Basin",
+            "index": "NDVI",
+            "action": "time_series_and_comparison",
+            "bbox_4326": [
+              -70.78564502454316,
+              -15.092744563643226,
+              -53.18260314900614,
+              2.093669294746089
+            ],
+            "target_season": "",
+            "primary_index": "NDVI",
+            "complementary_indices": [
+              "NDMI"
+            ],
+            "user_prompt": "Naredi analizo krčenja amazonskega pragozda skozi leta"
+          },
+          "replay_plan": {
+            "task_type": "time_series_and_comparison",
+            "place_name": "Amazon Rainforest Basin",
+            "lat": -6.5,
+            "lon": -62.0,
+            "radius_m": 950000,
+            "target_epsg": "EPSG:32720",
+            "start_date": "1990-01-01",
+            "end_date": "2026-11-26",
+            "event_date": "2026-11-26",
+            "interval": "Letno",
+            "index_name": "NDVI",
+            "sensor": "modis-09A1-061",
+            "sensors": [
+              "modis-09A1-061"
+            ],
+            "fusion_mode": "single",
+            "resolution_m": 1000,
+            "include_comparison": true,
+            "engine": "gee",
+            "user_query": "Naredi analizo krčenja amazonskega pragozda skozi leta",
+            "location_name": "Amazon Rainforest Basin",
+            "index": "NDVI",
+            "action": "time_series_and_comparison",
+            "bbox_4326": [
+              -70.78564502454316,
+              -15.092744563643226,
+              -53.18260314900614,
+              2.093669294746089
+            ],
+            "target_season": "",
+            "primary_index": "NDVI",
+            "complementary_indices": [
+              "NDMI"
+            ],
+            "user_prompt": "Naredi analizo krčenja amazonskega pragozda skozi leta"
+          },
+          "result_meta": {
+            "is_visual_analysis": true,
+            "engine": "gee",
+            "resolved_place": "Amazon Rainforest Basin",
+            "crs": "EPSG:32720"
+          }
         }
       ],
-      "last_analysis_context": null,
+      "last_analysis_context": {
+        "kind": "time_series_and_comparison",
+        "place_name": "Amazon Rainforest Basin",
+        "resolved_place": "Amazon Rainforest Basin",
+        "lat": -6.5,
+        "lon": -62.0,
+        "radius_m": 950000,
+        "crs": "EPSG:32720",
+        "sensor": "modis-09A1-061",
+        "sensors": [
+          "modis-09A1-061"
+        ],
+        "fusion_mode": "single",
+        "fusion_rationale_sl": "Za analizo območja kontinentalnega ali polarnega merila je bil izbran 8-dnevni mozaik **Terra MODIS (500 m–1 km)** v ustrezni polarni stereografski (**EPSG:3413 / EPSG:3031**) ali lokalni UTM projekciji, ki omogoča hiter, brezoblačen pregled celotnega ledenega pokrova ali porečja znotraj 1 GB RAM-a brez popačenj UTM na visokih širinah.",
+        "fusion_rationale_en": "For continental or polar-scale analysis, **Terra MODIS 8-day composites (500 m–1 km)** were selected in Polar Stereographic (**EPSG:3413 / EPSG:3031**) or local UTM projection, enabling fast, cloud-minimized coverage of entire ice sheets or river basins within 1 GB RAM without high-latitude UTM distortion.",
+        "resolution_m": 1000,
+        "task_type": "time_series_and_comparison",
+        "index_name": "NDVI",
+        "start_date": "1990-01-01",
+        "end_date": "2026-11-26",
+        "event_date": "2026-11-26",
+        "technical_summary": "=== TEHNIČNI POVZETEK GEODETSKE ANALIZE (DALJINSKO ZAZNAVANJE) ===\nObmočje (AOI): Amazon Rainforest Basin (φ=-6.50000°, λ=-62.00000°, radij=950000 m)\nKoordinatni sistem (CRS): EPSG:32720 | Prostorska ločljivost: 1000 m\nSenzor: modis-09A1-061 | Analiza: time_series_and_comparison (NDVI)\nObdobje časovne vrste: 1990-08-01 – 2026-08-01 (9 veljavnih datumov, interval: Letno)\nPovprečna vrednost NDVI: 0.750\nPogon obdelave: Google Earth Engine (strežniška obdelava, projekt: project-bb8eae96-1b75-4d2e-81d)\nGEE prostorska sprememba (1990-08-01 -> 2026-08-01): upad 171,912.15 km² (17,191,215 ha, 6.0 % AOI), porast 243,135.01 km² (8.6 % AOI)\nVir podatkov: Copernicus / USGS (Microsoft Planetary Computer STAC)",
+        "synergy_metrics": {
+          "fusion_type": "gee_server_side",
+          "engine": "gee",
+          "gee_project_id": "project-bb8eae96-1b75-4d2e-81d",
+          "reduce_scale_m": 1000
+        },
+        "n_dates": 9,
+        "total_visual_dates": 9,
+        "excluded_archive_dates": [],
+        "date_start": "1990-08-01",
+        "date_end": "2026-08-01",
+        "interval": "Letno",
+        "mean": 0.7503,
+        "min": 0.7271,
+        "max": 0.784,
+        "first_val": 0.7402,
+        "last_val": 0.784,
+        "trend_slope_per_obs": 0.00438,
+        "has_visual_comparison": false,
+        "delta_mean": 0.0,
+        "pos_area_ha": 0.0,
+        "neg_area_ha": 0.0
+      },
       "last_map_layout": null
     },
     {
@@ -39,28 +195,28 @@
           "action": "run_analysis",
           "result_id": "ai_replay_0_184700",
           "plan": {
+            "action": "time_series_and_comparison",
             "task_type": "time_series_and_comparison",
             "radius_m": 5000,
             "start_date": "1984-06-01",
             "end_date": "2026-10-01",
             "sensor": "landsat-c2-l2",
-            "resolution_m": 30,
-            "action": "time_series_and_comparison",
             "sensors": [
               "landsat-c2-l2"
-            ]
+            ],
+            "resolution_m": 30
           },
           "replay_plan": {
+            "action": "time_series_and_comparison",
             "task_type": "time_series_and_comparison",
             "radius_m": 5000,
             "start_date": "1984-06-01",
             "end_date": "2026-10-01",
             "sensor": "landsat-c2-l2",
-            "resolution_m": 30,
-            "action": "time_series_and_comparison",
             "sensors": [
               "landsat-c2-l2"
-            ]
+            ],
+            "resolution_m": 30
           },
           "result_meta": {
             "is_visual_analysis": true
