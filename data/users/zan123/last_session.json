@@ -1,12 +1,12 @@
 {
   "version": 1,
   "username": "zan123",
-  "saved_at": "2026-11-26T19:07:46Z",
+  "saved_at": "2026-11-26T20:47:05Z",
   "aoi": {
     "location_name": "Amazon Rainforest Basin",
     "center_lat": -6.5,
     "center_lon": -62.0,
-    "radius_m": 950000,
+    "radius_m": 15000,
     "bbox_4326": null,
     "custom_polygon_geojson": null
   },
@@ -17,7 +17,7 @@
     "interval": "all",
     "target_season": "summer",
     "max_cloud_pct": 20,
-    "resolution_m": 10,
+    "resolution_m": 30,
     "crs_mode": "auto",
     "basemap": "satellite",
     "exclude_l7_slc": true,
@@ -182,6 +182,15 @@
         "resolved_place": "Amazon Rainforest Basin",
         "crs": "EPSG:32720"
       }
+    },
+    {
+      "role": "user",
+      "content": "Lahko analiziraš predlagano vročo točko"
+    },
+    {
+      "role": "assistant",
+      "content": "Katero vročo točko krčenja pragozda v Amazoniji bi želeli podrobno analizirati v visoki ločljivosti (Landsat/Sentinel-2)? Predlagam tri najbolj reprezentativna območja t.i. loka krčenja (Arc of Deforestation):\n1. **Rondônia (Ariquemes / BR-364)** – ikoničen vzorec krčenja v obliki ribje kosti vzdolž cestnih koridorjev,\n2. **Novo Progresso, Pará (koridor BR-163)** – žarišče nedavnega obsežnega sekanja in požarov za pašnike,\n3. **Sinop / Alta Floresta (Mato Grosso)** – intenzivna preobrazba gozda v obsežne monokulture soje.",
+      "action": "ask_clarification"
     }
   ]
 }
