@@ -1086,6 +1086,118 @@ def compile_timelapse_gif_fps(
     return compile_timelapse_gif(frames_png_bytes, duration_ms=duration_ms)
 
 
+def classify_frame_sensor_group(frame: dict[str, Any]) -> str:
+    """Classify a timelapse frame dict into a concise sensor family group."""
+    raw = " ".join(
+        str(frame.get(k) or "")
+        for k in ("sensor_family", "platform", "sensor")
+    ).lower()
+    if "modis" in raw or "mod09" in raw or "myd09" in raw or "mod11" in raw:
+        return "MODIS"
+    if "landsat" in raw or "lt05" in raw or "le07" in raw or "lc08" in raw or "lc09" in raw:
+        return "Landsat"
+    if "sentinel-1" in raw or "sar" in raw or "s1" in raw:
+        return "Sentinel-1"
+    if "sentinel-2" in raw or "s2" in raw:
+        return "Sentinel-2"
+    return "Other"
+
+
+def _short_sensor_tag(frame: dict[str, Any]) -> str:
+    """Return a compact 2–5 char sensor tag for touch-friendly timelapse pills (e.g. L5/7, MODIS, S2)."""
+    plat = str(frame.get("platform") or frame.get("sensor_family") or frame.get("sensor") or "").lower()
+    if "modis" in plat:
+        return "MODIS"
+    if "landsat-5/7" in plat:
+        return "L5/7"
+    if "landsat-8/9" in plat:
+        return "L8/9"
+    if "landsat-5" in plat or "lt05" in plat:
+        return "L5"
+    if "landsat-7" in plat or "le07" in plat:
+        return "L7"
+    if "landsat-8" in plat or "lc08" in plat:
+        return "L8"
+    if "landsat-9" in plat or "lc09" in plat:
+        return "L9"
+    if "landsat" in plat:
+        return "Landsat"
+    if "sentinel-1" in plat or "sar" in plat:
+        return "S1"
+    if "sentinel-2" in plat or "s2" in plat:
+        return "S2"
+    return "EO"
+
+
+def format_timelapse_frame_pill_label(frame: dict[str, Any], idx: int = 0) -> str:
+    """Format a compact, unique pill label ``YYYY-MM-DD · <sensor>`` for a timelapse frame."""
+    d_raw = str(frame.get("date") or frame.get("date_str") or f"#{idx + 1}").strip()[:10]
+    tag = _short_sensor_tag(frame)
+    arch = " ⚠️" if frame.get("analysis_reliable") is False else ""
+    return f"{d_raw} · {tag}{arch}"
+
+
+def filter_timelapse_frames(
+    frames: Sequence[dict[str, Any]],
+    *,
+    included_indices: Sequence[int] | None = None,
+    reliable_only: bool = False,
+    exclude_sensor_groups: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Filter timelapse frames while strictly preserving chronological order."""
+    excl = {str(g).strip().lower() for g in (exclude_sensor_groups or []) if str(g).strip()}
+    inc_set = set(int(i) for i in included_indices) if included_indices is not None else None
+    out: list[dict[str, Any]] = []
+    for i, fr in enumerate(frames):
+        if inc_set is not None and i not in inc_set:
+            continue
+        if reliable_only and fr.get("analysis_reliable") is False:
+            continue
+        if excl and classify_frame_sensor_group(fr).lower() in excl:
+            continue
+        out.append(fr)
+    out.sort(key=lambda f: str(f.get("date") or f.get("date_str") or ""))
+    return out
+
+
+def rebuild_timelapse_gif_from_frames(
+    frames: Sequence[dict[str, Any]],
+    *,
+    mode: str = "rgb",
+    fps: float = 1.5,
+    duration_ms: int | None = None,
+) -> tuple[bytes | None, bytes | None]:
+    """Rebuild an animated GIF (or single preview PNG) instantaneously from cached frame bytes.
+
+    Returns ``(gif_bytes_or_None, single_preview_png_or_None)``.
+    - 0 valid frames -> ``(None, None)``
+    - 1 valid frame  -> ``(None, png_bytes)``
+    - >= 2 frames    -> ``(gif_bytes, png_bytes[0])``
+    """
+    pngs: list[bytes] = []
+    m_low = str(mode or "rgb").strip().lower()
+    for fr in frames:
+        raw_b: bytes | None = None
+        if m_low == "rgb":
+            raw_b = fr.get("rgb_png_bytes") or fr.get("png_bytes")
+        elif m_low == "index":
+            raw_b = fr.get("index_png_bytes") or fr.get("png_bytes")
+        else:
+            raw_b = (fr.get("extra_pngs") or {}).get(mode) or fr.get("png_bytes") or fr.get("index_png_bytes")
+        if isinstance(raw_b, (bytes, bytearray)) and len(raw_b) > 0:
+            pngs.append(bytes(raw_b))
+
+    if not pngs:
+        return None, None
+    if len(pngs) == 1:
+        return None, pngs[0]
+    if duration_ms is not None and int(duration_ms) > 0:
+        gif_b = compile_timelapse_gif(pngs, duration_ms=int(duration_ms))
+    else:
+        gif_b = compile_timelapse_gif_fps(pngs, fps=float(fps))
+    return gif_b, pngs[0]
+
+
 def render_change_swipe_pair(
     da_t1: xr.DataArray,
     da_t2: xr.DataArray,

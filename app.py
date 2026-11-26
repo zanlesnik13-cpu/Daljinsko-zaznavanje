@@ -152,6 +152,7 @@ from analize import (
     get_supported_indices_for_sensor,
 )
 from casovne_vrste import (
+    classify_frame_sensor_group,
     compile_timelapse_gif,
     compile_timelapse_gif_fps,
     compute_change_detection,
@@ -159,7 +160,10 @@ from casovne_vrste import (
     compute_cloud_free_composite,
     compute_dynamic_frame_delta,
     extract_time_series,
+    filter_timelapse_frames,
+    format_timelapse_frame_pill_label,
     generate_timelapse_frames,
+    rebuild_timelapse_gif_from_frames,
     render_change_swipe_pair,
     render_multi_date_comparison,
 )
@@ -7309,6 +7313,206 @@ def _render_ai_chat_turn(
 
 
 @st.fragment
+def render_interactive_timelapse_panel(
+    frames: list[dict[str, Any]],
+    *,
+    key_prefix: str,
+    index_label: str = "NDVI",
+    place_stem: str = "AOI",
+    lang: str = "sl",
+    default_fps: float = 1.5,
+    duration_ms_override: int | None = None,
+    show_mode_and_fps: bool = True,
+    fixed_mode: str = "rgb",
+    gif_cache: dict[Any, bytes] | None = None,
+) -> None:
+    """Reusable touch-friendly Visual Timelapse panel with 1-tap frame exclusion & sensor quick-filters.
+
+    Wrapped in ``@st.fragment`` so toggling individual frames, quick-filter chips, layer mode,
+    or FPS regenerates the GIF instantaneously in memory without reloading the page or jumping scroll.
+    """
+    if not frames:
+        st.info(t("tl_need_two_frames", lang=lang))
+        return
+
+    n_total = len(frames)
+    all_indices = list(range(n_total))
+
+    # Build unique touch-friendly pill labels (YYYY-MM-DD · <sensor>)
+    raw_labels = [format_timelapse_frame_pill_label(fr, idx=i) for i, fr in enumerate(frames)]
+    label_counts: dict[str, int] = {}
+    pill_labels: list[str] = []
+    for lbl in raw_labels:
+        cnt = label_counts.get(lbl, 0) + 1
+        label_counts[lbl] = cnt
+        pill_labels.append(lbl if cnt == 1 else f"{lbl} #{cnt}")
+    label_to_idx = {lbl: i for i, lbl in enumerate(pill_labels)}
+
+    # Fragment-scoped versioned selection state (avoids mutating an instantiated widget key!)
+    sig_key = f"{key_prefix}__sig"
+    ver_key = f"{key_prefix}__ver"
+    sel_key = f"{key_prefix}__sel_idx"
+    cur_sig = tuple(pill_labels)
+    if st.session_state.get(sig_key) != cur_sig:
+        st.session_state[sig_key] = cur_sig
+        st.session_state[ver_key] = int(st.session_state.get(ver_key, 0)) + 1
+        st.session_state[sel_key] = list(all_indices)
+
+    cur_ver = int(st.session_state.get(ver_key, 0))
+    cur_sel_idx = [i for i in (st.session_state.get(sel_key) or []) if 0 <= int(i) < n_total]
+
+    # Optional Layer (RGB / Index) & Speed (FPS) controls
+    tl_mode = str(fixed_mode or "rgb")
+    sel_fps = float(default_fps)
+    if show_mode_and_fps:
+        tl_modes: list[str] = []
+        if any(f.get("rgb_png_bytes") for f in frames):
+            tl_modes.append("rgb")
+        if any(f.get("index_png_bytes") for f in frames):
+            tl_modes.append("index")
+        if not tl_modes:
+            tl_modes = [fixed_mode]
+        tl_c1, tl_c2 = st.columns([1.0, 1.3], gap="small")
+        with tl_c1:
+            if len(tl_modes) > 1:
+                tl_mode = _touch_selector(
+                    t("ai_mf_layer_label", lang=lang),
+                    options=tl_modes,
+                    default=tl_modes[0],
+                    format_func=lambda m: (
+                        t("ai_mf_tl_rgb", lang=lang) if m == "rgb" else t("ai_mf_tl_idx", lang=lang)
+                    ),
+                    key=f"{key_prefix}_mode",
+                    use_pills=True,
+                )
+            else:
+                tl_mode = tl_modes[0]
+        with tl_c2:
+            fps_opts = [1.0, 1.5, 2.5]
+            fps_lbls = {
+                1.0: t("ai_mf_fps_slow", lang=lang),
+                1.5: t("ai_mf_fps_norm", lang=lang),
+                2.5: t("ai_mf_fps_fast", lang=lang),
+            }
+            sel_fps = float(
+                _touch_selector(
+                    t("ai_mf_fps_label", lang=lang),
+                    options=fps_opts,
+                    default=default_fps if default_fps in fps_opts else 1.5,
+                    format_func=lambda v: fps_lbls[v],
+                    key=f"{key_prefix}_fps",
+                    use_pills=True,
+                )
+            )
+
+    # Quick-filter action chips (All / Reliable only / Per-sensor exclude when >1 sensor family)
+    has_unreliable = any(fr.get("analysis_reliable") is False for fr in frames)
+    sensor_groups_order: list[str] = []
+    for fr in frames:
+        sg = classify_frame_sensor_group(fr)
+        if sg not in sensor_groups_order:
+            sensor_groups_order.append(sg)
+    multi_sensor_groups = [sg for sg in sensor_groups_order if sg != "Other"] if len(sensor_groups_order) > 1 else []
+
+    quick_actions: list[tuple[str, str, list[int]]] = [
+        ("all", t("tl_btn_all_frames", lang=lang), list(all_indices)),
+    ]
+    if has_unreliable:
+        rel_idx = [i for i, fr in enumerate(frames) if fr.get("analysis_reliable") is not False]
+        quick_actions.append(("rel", t("tl_btn_reliable_only", lang=lang), rel_idx))
+    for sg in multi_sensor_groups[:3]:
+        kept_idx = [i for i, fr in enumerate(frames) if classify_frame_sensor_group(fr) != sg]
+        if kept_idx:
+            quick_actions.append((f"no_{sg}", t("tl_btn_exclude_sensor", lang=lang, sensor=sg), kept_idx))
+
+    if len(quick_actions) > 1 or len(cur_sel_idx) < n_total:
+        q_cols = st.columns(len(quick_actions), gap="small")
+        for qc, (act_id, act_lbl, target_idx) in zip(q_cols, quick_actions):
+            with qc:
+                if st.button(act_lbl, width="stretch", key=f"{key_prefix}_qf_{act_id}_v{cur_ver}"):
+                    st.session_state[sel_key] = list(target_idx)
+                    st.session_state[ver_key] = cur_ver + 1
+                    st.rerun(scope="fragment")
+
+    # Individual touch-friendly multi-select frame pills
+    default_labels = [pill_labels[i] for i in cur_sel_idx]
+    selected_labels = st.pills(
+        f"{t('tl_filter_header', lang=lang)} **{t('tl_filter_count', lang=lang, sel=len(cur_sel_idx), total=n_total)}**",
+        options=pill_labels,
+        default=default_labels,
+        selection_mode="multi",
+        key=f"{key_prefix}_pills_v{cur_ver}",
+    )
+    if selected_labels is None:
+        selected_labels = []
+    chosen_indices = sorted(
+        {label_to_idx[lbl] for lbl in selected_labels if lbl in label_to_idx}
+    )
+    st.session_state[sel_key] = chosen_indices
+
+    filtered_frames = filter_timelapse_frames(frames, included_indices=chosen_indices)
+    if len(filtered_frames) == 0:
+        st.info(t("tl_need_two_frames", lang=lang))
+        return
+
+    cache_store = gif_cache if isinstance(gif_cache, dict) else st.session_state.setdefault("_tl_panel_gif_cache", {})
+    cache_k = (key_prefix, tl_mode, float(sel_fps), duration_ms_override, tuple(chosen_indices))
+
+    if len(filtered_frames) == 1:
+        _, single_png = rebuild_timelapse_gif_from_frames(
+            filtered_frames,
+            mode=tl_mode,
+            fps=sel_fps,
+            duration_ms=duration_ms_override,
+        )
+        if single_png:
+            b64_s = base64.b64encode(single_png).decode("ascii")
+            st.markdown(
+                f'<img src="data:image/png;base64,{b64_s}" alt="Timelapse Frame" '
+                f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
+                f'display:block;margin:6px auto 10px auto;border-radius:10px;'
+                f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
+                unsafe_allow_html=True,
+            )
+        st.caption(f"ℹ️ {t('tl_single_frame_note', lang=lang)}")
+        return
+
+    gif_bytes_show = cache_store.get(cache_k)
+    if gif_bytes_show is None:
+        gif_bytes_show, _ = rebuild_timelapse_gif_from_frames(
+            filtered_frames,
+            mode=tl_mode,
+            fps=sel_fps,
+            duration_ms=duration_ms_override,
+        )
+        if gif_bytes_show:
+            cache_store[cache_k] = gif_bytes_show
+            if len(cache_store) > 12:
+                cache_store.pop(next(iter(cache_store)), None)
+
+    if gif_bytes_show:
+        gif_b64 = base64.b64encode(gif_bytes_show).decode("ascii")
+        st.markdown(
+            f'<img src="data:image/gif;base64,{gif_b64}" alt="Timelapse GIF" '
+            f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
+            f'display:block;margin:6px auto 12px auto;border-radius:10px;'
+            f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
+            unsafe_allow_html=True,
+        )
+        gif_tag = "RGB" if tl_mode == "rgb" else str(index_label or "INDEX")
+        safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(place_stem or "AOI")).strip("_")[:40] or "AOI"
+        gif_fname = f"timelapse_{gif_tag}_{safe_stem}_{len(filtered_frames)}_frames.gif"
+        st.download_button(
+            label=t("ai_mf_dl_gif", lang=lang),
+            data=gif_bytes_show,
+            file_name=gif_fname,
+            mime="image/gif",
+            width="stretch",
+            key=f"{key_prefix}_dl_gif_{tl_mode}_{len(filtered_frames)}_{sel_fps}",
+        )
+
+
+@st.fragment
 def _render_ai_chat_analysis_fragment(
     *,
     result_id: str,
@@ -8615,70 +8819,17 @@ def _render_ai_chat_analysis_fragment(
                     tl_modes.append("index")
 
                 if tl_modes:
-                    tl_c1, tl_c2 = st.columns([1.0, 1.3], gap="small")
-                    with tl_c1:
-                        if len(tl_modes) > 1:
-                            tl_mode = _touch_selector(
-                                t("ai_mf_layer_label", lang=lang),
-                                options=tl_modes,
-                                default=tl_modes[0],
-                                format_func=lambda m: (
-                                    t("ai_mf_tl_rgb", lang=lang) if m == "rgb" else t("ai_mf_tl_idx", lang=lang)
-                                ),
-                                key=f"ai_mf_tl_mode_{result_id}",
-                                use_pills=True,
-                            )
-                        else:
-                            tl_mode = tl_modes[0]
-                    with tl_c2:
-                        fps_opts = [1.0, 1.5, 2.5]
-                        fps_lbls = {
-                            1.0: t("ai_mf_fps_slow", lang=lang),
-                            1.5: t("ai_mf_fps_norm", lang=lang),
-                            2.5: t("ai_mf_fps_fast", lang=lang),
-                        }
-                        sel_fps = _touch_selector(
-                            t("ai_mf_fps_label", lang=lang),
-                            options=fps_opts,
-                            default=1.5,
-                            format_func=lambda v: fps_lbls[v],
-                            key=f"ai_mf_tl_fps_{result_id}",
-                            use_pills=True,
-                        )
-
-                    gif_cache = ai_res_show.setdefault("_gif_cache", {})
-                    if abs(float(sel_fps) - 1.5) < 1e-3:
-                        if tl_mode == "rgb" and ai_res_show.get("timelapse_rgb_gif_bytes"):
-                            gif_cache[("rgb", 1.5)] = ai_res_show["timelapse_rgb_gif_bytes"]
-                        elif tl_mode == "index" and ai_res_show.get("timelapse_index_gif_bytes"):
-                            gif_cache[("index", 1.5)] = ai_res_show["timelapse_index_gif_bytes"]
-
-                    cache_k = (tl_mode, float(sel_fps))
-                    gif_bytes_show = gif_cache.get(cache_k)
-                    if gif_bytes_show is None:
-                        src_pngs = rgb_pngs_all if tl_mode == "rgb" else idx_pngs_all
-                        gif_bytes_show = compile_timelapse_gif_fps(src_pngs, fps=float(sel_fps))
-                        gif_cache[cache_k] = gif_bytes_show
-
-                    if gif_bytes_show:
-                        gif_b64 = base64.b64encode(gif_bytes_show).decode("ascii")
-                        st.markdown(
-                            f'<img src="data:image/gif;base64,{gif_b64}" alt="Timelapse GIF" '
-                            f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
-                            f'display:block;margin:6px auto 12px auto;border-radius:10px;'
-                            f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
-                            unsafe_allow_html=True,
-                        )
-                        gif_tag = "RGB" if tl_mode == "rgb" else idx_lbl_ts
-                        gif_fname = f"Timelapse_{gif_tag}_{pl['place_name']}_{frame_dates[0]}_to_{frame_dates[-1]}.gif"
-                        st.download_button(
-                            label=t("ai_mf_dl_gif", lang=lang),
-                            data=gif_bytes_show,
-                            file_name=gif_fname,
-                            mime="image/gif",
-                            width="stretch",
-                            key=f"ai_mf_dl_gif_{result_id}_{tl_mode}_{sel_fps}",
-                        )
+                    render_interactive_timelapse_panel(
+                        frames_list,
+                        key_prefix=f"ws5_tl_{result_id}",
+                        index_label=idx_lbl_ts,
+                        place_stem=str(pl.get("place_name") or "AOI"),
+                        lang=lang,
+                        default_fps=1.5,
+                        show_mode_and_fps=True,
+                        fixed_mode=tl_modes[0],
+                        gif_cache=ai_res_show.setdefault("_gif_cache", {}),
+                    )
 
             # --- TAB 4: All Intermediate Scenes (Visual Strip Gallery with Multi-Index Pills) ---
             with t_strip:
@@ -11784,8 +11935,17 @@ def main() -> None:
                         lang=lang,
                     )
                     st.plotly_chart(_g_fig, width="stretch", key="ws3_gee_ts_chart")
-                    if _g_cached.get("timelapse_index_gif_bytes"):
-                        st.image(_g_cached["timelapse_index_gif_bytes"], caption="🌍 GEE Server-Side Timelapse")
+                    if _g_cached.get("frames"):
+                        render_interactive_timelapse_panel(
+                            _g_cached["frames"],
+                            key_prefix="ws3_gee_tl",
+                            index_label=str(_g_cached["frames"][0].get("index_name") or "NDVI"),
+                            place_stem=str(loc_label or "GEE_AOI"),
+                            lang=lang,
+                            default_fps=1.5,
+                            show_mode_and_fps=True,
+                            fixed_mode="index",
+                        )
             elif not has_t3_scenes:
                 st.info(t("no_scenes_warn") if search_performed else t("need_search_first"))
             else:
@@ -12412,35 +12572,16 @@ def main() -> None:
                     if not tl_frames:
                         st.warning(t("tl_empty_warn"))
                     else:
-                        # Ob spremembi hitrosti ponovno sestavimo GIF iz predpomnjenih PNG sličic
                         desired_ms = int(round(tl_speed_sec * 1000))
-                        if tl_data.get("duration_ms") != desired_ms or not tl_data.get("gif_bytes"):
-                            tl_data["gif_bytes"] = compile_timelapse_gif(
-                                [f["png_bytes"] for f in tl_frames],
-                                duration_ms=desired_ms,
-                            )
-                            tl_data["duration_ms"] = desired_ms
-
-                        tl_gif_b64 = base64.b64encode(tl_data["gif_bytes"]).decode("ascii")
-                        st.markdown(
-                            f'<img src="data:image/gif;base64,{tl_gif_b64}" alt="Timelapse GIF" '
-                            f'style="max-height:450px;max-width:100%;width:auto;height:auto;'
-                            f'display:block;margin:6px auto 12px auto;border-radius:10px;'
-                            f'box-shadow:0 2px 10px rgba(0,0,0,0.12);" />',
-                            unsafe_allow_html=True,
-                        )
-
-                        tl_fname = (
-                            f"{tl_data['prefix']}_timelapse_{tl_data['layer_mode']}_"
-                            f"{tl_frames[0]['date_str']}_to_{tl_frames[-1]['date_str']}_"
-                            f"{tl_data['resolution_m']}m.gif"
-                        )
-                        st.download_button(
-                            label=t("btn_download_tl_gif"),
-                            data=tl_data["gif_bytes"],
-                            file_name=tl_fname,
-                            mime="image/gif",
-                            width="stretch",
+                        render_interactive_timelapse_panel(
+                            tl_frames,
+                            key_prefix=f"ws3_tl_{active_sensor}_{tl_data['layer_mode']}",
+                            index_label=str(tl_data.get("layer_mode") or "RGB"),
+                            place_stem=str(tl_data.get("prefix") or "AOI"),
+                            lang=lang,
+                            duration_ms_override=desired_ms,
+                            show_mode_and_fps=False,
+                            fixed_mode="rgb",
                         )
 
                         # Interaktivni drsnik po datumih (frame-by-frame scrubber)
