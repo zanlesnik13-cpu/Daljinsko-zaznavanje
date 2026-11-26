@@ -3,10 +3,30 @@
   "username": "zan123",
   "threads": [
     {
+      "id": "eae1f24f",
+      "title": "Krčenja amazonskega pragozda skozi leta",
+      "created_at": "2026-11-26T18:32:28Z",
+      "updated_at": "2026-11-26T18:36:52Z",
+      "pinned": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Naredi analizo krčenja amazonskega pragozda skozi leta"
+        },
+        {
+          "role": "assistant",
+          "content": "Amazonski deževni pragozd obsega več kot 6 milijonov km², zato satelitska spektralna analiza z visoko ločljivostjo (10–30 m) zahteva izbiro konkretnega opazovalnega območja (premer do ~15–20 km) in časovnega obdobja. Za katero območje in obdobje bi želeli izvesti analizo časovne vrste krčenja gozdov?\n\nPredlogi:\n1. **Rondônia (območje Ariquemes / Jamari, Brazilija)** – znameniti vzorec t.i. »ribje kosti« (fishbone deforestation) od leta 1990 do 2024 (Landsat).\n2. **Pará (Novo Progresso vzdolž avtoceste BR-163, Brazilija)** – intenzivno sodobno žarišče krčenja gozda med 2017 in 2024 (Sentinel-2 NDVI primerjava).\n3. **Mato Grosso (Sinop / Alta Floresta, Brazilija)** – preobrazba pragozda v kmetijske površine in pašnike v obdobju 2000–2024.",
+          "action": "ask_clarification"
+        }
+      ],
+      "last_analysis_context": null,
+      "last_map_layout": null
+    },
+    {
       "id": "8a5754de",
       "title": "Krčenja ledenika grosglockner v zadnjih 50…",
       "created_at": "2026-11-25T18:42:57Z",
-      "updated_at": "2026-11-26T18:32:26Z",
+      "updated_at": "2026-11-26T18:32:28Z",
       "pinned": false,
       "messages": [
         {
