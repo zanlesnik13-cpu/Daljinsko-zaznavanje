@@ -16,3 +16,4 @@ matplotlib>=3.8.0
 requests>=2.31.0
 Pillow>=10.0.0
 skyfield>=1.49
+earthengine-api>=0.1.390

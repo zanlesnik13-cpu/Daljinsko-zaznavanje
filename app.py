@@ -249,6 +249,14 @@ from relief import (
     extract_transect_profile,
     load_copernicus_dem as load_relief_dem,
 )
+from gee_engine import (
+    GEE_SUPPORTED_INDICES,
+    disconnect_gee,
+    gee_run_temporal_analysis,
+    get_gee_status,
+    init_gee,
+    is_gee_ready,
+)
 
 for _m_name in _LOCAL_MODULES_ORDER:
     _m_obj = sys.modules.get(_m_name)
@@ -4315,12 +4323,17 @@ def _resolve_active_aoi_state(
     return aoi_mode_key, bbox_4326, bbox_3794, aoi_polygon_4326, center_lat, center_lon, aoi_error, loc_label
 
 
+def _is_gee_engine_active() -> bool:
+    """Return True only when GEE is connected AND the user selected the GEE processing engine."""
+    return bool(is_gee_ready() and st.session_state.get("processing_engine", "pc") == "gee")
+
+
 def _sync_ws1_radius() -> None:
     val = st.session_state.get("ws1_map_radius_slider")
     if val is not None:
         cur_sensor = str(st.session_state.get("selected_sensor", SENSOR_S2))
         cur_res = float(st.session_state.get("selected_resolution", SENSOR_META.get(cur_sensor, {}).get("default_res", 10)))
-        max_r = int(get_dynamic_aoi_limits(cur_sensor, cur_res)["max_radius_m"])
+        max_r = 1_500_000 if _is_gee_engine_active() else int(get_dynamic_aoi_limits(cur_sensor, cur_res)["max_radius_m"])
         st.session_state["map_radius_m"] = min(int(val), max_r)
 
 
@@ -4504,8 +4517,8 @@ def _render_interactive_aoi_section(
                 )
             )
             ram_lims_aoi = get_dynamic_aoi_limits(cur_sensor_ws1, cur_res_ws1)
-            max_rad_m = int(ram_lims_aoi["max_radius_m"])
-            max_area_lim = float(ram_lims_aoi["max_area_km2"])
+            max_rad_m = 1_500_000 if _is_gee_engine_active() else int(ram_lims_aoi["max_radius_m"])
+            max_area_lim = 9_000_000.0 if _is_gee_engine_active() else float(ram_lims_aoi["max_area_km2"])
             if aoi_mode_key in ("map", "preset"):
                 cur_rad = min(int(st.session_state.get("map_radius_m", 2000)), max_rad_m)
                 st.session_state["map_radius_m"] = cur_rad
@@ -7333,9 +7346,16 @@ def _render_ai_chat_analysis_fragment(
         else ""
     )
 
+    gee_pill_html = (
+        f'<span style="background:#ECFDF5;color:#047857;border:1px solid #6EE7B7;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:700;">{t("gee_ai_badge", lang=lang)}</span>'
+        if ai_res_show.get("engine") == "gee"
+        else ""
+    )
+
     # 1. Compact Geodetic Plan Pills (cartographic teal & slate, zero purple)
     plan_pills_html = (
         f'<div style="display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px 0;">'
+        f"{gee_pill_html}"
         f"{fusion_pill_html}"
         f'<span style="background:#F0FDFA;color:#0F766E;border:1px solid #99F6E4;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">📍 {t("ai_plan_place")}: {ai_res_show.get("resolved_place", pl["place_name"])} ({pl["radius_m"]} m)</span>'
         f'<span style="background:#F8FAFC;color:#0F172A;border:1px solid #CBD5E1;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:600;">🛰️ {t("ai_plan_sensor")}: {ai_sensor_short}</span>'
@@ -7347,6 +7367,8 @@ def _render_ai_chat_analysis_fragment(
     st.markdown(plan_pills_html, unsafe_allow_html=True)
     if fb_note:
         st.caption(f"ℹ️ {fb_note}")
+    if ai_res_show.get("gee_fallback_note"):
+        st.caption(f"🌍 {ai_res_show['gee_fallback_note']}")
 
     basemap_now = str(st.session_state.get("map_basemap", "satellite"))
 
@@ -9208,6 +9230,76 @@ def _render_sidebar_user_profile_card(lang: str) -> None:
 
         # Compact Gemini API & Model settings (accessible to both Guests and Logged-in users)
         _render_sidebar_gemini_settings(lang)
+        # Compact Optional Google Earth Engine settings (100% optional, session-only secrets)
+        _render_sidebar_gee_settings(lang)
+
+
+def _render_sidebar_gee_settings(lang: str) -> None:
+    """Render compact collapsible '🌍 Google Earth Engine (Opcijsko)' expander in Sidebar."""
+    if not st.session_state.get("_gee_auto_init_done"):
+        st.session_state["_gee_auto_init_done"] = True
+        try:
+            init_gee()
+        except Exception:
+            pass
+
+    st_gee = get_gee_status()
+    connected = bool(st_gee.get("connected"))
+    proj_cur = str(st_gee.get("project_id") or "")
+
+    with st.expander(t("gee_sidebar_expander", lang=lang), expanded=False):
+        if connected:
+            st.markdown(f"**{t('gee_status_connected', lang=lang, project=proj_cur or 'GEE')}**")
+        else:
+            st.caption(t("gee_status_disconnected", lang=lang))
+        st.caption(t("gee_tooltip", lang=lang))
+
+        gee_proj_in = st.text_input(
+            t("gee_project_label", lang=lang),
+            value=proj_cur,
+            placeholder=t("gee_project_placeholder", lang=lang),
+            key="sidebar_gee_project_id",
+        )
+        gee_sa_in = st.text_area(
+            t("gee_sa_json_label", lang=lang),
+            placeholder=t("gee_sa_json_placeholder", lang=lang),
+            height=78,
+            key="sidebar_gee_sa_json",
+        )
+        c_gc1, c_gc2 = st.columns(2)
+        with c_gc1:
+            if st.button(t("gee_btn_connect", lang=lang), width="stretch", key="sb_btn_connect_gee"):
+                res_g = init_gee(
+                    project_id=gee_proj_in.strip() or None,
+                    service_account_json=gee_sa_in.strip() or None,
+                    force=True,
+                )
+                if res_g.get("connected"):
+                    st.success(t("gee_connect_ok", lang=lang, project=res_g.get("project_id", "GEE")))
+                    st.rerun()
+                else:
+                    st.error(t("gee_connect_err", lang=lang, err=res_g.get("error") or "No credentials found"))
+        with c_gc2:
+            if connected and st.button(t("gee_btn_disconnect", lang=lang), width="stretch", key="sb_btn_disconnect_gee"):
+                disconnect_gee()
+                st.session_state["processing_engine"] = "pc"
+                st.rerun()
+
+        if is_gee_ready():
+            cur_eng = str(st.session_state.get("processing_engine", "pc"))
+            if cur_eng not in ("pc", "gee"):
+                cur_eng = "pc"
+            chosen_eng = _touch_selector(
+                t("gee_engine_label", lang=lang),
+                options=["pc", "gee"],
+                default=cur_eng,
+                format_func=lambda k: t("gee_engine_gee", lang=lang) if k == "gee" else t("gee_engine_pc", lang=lang),
+                key="sidebar_processing_engine_pill",
+                use_pills=True,
+            )
+            if chosen_eng != st.session_state.get("processing_engine"):
+                st.session_state["processing_engine"] = chosen_eng
+                st.rerun()
 
 
 def _render_sidebar_gemini_settings(lang: str) -> tuple[str | None, str, str]:
@@ -9548,7 +9640,7 @@ def main() -> None:
         st.session_state.get("selected_resolution", sensor_cfg["default_res"])
     )
     _ram_lims_main = get_dynamic_aoi_limits(sensor, _cur_res_main)
-    _max_rad_main = int(_ram_lims_main["max_radius_m"])
+    _max_rad_main = 1_500_000 if _is_gee_engine_active() else int(_ram_lims_main["max_radius_m"])
     if int(st.session_state.get("map_radius_m", 2000)) > _max_rad_main:
         st.session_state["map_radius_m"] = _max_rad_main
     if int(st.session_state.get("ws1_map_radius_slider", 2000)) > _max_rad_main:
@@ -11477,6 +11569,24 @@ def main() -> None:
         def _fmt_metric_pill(code: str, _lang: str = lang) -> str:
             return _fmt_index_pill(code, _lang)
 
+        if is_gee_ready():
+            cur_ws3_eng = str(st.session_state.get("processing_engine", "pc"))
+            if cur_ws3_eng not in ("pc", "gee"):
+                cur_ws3_eng = "pc"
+            ws3_eng_pick = _touch_selector(
+                t("gee_engine_label", lang=lang),
+                options=["pc", "gee"],
+                default=cur_ws3_eng,
+                format_func=lambda k: t("gee_engine_gee", lang=lang) if k == "gee" else t("gee_engine_pc", lang=lang),
+                key="ws3_processing_engine_pill",
+                use_pills=True,
+            )
+            if ws3_eng_pick != st.session_state.get("processing_engine"):
+                st.session_state["processing_engine"] = ws3_eng_pick
+                st.rerun()
+            if ws3_eng_pick == "gee":
+                st.info(t("gee_ws3_active_hint", lang=lang))
+
         sub_ts, sub_change, sub_tl, sub_dis = st.tabs(
             [
                 t("ws3_sub_ts"),
@@ -11490,7 +11600,83 @@ def main() -> None:
         # PODZAVIHEK 3.1: ČASOVNA VRSTA (GRAF)
         # -------------------------------------------------------------------
         with sub_ts:
-            if not has_t3_scenes:
+            if _is_gee_engine_active() and bbox_4326 is not None:
+                with st.container(border=True):
+                    g_c1, g_c2, g_c3 = st.columns([1.4, 0.8, 0.9], vertical_alignment="bottom")
+                    with g_c1:
+                        gee_ws3_idx = _touch_selector(
+                            t("index_select_label"),
+                            options=list(GEE_SUPPORTED_INDICES),
+                            default="NDVI",
+                            format_func=_fmt_metric_pill,
+                            key="ws3_gee_index_select",
+                            use_pills=True,
+                        )
+                    with g_c2:
+                        gee_ws3_frames = st.slider(
+                            t("t3_epochs_slider"),
+                            min_value=3,
+                            max_value=12,
+                            value=7,
+                            key="ws3_gee_max_frames",
+                        )
+                    with g_c3:
+                        gee_ws3_run = st.button(
+                            t("gee_ws3_run_btn", lang=lang),
+                            type="primary",
+                            width="stretch",
+                            key="ws3_gee_run_btn",
+                        )
+                if gee_ws3_run:
+                    gee_prog_bar = st.progress(0.05)
+                    try:
+                        _g_sy = int(st.session_state.get("search_start_date", date(2000, 1, 1)).year)
+                        _g_ey = int(st.session_state.get("search_end_date", date.today()).year)
+                        _g_res = gee_run_temporal_analysis(
+                            bbox_4326=bbox_4326,
+                            start_year=_g_sy,
+                            end_year=_g_ey,
+                            index_code=str(gee_ws3_idx),
+                            sensor_mode="auto_fusion",
+                            target_season=str(st.session_state.get("yearly_target_season", SEASON_SUMMER)),
+                            max_frames=int(gee_ws3_frames),
+                            progress_cb=lambda f, m: gee_prog_bar.progress(min(1.0, max(0.0, f)), text=m),
+                            lang=lang,
+                        )
+                        st.session_state["ws3_gee_last_result"] = _g_res
+                        st.session_state["tab3_ts_df"] = _g_res["ts_df"]
+                        st.session_state["tab3_ts_meta"] = {
+                            "index_name": str(gee_ws3_idx),
+                            "sensor": "gee:auto_fusion",
+                            "loc_label": loc_label,
+                            "engine": "gee",
+                        }
+                    except Exception as _g_exc:
+                        st.error(str(_g_exc))
+                    finally:
+                        gee_prog_bar.empty()
+                _g_cached = st.session_state.get("ws3_gee_last_result")
+                if isinstance(_g_cached, dict) and isinstance(_g_cached.get("ts_df"), pd.DataFrame) and not _g_cached["ts_df"].empty:
+                    _g_df = _g_cached["ts_df"]
+                    _g_cs = _g_cached.get("change_summary") or {}
+                    if _g_cs.get("decrease_area_km2") is not None:
+                        gm1, gm2, gm3 = st.columns(3)
+                        gm1.metric("Δ Mean", f"{_g_cs.get('delta_mean', 0.0):+.3f}")
+                        gm2.metric("↓ Decrease", f"{_g_cs['decrease_area_km2']:,.1f} km² ({_g_cs['decrease_pct']:.1f}%)")
+                        gm3.metric("↑ Increase", f"{_g_cs['increase_area_km2']:,.1f} km² ({_g_cs['increase_pct']:.1f}%)")
+                    _g_fig = _build_time_series_chart(
+                        ts_df=_g_df,
+                        metric_label=str(_g_cached["frames"][0]["index_name"]),
+                        target_crs=target_crs,
+                        resolution_m=int(_g_cached.get("reduce_scale_m", 120)),
+                        unit_suffix="",
+                        exclude_archive=True,
+                        lang=lang,
+                    )
+                    st.plotly_chart(_g_fig, width="stretch", key="ws3_gee_ts_chart")
+                    if _g_cached.get("timelapse_index_gif_bytes"):
+                        st.image(_g_cached["timelapse_index_gif_bytes"], caption="🌍 GEE Server-Side Timelapse")
+            elif not has_t3_scenes:
                 st.info(t("no_scenes_warn") if search_performed else t("need_search_first"))
             else:
                 st.caption(t("t3_sec_a_caption"))

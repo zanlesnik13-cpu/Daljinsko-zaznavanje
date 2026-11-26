@@ -96,6 +96,12 @@ from stac_loader import (
     search_scenes,
 )
 
+from gee_engine import (
+    GEE_SUPPORTED_INDICES,
+    gee_run_temporal_analysis,
+    is_gee_ready,
+)
+
 # ---------------------------------------------------------------------------
 # Constants, Schema Allowed Values & Quick Example Prompts
 # ---------------------------------------------------------------------------
@@ -1639,9 +1645,31 @@ def build_technical_summary(
         if lang == "sl":
             lines.append(f"Obdobje časovne vrste: {d1} – {d2} ({n_obs} veljavnih datumov, interval: {plan['interval']})")
             lines.append(f"Povprečna vrednost {plan['index_name']}: {mean_val:.3f}")
+            if result.get("engine") == "gee":
+                lines.append(f"Pogon obdelave: Google Earth Engine (strežniška obdelava, projekt: {result.get('gee_project_id') or 'GEE'})")
+                cs = result.get("change_summary") or {}
+                if cs.get("decrease_area_km2") is not None:
+                    lines.append(
+                        f"GEE prostorska sprememba ({cs.get('t1_date')} -> {cs.get('t2_date')}): "
+                        f"upad {cs['decrease_area_km2']:,.2f} km² ({cs['decrease_area_ha']:,.0f} ha, {cs['decrease_pct']:.1f} % AOI), "
+                        f"porast {cs['increase_area_km2']:,.2f} km² ({cs['increase_pct']:.1f} % AOI)"
+                    )
+            elif result.get("gee_fallback_note"):
+                lines.append(str(result["gee_fallback_note"]))
         else:
             lines.append(f"Time Series Span: {d1} – {d2} ({n_obs} valid dates, interval: {plan['interval']})")
             lines.append(f"Mean {plan['index_name']} value: {mean_val:.3f}")
+            if result.get("engine") == "gee":
+                lines.append(f"Processing Engine: Google Earth Engine (server-side processing, project: {result.get('gee_project_id') or 'GEE'})")
+                cs = result.get("change_summary") or {}
+                if cs.get("decrease_area_km2") is not None:
+                    lines.append(
+                        f"GEE spatial change ({cs.get('t1_date')} -> {cs.get('t2_date')}): "
+                        f"decrease {cs['decrease_area_km2']:,.2f} km² ({cs['decrease_area_ha']:,.0f} ha, {cs['decrease_pct']:.1f}% of AOI), "
+                        f"increase {cs['increase_area_km2']:,.2f} km² ({cs['increase_pct']:.1f}% of AOI)"
+                    )
+            elif result.get("gee_fallback_note"):
+                lines.append(str(result["gee_fallback_note"]))
     elif task == "spectral_index":
         st_d = result["stats"]
         if lang == "sl":
@@ -3002,6 +3030,95 @@ def execute_ai_plan(
     if task in ("time_series", "time_series_and_comparison") or (
         task == "change_comparison" and str(plan.get("fusion_mode") or "") == FUSION_TEMPORAL_LANDSAT_S2
     ):
+        # Optional Google Earth Engine (GEE) server-side routing for large regional/continental or explicit GEE queries
+        _q_norm_gee = _normalize_ascii(str(plan.get("user_query") or plan.get("explanation_sl") or "")).lower()
+        _user_asked_gee = any(k in _q_norm_gee for k in ("google earth engine", "earth engine", " gee", "gee "))
+        _is_large_for_gee = (
+            _sfloat(plan.get("radius_m"), 0.0) >= 40_000.0
+            or sensor in MODIS_SENSORS
+            or _detect_continental_polar_region(_q_norm_gee, str(plan.get("place_name") or "")) is not None
+        )
+        _idx_for_gee = str(plan.get("index_name") or "NDVI").strip().upper()
+        if is_gee_ready() and _idx_for_gee in GEE_SUPPORTED_INDICES and (_user_asked_gee or _is_large_for_gee):
+            _prog(
+                0.10,
+                "🌍 Povezan z Google Earth Engine — zaganjam strežniško obdelavo..."
+                if lang == "sl"
+                else "🌍 Connected to Google Earth Engine — starting server-side analysis...",
+            )
+            _sy_gee = _parse_iso_date(plan.get("start_date"), date(2000, 1, 1)).year
+            _ey_gee = _parse_iso_date(plan.get("end_date"), date.today()).year
+            _gee_sensor_mode = "modis" if (_sfloat(plan.get("radius_m"), 0.0) >= 400_000.0 and _sy_gee >= 2000) else "auto_fusion"
+            _gee_season = _resolve_ai_target_season(plan)
+            gee_res = gee_run_temporal_analysis(
+                bbox_4326=bbox_4326,
+                start_year=_sy_gee,
+                end_year=_ey_gee,
+                index_code=_idx_for_gee,
+                sensor_mode=_gee_sensor_mode,
+                target_season=_gee_season,
+                max_frames=9,
+                progress_cb=progress_cb,
+                lang=lang,
+            )
+            _ts_gee = gee_res["ts_df"]
+            _csv_gee = _ts_gee.to_csv(index=False).encode("utf-8-sig")
+            _csv_fn_gee = f"GEE_{_idx_for_gee}_{plan['place_name']}_{_sy_gee}_{_ey_gee}.csv"
+            base_out["plan"]["fusion_rationale_sl"] = (
+                "Za visokonatančno obdelavo velikega območja je bila uporabljena strežniška platforma "
+                "**Google Earth Engine (GEE)** (Landsat C2 L2 + Sentinel-2 SR / MODIS), ki izračuna "
+                "sezonske mediano-mozaike, Δ spremembe in površine v km² neposredno na Googlovih strežnikih."
+            )
+            base_out["plan"]["fusion_rationale_en"] = (
+                "Server-side **Google Earth Engine (GEE)** processing (Landsat C2 L2 + Sentinel-2 SR / MODIS) "
+                "was used for high-accuracy large-scale computation of seasonal median composites, Δ change maps, "
+                "and exact pixelArea() statistics in km² directly on Google's servers."
+            )
+            base_out.update(
+                {
+                    "kind": "time_series_and_comparison" if len(gee_res["frames"]) >= 2 else "time_series",
+                    "engine": "gee",
+                    "gee_project_id": gee_res.get("gee_project_id", ""),
+                    "adaptive_interval": "Letno",
+                    "relevant_layers": ["RGB", _idx_for_gee] + list(gee_res.get("extra_indices") or []),
+                    "extra_indices": list(gee_res.get("extra_indices") or []),
+                    "ts_df": _ts_gee,
+                    "csv_bytes": _csv_gee,
+                    "csv_filename": _csv_fn_gee,
+                    "frames": gee_res["frames"],
+                    "default_t1_index": gee_res["default_t1_index"],
+                    "excluded_archive_dates": gee_res["excluded_archive_dates"],
+                    "timelapse_rgb_gif_bytes": gee_res["timelapse_rgb_gif_bytes"],
+                    "timelapse_index_gif_bytes": gee_res["timelapse_index_gif_bytes"],
+                    "comparison_rgb": None,
+                    "comparison_index": None,
+                    "comparison_result": None,
+                    "change_summary": gee_res["change_summary"],
+                    "delta_overlay_uri": gee_res["delta_overlay_uri"],
+                    "delta_overlay_bounds": gee_res["delta_overlay_bounds"],
+                    "delta_vmin": gee_res["delta_vmin"],
+                    "delta_vmax": gee_res["delta_vmax"],
+                    "delta_cmap": gee_res["delta_cmap"],
+                    "synergy_metrics": {
+                        "fusion_type": "gee_server_side",
+                        "engine": "gee",
+                        "gee_project_id": gee_res.get("gee_project_id", ""),
+                        "reduce_scale_m": gee_res.get("reduce_scale_m", 120),
+                        "total_frames": len(gee_res["frames"]),
+                    },
+                }
+            )
+            base_out["technical_summary"] = build_technical_summary(plan, base_out, lang=lang)
+            base_out["analysis_context"] = build_analysis_context_dict(plan, base_out)
+            _prog(1.0, "Zaključeno." if lang == "sl" else "Complete.")
+            return base_out
+        if _user_asked_gee and not is_gee_ready():
+            base_out["gee_fallback_note"] = (
+                "Opomba: Google Earth Engine še ni nastavljen v stranski vrstici, zato je bila analiza samodejno izvedena prek Microsoft Planetary Computer (STAC/MODIS)."
+                if lang == "sl"
+                else "Note: Google Earth Engine is not configured in the sidebar yet, so the analysis ran automatically via Microsoft Planetary Computer (STAC/MODIS)."
+            )
+
         if str(plan.get("fusion_mode") or "") == FUSION_TEMPORAL_LANDSAT_S2:
             return execute_temporal_fusion(
                 plan,
