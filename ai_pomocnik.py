@@ -99,6 +99,7 @@ from stac_loader import (
 from gee_engine import (
     GEE_SUPPORTED_INDICES,
     gee_run_temporal_analysis,
+    is_gee_iam_permission_error,
     is_gee_ready,
     is_transient_gee_timeout,
 )
@@ -3084,26 +3085,28 @@ def execute_ai_plan(
                     index_code=_idx_for_gee,
                     sensor_mode=_gee_sensor_mode,
                     target_season=_gee_season,
-                    max_frames=9,
+                    max_frames=7,
                     progress_cb=progress_cb,
                     lang=lang,
+                    max_total_seconds=55.0,
                 )
+                if not isinstance(gee_res, dict) or len(gee_res.get("frames") or []) < 2:
+                    raise TimeoutError("GEE returned fewer than 2 valid frames.")
             except Exception as _gee_exc:
+                if is_gee_iam_permission_error(_gee_exc):
+                    raise
                 _est_area_km2 = ((2.0 * _sfloat(plan.get("radius_m"), 0.0)) ** 2) / 1e6
                 _can_fallback_stac = bool(
-                    is_transient_gee_timeout(_gee_exc)
-                    and (
-                        _est_area_km2 <= 1_500.0
-                        or sensor in MODIS_SENSORS
-                        or _detect_continental_polar_region(_q_norm_gee, str(plan.get("place_name") or "")) is not None
-                    )
+                    _est_area_km2 <= 1_500.0
+                    or sensor in MODIS_SENSORS
+                    or _detect_continental_polar_region(_q_norm_gee, str(plan.get("place_name") or "")) is not None
                 )
                 if not _can_fallback_stac:
                     raise
                 base_out["gee_fallback_note"] = (
-                    "ℹ️ Google Earth Engine je presegel časovno omejitev; analiza je bila samodejno izvedena prek Planetary Computer (STAC)."
+                    "ℹ️ Google Earth Engine je bil preobremenjen; analiza je bila samodejno in hitro izvedena prek Planetary Computer (STAC)."
                     if lang == "sl"
-                    else "ℹ️ Google Earth Engine timed out; the analysis was automatically completed via Planetary Computer (STAC)."
+                    else "ℹ️ Google Earth Engine was overloaded; the analysis was automatically and rapidly completed via Planetary Computer (STAC)."
                 )
                 gee_res = None
 

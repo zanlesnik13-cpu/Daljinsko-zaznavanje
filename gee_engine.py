@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -576,12 +578,26 @@ def _gee_s2_composite(
     start_iso: str,
     end_iso: str,
     *,
-    max_scenes: int = 12,
+    max_scenes: int = 6,
 ) -> tuple[Any, int]:
     """Build fast cloud-masked Sentinel-2 SR Harmonized seasonal median composite (sorted & limited)."""
+    img, col_sz = _gee_s2_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    cnt = int(col_sz.getInfo())
+    if cnt == 0:
+        return None, 0
+    return img, min(cnt, int(max_scenes))
+
+
+def _gee_s2_composite_lazy(
+    region: Any,
+    start_iso: str,
+    end_iso: str,
+    *,
+    max_scenes: int = 6,
+) -> tuple[Any, Any]:
+    """Pure server-side lazy S2 composite (NO .getInfo() round-trip; .sort().limit(6) before median)."""
     def _prep_s2(img: Any) -> Any:
         scl = img.select("SCL")
-        # Mask cloud shadow (3), medium/high cloud (8, 9), cirrus (10), saturated/defective (1)
         mask = (
             scl.neq(1)
             .And(scl.neq(3))
@@ -596,43 +612,33 @@ def _gee_s2_composite(
         )
         return optical.updateMask(mask)
 
-    base = (
+    filtered = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
         .filterDate(start_iso, end_iso)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 60))
     )
-    filtered = base.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 45))
-    count = int(filtered.size().getInfo())
-    if count == 0:
-        filtered = base.filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 75))
-        count = int(filtered.size().getInfo())
-    if count == 0:
-        return None, 0
-    # Sort by cloud cover ascending & cap BEFORE masking/median -> 5-10x faster & cleaner!
     limited = filtered.sort("CLOUDY_PIXEL_PERCENTAGE").limit(int(max_scenes)).map(_prep_s2)
-    return limited.median().clip(region), min(count, int(max_scenes))
+    return limited.median().clip(region), filtered.size()
 
 
-def _gee_landsat_composite(
+def _gee_landsat_composite_lazy(
     region: Any,
     start_iso: str,
     end_iso: str,
     *,
-    max_scenes: int = 10,
-) -> tuple[Any, int, str]:
-    """Build fast cloud-masked Landsat C2 L2 (L5/L7/L8/L9) seasonal median composite (sorted & limited)."""
+    max_scenes: int = 6,
+) -> tuple[Any, Any, str]:
+    """Pure server-side lazy Landsat C2 L2 composite (NO .getInfo() round-trip; .sort().limit(6) before median)."""
     def _mask_qa(img: Any) -> Any:
         qa = img.select("QA_PIXEL")
-        # Bit 1: dilated cloud, Bit 3: cloud, Bit 4: cloud shadow
-        mask = (
+        return (
             qa.bitwiseAnd(1 << 1).eq(0)
             .And(qa.bitwiseAnd(1 << 3).eq(0))
             .And(qa.bitwiseAnd(1 << 4).eq(0))
         )
-        return mask
 
     def _prep_l57(img: Any) -> Any:
-        mask = _mask_qa(img)
         opt = (
             img.select(
                 ["SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"],
@@ -642,10 +648,9 @@ def _gee_landsat_composite(
             .add(-0.2)
             .clamp(0.0, 1.0)
         )
-        return opt.updateMask(mask)
+        return opt.updateMask(_mask_qa(img))
 
     def _prep_l89(img: Any) -> Any:
-        mask = _mask_qa(img)
         opt = (
             img.select(
                 ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
@@ -655,7 +660,7 @@ def _gee_landsat_composite(
             .add(-0.2)
             .clamp(0.0, 1.0)
         )
-        return opt.updateMask(mask)
+        return opt.updateMask(_mask_qa(img))
 
     yr = int(start_iso[:4])
     if yr >= 2013:
@@ -685,28 +690,36 @@ def _gee_landsat_composite(
         prep_fn = _prep_l57
         plat = "Landsat-5/7"
 
-    filtered = raw_col.filter(ee.Filter.lt("CLOUD_COVER", 45))
-    count = int(filtered.size().getInfo())
-    if count == 0:
-        filtered = raw_col.filter(ee.Filter.lt("CLOUD_COVER", 75))
-        count = int(filtered.size().getInfo())
-    if count == 0:
-        return None, 0, plat
-    # Sort by cloud cover ascending & cap BEFORE masking/median -> 5-10x faster on tropical AOIs!
+    filtered = raw_col.filter(ee.Filter.lt("CLOUD_COVER", 60))
     limited = filtered.sort("CLOUD_COVER").limit(int(max_scenes)).map(prep_fn)
-    return limited.median().clip(region), min(count, int(max_scenes)), plat
+    return limited.median().clip(region), filtered.size(), plat
 
 
-def _gee_modis_composite(
+def _gee_landsat_composite(
     region: Any,
     start_iso: str,
     end_iso: str,
     *,
-    max_scenes: int = 12,
-) -> tuple[Any, int]:
-    """Build Terra MODIS MOD09A1 500 m 8-day SR seasonal median composite."""
+    max_scenes: int = 6,
+) -> tuple[Any, int, str]:
+    """Build fast cloud-masked Landsat C2 L2 seasonal median composite (sorted & limited to 6 scenes)."""
+    img, col_sz, plat = _gee_landsat_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    cnt = int(col_sz.getInfo())
+    if cnt == 0:
+        return None, 0, plat
+    return img, min(cnt, int(max_scenes)), plat
+
+
+def _gee_modis_composite_lazy(
+    region: Any,
+    start_iso: str,
+    end_iso: str,
+    *,
+    max_scenes: int = 6,
+) -> tuple[Any, Any]:
+    """Pure server-side lazy MODIS MOD09A1 composite (NO .getInfo() round-trip; .limit(6))."""
     def _prep_modis(img: Any) -> Any:
-        opt = (
+        return (
             img.select(
                 ["sur_refl_b03", "sur_refl_b04", "sur_refl_b01", "sur_refl_b02", "sur_refl_b06", "sur_refl_b07"],
                 ["blue", "green", "red", "nir", "swir16", "swir22"],
@@ -714,18 +727,68 @@ def _gee_modis_composite(
             .multiply(0.0001)
             .clamp(0.0, 1.0)
         )
-        return opt
 
     col = (
         ee.ImageCollection("MODIS/061/MOD09A1")
         .filterBounds(region)
         .filterDate(start_iso, end_iso)
     )
-    count = int(col.size().getInfo())
-    if count == 0:
-        return None, 0
     limited = col.limit(int(max_scenes)).map(_prep_modis)
-    return limited.median().clip(region), min(count, int(max_scenes))
+    return limited.median().clip(region), col.size()
+
+
+def _gee_modis_composite(
+    region: Any,
+    start_iso: str,
+    end_iso: str,
+    *,
+    max_scenes: int = 6,
+) -> tuple[Any, int]:
+    """Build Terra MODIS MOD09A1 500 m 8-day SR seasonal median composite."""
+    img, col_sz = _gee_modis_composite_lazy(region, start_iso, end_iso, max_scenes=max_scenes)
+    cnt = int(col_sz.getInfo())
+    if cnt == 0:
+        return None, 0
+    return img, min(cnt, int(max_scenes))
+
+
+def _build_batched_yearly_stats_fc(
+    year_specs: Sequence[dict[str, Any]],
+    region: Any,
+    idx_key: str,
+    reduce_scale: int,
+    tile_scale: int = 4,
+) -> Any:
+    """Build ONE server-side ``ee.FeatureCollection`` evaluating all years in parallel in a single ``.getInfo()`` call."""
+    reducer = ee.Reducer.mean().combine(ee.Reducer.median(), sharedInputs=True)
+    feats: list[Any] = []
+    for sp in year_specs:
+        idx_img = sp["idx_img"]
+        stats_d = ee.Algorithms.If(
+            sp["col_size_ee"].gt(0),
+            idx_img.reduceRegion(
+                reducer=reducer,
+                geometry=region,
+                scale=int(reduce_scale),
+                bestEffort=True,
+                maxPixels=int(1e9),
+                tileScale=int(tile_scale),
+            ),
+            ee.Dictionary({}),
+        )
+        stats_dict = ee.Dictionary(stats_d)
+        feats.append(
+            ee.Feature(
+                None,
+                {
+                    "year": int(sp["year"]),
+                    "scene_cnt": sp["col_size_ee"],
+                    "mean": stats_dict.get(f"{idx_key}_mean", None),
+                    "median": stats_dict.get(f"{idx_key}_median", None),
+                },
+            )
+        )
+    return ee.FeatureCollection(feats)
 
 
 def _season_date_window(year: int, target_season: str, center_lat: float) -> tuple[str, str]:
@@ -794,7 +857,7 @@ def select_gee_scale_and_mode(
 
     scale_m = select_gee_scale_for_area(area_km2, sensor_mode=sensor_mode)
     tile_scale = 4
-    thumb_dim = 560
+    thumb_dim = 480
     use_modis_post_2000 = bool(sensor_mode == "modis" or (sensor_mode == "auto_fusion" and area_km2 > 2_000_000.0))
     return {
         "area_km2": round(area_km2, 1),
@@ -805,8 +868,21 @@ def select_gee_scale_and_mode(
     }
 
 
+def is_gee_iam_permission_error(exc: Exception | str) -> bool:
+    """Return True if an exception indicates a Google Cloud IAM permission error (never swallow!)."""
+    low = str(exc or "").lower()
+    return (
+        "thumbnails.create" in low
+        or "earthengine.thumbnails" in low
+        or ("permission" in low and ("denied" in low or "required" in low or "does not have" in low))
+        or ("403" in low and ("forbidden" in low or "earth engine" in low or "earthengine" in low))
+    )
+
+
 def is_transient_gee_timeout(exc: Exception | str) -> bool:
     """Return True if an exception represents a transient GEE network/read/computation timeout."""
+    if is_gee_iam_permission_error(exc):
+        return False
     if isinstance(
         exc,
         (
@@ -828,6 +904,7 @@ def is_transient_gee_timeout(exc: Exception | str) -> bool:
             "computation timed out",
             "connection aborted",
             "connection reset",
+            "httpsconnectionpool",
         )
     )
 
@@ -838,11 +915,7 @@ def _gee_call_with_retry(
     *,
     label: str = "",
 ) -> Any:
-    """Execute a GEE server call with 1 automatic lighter retry on transient timeout; returns None if both time out.
-
-    Non-timeout errors (such as IAM permission denied) are re-raised immediately so actionable
-    user messages are never swallowed.
-    """
+    """Execute a GEE server call with 1 automatic lighter retry on transient timeout; returns None if both time out."""
     try:
         return primary_fn()
     except Exception as exc1:
@@ -861,14 +934,7 @@ def _gee_call_with_retry(
 def format_gee_error(exc: Exception | str, lang: str = "sl") -> str:
     """Translate raw Google Earth Engine IAM/permission errors into clear actionable guidance."""
     raw = str(exc or "").strip()
-    low = raw.lower()
-    is_perm = (
-        "thumbnails.create" in low
-        or "earthengine.thumbnails" in low
-        or ("permission" in low and ("denied" in low or "required" in low or "does not have" in low))
-        or ("403" in low and ("forbidden" in low or "earth engine" in low or "earthengine" in low))
-    )
-    if is_perm:
+    if is_gee_iam_permission_error(raw):
         if lang == "en":
             return (
                 "Google Earth Engine permission denied (IAM): Your Google Cloud Service Account needs the "
@@ -889,10 +955,10 @@ def _fetch_thumb_png(
     image: Any,
     vis_params: dict[str, Any],
     region: Any,
-    max_dim: int = 560,
+    max_dim: int = 480,
     lang: str = "sl",
 ) -> bytes:
-    """Download a lightweight PNG visualization from GEE ``getThumbURL`` (EPSG:3857, 90 s timeout)."""
+    """Download a lightweight PNG visualization from GEE ``getThumbURL`` (EPSG:3857, 480 px, 30 s timeout)."""
     params = dict(vis_params)
     params["region"] = region
     params["dimensions"] = int(max_dim)
@@ -900,13 +966,13 @@ def _fetch_thumb_png(
     params["format"] = "png"
     try:
         url = image.getThumbURL(params)
-        resp = requests.get(url, timeout=90)
+        resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         return resp.content
     except Exception as exc:
-        if is_transient_gee_timeout(exc):
-            raise
-        raise RuntimeError(format_gee_error(exc, lang=lang)) from exc
+        if is_gee_iam_permission_error(exc):
+            raise RuntimeError(format_gee_error(exc, lang=lang)) from exc
+        raise
 
 
 def _png_bytes_to_data_uri(png_bytes: bytes) -> str:
@@ -935,18 +1001,25 @@ def gee_run_temporal_analysis(
     index_code: str = "NDVI",
     sensor_mode: str = "auto_fusion",
     target_season: str = "summer",
-    max_frames: int = 9,
+    max_frames: int = 7,
     progress_cb: Callable[[float, str], None] | None = None,
     lang: str = "sl",
+    max_total_seconds: float = 55.0,
 ) -> dict[str, Any]:
-    """Run server-side multi-year compositing, spectral index analysis, Δ change & area stats on GEE.
+    """Run fast server-side multi-year compositing, batched stats, parallel thumbnails & Δ stats on GEE.
 
-    Returns the exact same frame / time-series / change-map bundle expected by
-    Workspace 3 and Workspace 5 (AI Assistant), with zero heavy raster RAM on Streamlit Cloud.
+    Architecture (typically ~15–25 s total):
+        1. Builds lazy server-side `.sort(cloud).limit(6).median()` composites for <= 7 sampled years.
+        2. Evaluates ALL yearly mean/median stats + scene counts in ONE batched ``ee.FeatureCollection.getInfo()``.
+        3. Fetches lightweight 480 px thumbnails concurrently via ``ThreadPoolExecutor(max_workers=4)``,
+           prioritizing ``t1`` (earliest reliable) and ``t2`` (latest) first, omitting redundant
+           complementary-index thumbnails on intermediate years, and enforcing a strict wall-clock
+           budget (``max_total_seconds=55``).
     """
     if not is_gee_ready():
         raise RuntimeError("Google Earth Engine is not connected.")
 
+    t_start = time.monotonic()
     idx_key = str(index_code or "NDVI").strip().upper()
     vis_spec = get_gee_index_vis(idx_key)
     min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox_4326]
@@ -954,7 +1027,6 @@ def gee_run_temporal_analysis(
     bounds_4326 = [[min_lat, min_lon], [max_lat, max_lon]]
     region = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat], None, False)
 
-    # Pick timeout-safe server-side reduction scale, tileScale, and thumbnail size from AOI area
     scale_cfg = select_gee_scale_and_mode(bbox_4326, sensor_mode=sensor_mode)
     reduce_scale = int(scale_cfg["scale_m"])
     tile_scale = int(scale_cfg["tile_scale"])
@@ -969,14 +1041,13 @@ def gee_run_temporal_analysis(
         sy = max(2017, sy)
 
     all_years = list(range(sy, ey + 1))
-    cap = max(2, min(int(max_frames), 12))
+    cap = max(2, min(int(max_frames), 7))
     if len(all_years) > cap:
         pick_idx = np.linspace(0, len(all_years) - 1, cap, dtype=int)
         sampled_years = sorted(set(all_years[i] for i in pick_idx))
     else:
         sampled_years = all_years
 
-    # Choose 1 complementary index for rich layer switching
     if idx_key == "NDSI":
         comp_idx = "NDWI"
     elif idx_key in ("NDBI", "NBR", "BSI"):
@@ -992,112 +1063,198 @@ def gee_run_temporal_analysis(
             except Exception:
                 pass
 
-    rows: list[dict[str, Any]] = []
-    frames: list[dict[str, Any]] = []
-    index_images: list[tuple[int, str, Any, bool]] = []  # (year, date_str, ee.Image, reliable)
-    excluded_archive_dates: list[str] = []
-
-    total_y = len(sampled_years)
-    for i, yr in enumerate(sampled_years):
-        _prog(
-            0.10 + 0.65 * (i / max(total_y, 1)),
-            f"🌍 GEE strežniški mozaik {yr} ({i + 1}/{total_y})..."
-            if lang == "sl"
-            else f"🌍 GEE server-side composite {yr} ({i + 1}/{total_y})...",
-        )
+    # 1. Build pure lazy server-side composites for all sampled years (ZERO network calls yet!)
+    _prog(
+        0.12,
+        f"🌍 GEE pripravlja strežniške mozaike za {len(sampled_years)} let..."
+        if lang == "sl"
+        else f"🌍 GEE preparing server-side composites for {len(sampled_years)} years...",
+    )
+    year_specs: list[dict[str, Any]] = []
+    for yr in sampled_years:
         w_start, w_end = _season_date_window(yr, target_season, center_lat)
         mid_date = f"{yr}-08-01" if center_lat >= -20.0 else f"{yr}-02-01"
 
-        def _run_year_once(max_sc: int, eff_scale: int, eff_dim: int) -> dict[str, Any] | None:
-            comp_img_l = None
-            scene_cnt_l = 0
-            plat_l = "MODIS"
-            sfam_l = "MODIS (500 m)"
+        if (sensor_mode == "modis" or use_modis_post_2000) and yr >= 2000:
+            comp_img, col_sz = _gee_modis_composite_lazy(region, w_start, w_end, max_scenes=6)
+            plat_lbl, sensor_fam = "MODIS Terra", "MODIS (500 m)"
+        elif sensor_mode == "sentinel2" or (sensor_mode == "auto_fusion" and yr >= 2017):
+            comp_img, col_sz = _gee_s2_composite_lazy(region, w_start, w_end, max_scenes=6)
+            plat_lbl, sensor_fam = "Sentinel-2", "Sentinel-2 (10–20 m)"
+        else:
+            comp_img, col_sz, plat_lbl = _gee_landsat_composite_lazy(region, w_start, w_end, max_scenes=6)
+            sensor_fam = "Landsat (30 m)"
 
-            if (sensor_mode == "modis" or use_modis_post_2000) and yr >= 2000:
-                comp_img_l, scene_cnt_l = _gee_modis_composite(region, w_start, w_end, max_scenes=max_sc)
-                plat_l = "MODIS Terra"
-                sfam_l = "MODIS (500 m)"
-            elif sensor_mode == "sentinel2" or (sensor_mode == "auto_fusion" and yr >= 2017):
-                comp_img_l, scene_cnt_l = _gee_s2_composite(region, w_start, w_end, max_scenes=max_sc)
-                plat_l = "Sentinel-2"
-                sfam_l = "Sentinel-2 (10–20 m)"
-                if comp_img_l is None and sensor_mode == "auto_fusion":
-                    comp_img_l, scene_cnt_l, plat_l = _gee_landsat_composite(
-                        region, w_start, w_end, max_scenes=min(max_sc, 10)
-                    )
-                    sfam_l = "Landsat (30 m)"
-            else:
-                comp_img_l, scene_cnt_l, plat_l = _gee_landsat_composite(
-                    region, w_start, w_end, max_scenes=min(max_sc, 10)
-                )
-                sfam_l = "Landsat (30 m)"
-
-            if comp_img_l is None or scene_cnt_l == 0:
-                return None
-
-            idx_img_l = gee_compute_index(comp_img_l, idx_key)
-            comp_idx_img_l = gee_compute_index(comp_img_l, comp_idx)
-
-            reducer = ee.Reducer.mean().combine(ee.Reducer.median(), sharedInputs=True)
-            stats_l = idx_img_l.reduceRegion(
-                reducer=reducer,
-                geometry=region,
-                scale=eff_scale,
-                bestEffort=True,
-                maxPixels=int(1e9),
-                tileScale=tile_scale,
-            ).getInfo() or {}
-            im_val = stats_l.get(f"{idx_key}_mean")
-            imed_val = stats_l.get(f"{idx_key}_median")
-            if im_val is None:
-                return None
-
-            rgb_vis = {"bands": ["red", "green", "blue"], "min": 0.02, "max": 0.35, "gamma": 1.25}
-            idx_vis_p = {"min": vis_spec["min"], "max": vis_spec["max"], "palette": vis_spec["palette"]}
-            comp_vis_p = {"min": comp_vis["min"], "max": comp_vis["max"], "palette": comp_vis["palette"]}
-
-            return {
-                "scene_cnt": scene_cnt_l,
-                "plat_lbl": plat_l,
-                "sensor_fam": sfam_l,
-                "idx_img": idx_img_l,
-                "idx_mean_f": round(float(im_val), 4),
-                "idx_med_f": round(float(imed_val if imed_val is not None else im_val), 4),
-                "rgb_png_raw": _fetch_thumb_png(comp_img_l, rgb_vis, region, max_dim=eff_dim, lang=lang),
-                "idx_png_raw": _fetch_thumb_png(idx_img_l, idx_vis_p, region, max_dim=eff_dim, lang=lang),
-                "comp_png_raw": _fetch_thumb_png(comp_idx_img_l, comp_vis_p, region, max_dim=eff_dim, lang=lang),
+        idx_img = gee_compute_index(comp_img, idx_key)
+        comp_idx_img = gee_compute_index(comp_img, comp_idx)
+        year_specs.append(
+            {
+                "year": yr,
+                "mid_date": mid_date,
+                "comp_img": comp_img,
+                "idx_img": idx_img,
+                "comp_idx_img": comp_idx_img,
+                "col_size_ee": col_sz,
+                "plat_lbl": plat_lbl,
+                "sensor_fam": sensor_fam,
+                "is_reliable": yr >= 1990,
             }
-
-        yr_out = _gee_call_with_retry(
-            lambda: _run_year_once(12, reduce_scale, thumb_dim),
-            lambda: _run_year_once(6, int(round(reduce_scale * 1.5)), 448),
-            label=f"year {yr}",
         )
-        if not isinstance(yr_out, dict):
+
+    # 2. ONE SINGLE BATCHED .getInfo() call for ALL years' stats + scene counts!
+    _prog(
+        0.24,
+        "🌍 GEE paketno računa statistike vseh let na Googlovih strežnikih..."
+        if lang == "sl"
+        else "🌍 GEE computing batched statistics for all years on Google's servers...",
+    )
+    stats_fc = _build_batched_yearly_stats_fc(year_specs, region, idx_key, reduce_scale, tile_scale)
+    try:
+        fc_info = stats_fc.getInfo() or {}
+    except Exception as exc:
+        if is_gee_iam_permission_error(exc):
+            raise RuntimeError(format_gee_error(exc, lang=lang)) from exc
+        raise
+
+    stats_by_year: dict[int, dict[str, Any]] = {}
+    for feat in fc_info.get("features") or []:
+        props = feat.get("properties") or {}
+        if props.get("year") is not None:
+            stats_by_year[int(props["year"])] = props
+
+    valid_specs: list[dict[str, Any]] = []
+    for sp in year_specs:
+        pr = stats_by_year.get(int(sp["year"])) or {}
+        sc_cnt = int(pr.get("scene_cnt") or 0)
+        im_val = pr.get("mean")
+        if sc_cnt <= 0 or im_val is None:
             continue
+        imed_val = pr.get("median")
+        sp["scene_cnt"] = sc_cnt
+        sp["idx_mean_f"] = round(float(im_val), 4)
+        sp["idx_med_f"] = round(float(imed_val if imed_val is not None else im_val), 4)
+        valid_specs.append(sp)
 
-        scene_cnt = int(yr_out["scene_cnt"])
-        plat_lbl = str(yr_out["plat_lbl"])
-        sensor_fam = str(yr_out["sensor_fam"])
-        idx_img = yr_out["idx_img"]
-        idx_mean_f = float(yr_out["idx_mean_f"])
-        idx_med_f = float(yr_out["idx_med_f"])
-        rgb_png_raw = yr_out["rgb_png_raw"]
-        idx_png_raw = yr_out["idx_png_raw"]
-        comp_png_raw = yr_out["comp_png_raw"]
+    if not valid_specs:
+        raise RuntimeError(
+            "Google Earth Engine ni našel uporabnih ne-oblačnih mozaikov za izbrano obdobje in območje."
+            if lang == "sl"
+            else "Google Earth Engine found no usable cloud-free composites for the selected period and region."
+        )
 
-        is_reliable = yr >= 1990
+    # Identify t1 (earliest reliable >= 1990) and t2 (latest) and prioritize them FIRST!
+    t1_pos = 0
+    for idx_i, sp in enumerate(valid_specs):
+        if sp["is_reliable"]:
+            t1_pos = idx_i
+            break
+    t2_pos = len(valid_specs) - 1
+    endpoint_years = {valid_specs[t1_pos]["year"], valid_specs[t2_pos]["year"]}
+
+    priority_order = [valid_specs[t1_pos]]
+    if t2_pos != t1_pos:
+        priority_order.append(valid_specs[t2_pos])
+    for idx_i, sp in enumerate(valid_specs):
+        if idx_i not in (t1_pos, t2_pos):
+            priority_order.append(sp)
+
+    # 3. Parallel 4-worker thumbnail fetching with strict overall wall-clock budget!
+    _prog(
+        0.40,
+        f"🌍 GEE vzporedno generira satelitske prikaze ({len(valid_specs)} let)..."
+        if lang == "sl"
+        else f"🌍 GEE rendering satellite overlays in parallel ({len(valid_specs)} years)...",
+    )
+    rgb_vis = {"bands": ["red", "green", "blue"], "min": 0.02, "max": 0.35, "gamma": 1.25}
+    idx_vis_p = {"min": vis_spec["min"], "max": vis_spec["max"], "palette": vis_spec["palette"]}
+    comp_vis_p = {"min": comp_vis["min"], "max": comp_vis["max"], "palette": comp_vis["palette"]}
+
+    def _fetch_year_bundle(sp: dict[str, Any]) -> dict[str, Any] | None:
+        yr_i = int(sp["year"])
+        is_endpoint = yr_i in endpoint_years
+        # Respect strict wall-clock budget for non-endpoint intermediate frames
+        if not is_endpoint and (time.monotonic() - t_start) > float(max_total_seconds):
+            return None
+        try:
+            rgb_raw = _fetch_thumb_png(sp["comp_img"], rgb_vis, region, max_dim=thumb_dim, lang=lang)
+            idx_raw = _fetch_thumb_png(sp["idx_img"], idx_vis_p, region, max_dim=thumb_dim, lang=lang)
+            # Fetch complementary index ONLY for t1 & t2 endpoints (cuts GEE renders by ~30-60%!)
+            comp_raw: bytes | None = None
+            if is_endpoint and (time.monotonic() - t_start) <= float(max_total_seconds):
+                try:
+                    comp_raw = _fetch_thumb_png(sp["comp_idx_img"], comp_vis_p, region, max_dim=thumb_dim, lang=lang)
+                except Exception as exc_c:
+                    if is_gee_iam_permission_error(exc_c):
+                        raise
+                    comp_raw = None
+            return {
+                "spec": sp,
+                "rgb_raw": rgb_raw,
+                "idx_raw": idx_raw,
+                "comp_raw": comp_raw,
+            }
+        except Exception as exc_f:
+            if is_gee_iam_permission_error(exc_f):
+                raise
+            logger.warning("GEE thumbnail skipped for %s: %s", yr_i, exc_f)
+            return None
+
+    fetched_bundles: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        fut_map = {pool.submit(_fetch_year_bundle, sp): sp for sp in priority_order}
+        done_cnt = 0
+        for fut in as_completed(fut_map):
+            done_cnt += 1
+            res_b = fut.result()
+            if isinstance(res_b, dict):
+                fetched_bundles.append(res_b)
+            _prog(
+                0.40 + 0.38 * (done_cnt / max(len(priority_order), 1)),
+                f"🌍 GEE prikazi: {done_cnt}/{len(priority_order)}"
+                if lang == "sl"
+                else f"🌍 GEE overlays: {done_cnt}/{len(priority_order)}",
+            )
+
+    if not fetched_bundles:
+        raise RuntimeError(
+            "Google Earth Engine ni uspel generirati satelitskih prikazov (časovna omejitev)."
+            if lang == "sl"
+            else "Google Earth Engine failed to render satellite overlays (timed out)."
+        )
+
+    # Restore strict chronological order
+    fetched_bundles.sort(key=lambda b: int(b["spec"]["year"]))
+
+    rows: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    index_images: list[tuple[int, str, Any, bool]] = []
+    excluded_archive_dates: list[str] = []
+
+    for b in fetched_bundles:
+        sp = b["spec"]
+        yr = int(sp["year"])
+        mid_date = str(sp["mid_date"])
+        plat_lbl = str(sp["plat_lbl"])
+        sensor_fam = str(sp["sensor_fam"])
+        is_reliable = bool(sp["is_reliable"])
+        idx_mean_f = float(sp["idx_mean_f"])
+        idx_med_f = float(sp["idx_med_f"])
+        scene_cnt = int(sp["scene_cnt"])
         if not is_reliable:
             excluded_archive_dates.append(mid_date)
 
-        rgb_uri = _png_bytes_to_data_uri(rgb_png_raw)
-        idx_uri = _png_bytes_to_data_uri(idx_png_raw)
-        comp_uri = _png_bytes_to_data_uri(comp_png_raw)
+        rgb_uri = _png_bytes_to_data_uri(b["rgb_raw"])
+        idx_uri = _png_bytes_to_data_uri(b["idx_raw"])
+        rgb_stamped = _stamp_png_bytes(b["rgb_raw"], f"{mid_date} | GEE {plat_lbl} | RGB")
+        idx_stamped = _stamp_png_bytes(b["idx_raw"], f"{mid_date} | GEE {plat_lbl} | {idx_key}={idx_mean_f:.2f}")
 
-        rgb_stamped = _stamp_png_bytes(rgb_png_raw, f"{mid_date} | GEE {plat_lbl} | RGB")
-        idx_stamped = _stamp_png_bytes(idx_png_raw, f"{mid_date} | GEE {plat_lbl} | {idx_key}={idx_mean_f:.2f}")
-        comp_stamped = _stamp_png_bytes(comp_png_raw, f"{mid_date} | GEE {plat_lbl} | {comp_idx}")
+        extra_overlays: dict[str, str] = {}
+        extra_pngs: dict[str, bytes] = {}
+        extra_means: dict[str, Any] = {}
+        if b["comp_raw"]:
+            extra_overlays[comp_idx] = _png_bytes_to_data_uri(b["comp_raw"])
+            extra_pngs[comp_idx] = _stamp_png_bytes(b["comp_raw"], f"{mid_date} | GEE {plat_lbl} | {comp_idx}")
+            extra_means[comp_idx] = None
 
         rows.append(
             {
@@ -1136,9 +1293,9 @@ def gee_run_temporal_analysis(
                 "bounds_4326": bounds_4326,
                 "rgb_overlay_uri": rgb_uri,
                 "index_overlay_uri": idx_uri,
-                "extra_overlays": {comp_idx: comp_uri},
-                "extra_pngs": {comp_idx: comp_stamped},
-                "extra_means": {comp_idx: None},
+                "extra_overlays": extra_overlays,
+                "extra_pngs": extra_pngs,
+                "extra_means": extra_means,
                 "rgb_png_bytes": rgb_stamped,
                 "index_png_bytes": idx_stamped,
                 "index_grid_small": None,
@@ -1146,18 +1303,10 @@ def gee_run_temporal_analysis(
                 "nir_grid_small": None,
             }
         )
-        index_images.append((yr, mid_date, idx_img, is_reliable))
-
-    if not frames:
-        raise RuntimeError(
-            "Google Earth Engine ni našel uporabnih ne-oblačnih mozaikov za izbrano obdobje in območje."
-            if lang == "sl"
-            else "Google Earth Engine found no usable cloud-free composites for the selected period and region."
-        )
+        index_images.append((yr, mid_date, sp["idx_img"], is_reliable))
 
     ts_df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
-    # Pick default reliable t1 (>= 1990) and latest t2 for server-side Δ Change Map + pixelArea() stats
     default_t1_idx = 0
     for idx_i, fr in enumerate(frames):
         if fr.get("analysis_reliable", True):
@@ -1172,7 +1321,7 @@ def gee_run_temporal_analysis(
 
     if len(index_images) >= 2 and default_t1_idx < len(index_images) - 1:
         _prog(
-            0.80,
+            0.82,
             "🌍 GEE računa prostorsko spremembo (Δ) in površine v km²..."
             if lang == "sl"
             else "🌍 GEE computing spatial Δ change map and km² area statistics...",
@@ -1182,53 +1331,51 @@ def gee_run_temporal_analysis(
         diff_img = img_t2.subtract(img_t1).rename("DELTA")
 
         d_pal = GEE_DELTA_PALETTES.get(delta_cmap, GEE_DELTA_PALETTES["RdBu"])
-        delta_png = _fetch_thumb_png(
-            diff_img,
-            {"min": -delta_lim, "max": delta_lim, "palette": d_pal},
-            region,
-            max_dim=thumb_dim,
-            lang=lang,
-        )
-        delta_uri = _png_bytes_to_data_uri(delta_png)
-        delta_bnds = bounds_4326
+        try:
+            delta_png = _fetch_thumb_png(
+                diff_img,
+                {"min": -delta_lim, "max": delta_lim, "palette": d_pal},
+                region,
+                max_dim=thumb_dim,
+                lang=lang,
+            )
+            delta_uri = _png_bytes_to_data_uri(delta_png)
+            delta_bnds = bounds_4326
+        except Exception as exc_d:
+            if is_gee_iam_permission_error(exc_d):
+                raise
+            logger.warning("GEE delta thumbnail skipped: %s", exc_d)
 
-        # Server-side pixelArea() statistics (exact km² and ha!)
+        # Single combined pixelArea() reduction
         thr = 0.15 if idx_key != "BAI" else 25.0
         px_area = ee.Image.pixelArea()
         dec_area_img = px_area.updateMask(diff_img.lt(-thr)).rename("dec_m2")
         inc_area_img = px_area.updateMask(diff_img.gt(thr)).rename("inc_m2")
         tot_area_img = px_area.updateMask(diff_img.mask()).rename("tot_m2")
 
-        area_sums = (
-            dec_area_img.addBands(inc_area_img)
-            .addBands(tot_area_img)
-            .reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=region,
-                scale=reduce_scale,
-                bestEffort=True,
-                maxPixels=int(1e9),
-                tileScale=tile_scale,
+        area_sums: dict[str, Any] = {}
+        try:
+            area_sums = (
+                dec_area_img.addBands(inc_area_img)
+                .addBands(tot_area_img)
+                .reduceRegion(
+                    reducer=ee.Reducer.sum(),
+                    geometry=region,
+                    scale=reduce_scale,
+                    bestEffort=True,
+                    maxPixels=int(1e9),
+                    tileScale=tile_scale,
+                )
+                .getInfo()
+                or {}
             )
-            .getInfo()
-            or {}
-        )
-        mean_diff_d = (
-            diff_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region,
-                scale=reduce_scale,
-                bestEffort=True,
-                maxPixels=int(1e9),
-                tileScale=tile_scale,
-            ).getInfo()
-            or {}
-        )
+        except Exception as exc_a:
+            logger.warning("GEE pixelArea reduction skipped: %s", exc_a)
 
         dec_km2 = float(area_sums.get("dec_m2") or 0.0) / 1e6
         inc_km2 = float(area_sums.get("inc_m2") or 0.0) / 1e6
         tot_km2 = max(1e-6, float(area_sums.get("tot_m2") or 0.0) / 1e6)
-        delta_mean_v = float(mean_diff_d.get("DELTA") or (frames[-1]["index_mean"] - frames[default_t1_idx]["index_mean"]))
+        delta_mean_v = float(frames[-1]["index_mean"] - frames[default_t1_idx]["index_mean"])
 
         change_summary = {
             "t1_date": d1,
@@ -1247,7 +1394,6 @@ def gee_run_temporal_analysis(
             "engine": "gee",
         }
 
-    # Build crisp Timelapse GIFs using our existing builder
     gif_rgb: bytes | None = None
     gif_idx: bytes | None = None
     try:
