@@ -82,9 +82,12 @@ from stac_loader import (
     INTERVAL_MONTHLY,
     INTERVAL_SEASONAL,
     INTERVAL_YEARLY,
+    MODIS_SENSORS,
     SEASON_GLACIER_ABLATION,
     SEASON_SUMMER,
     SENSOR_LANDSAT,
+    SENSOR_MODIS_LST,
+    SENSOR_MODIS_SR,
     SENSOR_S1,
     SENSOR_S2,
     assess_scene_analysis_reliability,
@@ -206,7 +209,13 @@ def verify_gemini_api_connection(
 
 GEMINI_ENDPOINT: str = build_gemini_endpoint(DEFAULT_GEMINI_MODEL)
 
-VALID_SENSORS: tuple[str, ...] = (SENSOR_S2, SENSOR_LANDSAT, SENSOR_S1)
+VALID_SENSORS: tuple[str, ...] = (
+    SENSOR_S2,
+    SENSOR_LANDSAT,
+    SENSOR_S1,
+    SENSOR_MODIS_SR,
+    SENSOR_MODIS_LST,
+)
 VALID_TASKS: tuple[str, ...] = (
     "scene_rgb",
     "spectral_index",
@@ -236,7 +245,7 @@ VALID_INDICES: tuple[str, ...] = (
     "LST",
     "VV",
 )
-VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60)
+VALID_RESOLUTIONS: tuple[int, ...] = (10, 20, 30, 60, 100, 250, 500, 1000, 2000)
 
 FUSION_SINGLE: str = "single"
 FUSION_TEMPORAL_LANDSAT_S2: str = "temporal_landsat_s2"
@@ -252,9 +261,72 @@ VALID_FUSION_MODES: tuple[str, ...] = (
 )
 SENSOR_DEM: str = "cop-dem-glo-30"
 
+# Continental / polar regions that automatically route to MODIS 500m-1km + Polar Stereographic / UTM
+# tuple: (keywords, canonical_name, lat, lon, default_radius_m, default_res_m, default_index)
+_CONTINENTAL_POLAR_REGIONS: tuple[tuple[tuple[str, ...], str, float, float, int, int, str], ...] = (
+    (
+        ("grenland", "greenland", "jakobshavn", "ilulissat", "sermeq"),
+        "Greenland Ice Sheet",
+        72.0,
+        -40.0,
+        550_000,
+        1000,
+        "NDSI",
+    ),
+    (
+        ("antarktik", "antarctic", "thwaites", "pine island", "larsen"),
+        "West Antarctica (Thwaites / Peninsula)",
+        -75.0,
+        -106.0,
+        550_000,
+        1000,
+        "NDSI",
+    ),
+    (
+        ("amazon", "rondoni", "amazonsk"),
+        "Amazon Rainforest (Rondônia, Brazil)",
+        -10.5,
+        -62.5,
+        220_000,
+        500,
+        "NDVI",
+    ),
+)
+
+
+def _detect_continental_polar_region(
+    query: str,
+    place_name: str = "",
+) -> tuple[str, float, float, int, int, str] | None:
+    """Detect continental or polar AOI requests (Greenland, Antarctica, Amazon) for MODIS routing."""
+    hay = _normalize_ascii(f"{query} {place_name}")
+    for kws, cname, lat_v, lon_v, rad_m, res_m, idx_c in _CONTINENTAL_POLAR_REGIONS:
+        if any(kw in hay for kw in kws):
+            return cname, lat_v, lon_v, rad_m, res_m, idx_c
+    return None
+
+
 # Global landmarks & common typos -> (canonical_name, lat, lon)
 # Prevents ambiguous place names (e.g. "Boca Chica" -> Dominican Republic instead of SpaceX Starbase Texas!)
 _KNOWN_GLOBAL_LANDMARKS: tuple[tuple[tuple[str, ...], str, float, float], ...] = (
+    (
+        ("grenland", "greenland", "jakobshavn"),
+        "Greenland Ice Sheet",
+        72.0,
+        -40.0,
+    ),
+    (
+        ("antarktik", "antarctic", "thwaites"),
+        "West Antarctica (Thwaites / Peninsula)",
+        -75.0,
+        -106.0,
+    ),
+    (
+        ("amazon", "rondoni", "amazonsk"),
+        "Amazon Rainforest (Rondônia, Brazil)",
+        -10.5,
+        -62.5,
+    ),
     (
         ("starbase", "boca chic", "spacex", "sapacex"),
         "SpaceX Starbase, Boca Chica, Texas, USA",
@@ -674,6 +746,20 @@ def detect_fusion_mode(
     req_m = str(requested_mode or "").strip().lower()
     y1, y2 = start_d.year, end_d.year
 
+    # 0. Continental / Polar MODIS Mode (unified 2000–present 8-day composites; never force 30m/10m fusion over 500km!)
+    if sensor in MODIS_SENSORS:
+        r_sl = (
+            "Za analizo območja kontinentalnega ali polarnega merila je bil izbran 8-dnevni mozaik **Terra MODIS (500 m–1 km)** "
+            "v ustrezni polarni stereografski (**EPSG:3413 / EPSG:3031**) ali lokalni UTM projekciji, ki omogoča hiter, "
+            "brezoblačen pregled celotnega ledenega pokrova ali porečja znotraj 1 GB RAM-a brez popačenj UTM na visokih širinah."
+        )
+        r_en = (
+            "For continental or polar-scale analysis, **Terra MODIS 8-day composites (500 m–1 km)** were selected "
+            "in Polar Stereographic (**EPSG:3413 / EPSG:3031**) or local UTM projection, enabling fast, cloud-minimized "
+            "coverage of entire ice sheets or river basins within 1 GB RAM without high-latitude UTM distortion."
+        )
+        return FUSION_SINGLE, [sensor], r_sl, r_en
+
     # 1. Multi-Decade Temporal Fusion: Landsat (1984–2016) + Sentinel-2 (2017–present)
     is_temporal_task = task_type in ("time_series", "time_series_and_comparison", "change_comparison")
     spans_s2_boundary = start_d < date(2017, 1, 1) and end_d >= date(2017, 1, 1)
@@ -770,21 +856,20 @@ def validate_and_normalize_plan(
     """Validate and enforce strict geodetic/sensor rules on any parsed JSON plan."""
     today = date.today()
     raw_place = str(raw_plan.get("place_name") or raw_plan.get("location") or "Ljubljana").strip()
+    cont_hit = _detect_continental_polar_region(query, raw_place)
     lm_hit = _match_known_global_landmark(raw_place)
-    if lm_hit is not None:
+    if cont_hit is not None:
+        place_name = cont_hit[0]
+    elif lm_hit is not None:
         place_name = lm_hit[0]
     else:
         place_name = _normalize_slovenian_place_name(raw_place)
 
     lat_val, lon_val = _coerce_valid_lat_lon(raw_plan.get("lat"), raw_plan.get("lon"))
-    if lat_val is None and lm_hit is not None:
+    if cont_hit is not None and lat_val is None:
+        lat_val, lon_val = cont_hit[1], cont_hit[2]
+    elif lat_val is None and lm_hit is not None:
         lat_val, lon_val = lm_hit[1], lm_hit[2]
-
-    try:
-        radius_m = int(round(float(raw_plan.get("radius_m", 4000))))
-    except Exception:
-        radius_m = 4000
-    radius_m = int(np.clip(radius_m, 500, 12000))
 
     task_type = str(raw_plan.get("task_type") or "spectral_index").strip().lower()
     if task_type not in VALID_TASKS:
@@ -796,9 +881,9 @@ def validate_and_normalize_plan(
     if task_type == "time_series" and include_comparison:
         task_type = "time_series_and_comparison"
 
-    index_name = str(raw_plan.get("index_name") or "NDVI").strip().upper()
+    index_name = str(raw_plan.get("index_name") or (cont_hit[5] if cont_hit else "NDVI")).strip().upper()
     if index_name not in VALID_INDICES:
-        index_name = "VV" if task_type == "disaster_flood" else "NDVI"
+        index_name = "VV" if task_type == "disaster_flood" else (cont_hit[5] if cont_hit else "NDVI")
 
     default_start = today - timedelta(days=90)
     start_d = _parse_iso_date(raw_plan.get("start_date"), default_start)
@@ -807,12 +892,18 @@ def validate_and_normalize_plan(
         start_d, end_d = end_d, start_d
     event_d = _parse_iso_date(raw_plan.get("event_date"), end_d)
 
-    # Enforce physically valid sensor rules
+    # Enforce physically valid sensor rules (including Continental / Polar MODIS!)
     sensor = str(raw_plan.get("sensor") or SENSOR_S2).strip().lower()
     if sensor not in VALID_SENSORS:
         sensor = SENSOR_S2
 
-    if task_type == "disaster_flood" or index_name == "VV":
+    if cont_hit is not None or sensor in MODIS_SENSORS:
+        sensor = SENSOR_MODIS_LST if index_name == "LST" else SENSOR_MODIS_SR
+        if start_d < date(2000, 2, 18):
+            start_d = date(2000, 2, 18)
+        if cont_hit is not None and not raw_plan.get("index_name"):
+            index_name = cont_hit[5]
+    elif task_type == "disaster_flood" or index_name == "VV":
         sensor = SENSOR_S1
         index_name = "VV"
     elif index_name == "LST":
@@ -827,6 +918,18 @@ def validate_and_normalize_plan(
         if start_d < date(2016, 1, 1):
             sensor = SENSOR_LANDSAT
 
+    is_modis_plan = sensor in MODIS_SENSORS
+    try:
+        radius_m = int(round(float(raw_plan.get("radius_m", cont_hit[3] if cont_hit else 4000))))
+    except Exception:
+        radius_m = cont_hit[3] if cont_hit else 4000
+    if is_modis_plan:
+        if cont_hit is not None and radius_m < 50_000:
+            radius_m = cont_hit[3]
+        radius_m = int(np.clip(radius_m, 25_000, 1_200_000))
+    else:
+        radius_m = int(np.clip(radius_m, 500, 12_000))
+
     # Normalize temporal interval label
     interval = str(raw_plan.get("interval") or "Mesečno").strip()
     if interval not in INTERVAL_LABEL_TO_KEY:
@@ -840,11 +943,25 @@ def validate_and_normalize_plan(
         else:
             interval = "Vsi posnetki"
 
-    # Normalize spatial resolution (16 GB RAM profile: native 10 m for Sentinel, 30 m for Landsat)
+    # Normalize spatial resolution
+    default_res_for_sensor = (
+        1000
+        if sensor == SENSOR_MODIS_LST
+        else (
+            (cont_hit[4] if cont_hit else 500)
+            if sensor == SENSOR_MODIS_SR
+            else (30 if sensor == SENSOR_LANDSAT else 10)
+        )
+    )
     try:
-        res_m = int(raw_plan.get("resolution_m", 30 if sensor == SENSOR_LANDSAT else 10))
+        res_m = int(raw_plan.get("resolution_m", default_res_for_sensor))
     except Exception:
-        res_m = 30 if sensor == SENSOR_LANDSAT else 10
+        res_m = default_res_for_sensor
+    if is_modis_plan:
+        if res_m < 500:
+            res_m = default_res_for_sensor
+        if sensor == SENSOR_MODIS_LST and res_m < 1000:
+            res_m = 1000
     if res_m not in VALID_RESOLUTIONS:
         res_m = min(VALID_RESOLUTIONS, key=lambda r: abs(r - res_m))
     if sensor == SENSOR_LANDSAT and res_m < 30:
@@ -1191,7 +1308,27 @@ def parse_eo_request_local(query: str) -> dict[str, Any]:
         interval = "Letno"
 
     # Index detection
-    if "ndsi" in norm_q or any(k in norm_q for k in ("sneg", "snez", "ledenik", "snow", "glacier")):
+    if "ndsi" in norm_q or any(
+        k in norm_q
+        for k in (
+            "sneg",
+            "snez",
+            "ledenik",
+            "leden",
+            "ledu",
+            "leda",
+            "ledom",
+            "snow",
+            "glacier",
+            "ice sheet",
+            "ice cap",
+            "sea ice",
+            "grenland",
+            "greenland",
+            "antarktik",
+            "antarctic",
+        )
+    ):
         index_name = "NDSI"
     elif "lst" in norm_q or any(k in norm_q for k in ("temperat", "vrocin", "toplot", "thermal", "heat island")):
         index_name = "LST"

@@ -412,7 +412,8 @@ def get_required_bands_for_sensor(
 ) -> list[str]:
     """Return the minimal band/polarization list for a given sensor and index/metric."""
     key = metric_name.strip().upper()
-    if sensor == "sentinel-1-rtc":
+    s_norm = str(sensor or "").strip().lower()
+    if s_norm == "sentinel-1-rtc":
         if key not in SAR_METRICS:
             raise ValueError(
                 f"Unsupported SAR metric {metric_name!r}. "
@@ -426,8 +427,8 @@ def get_required_bands_for_sensor(
             f"Supported indices: {', '.join(SPECTRAL_INDICES.keys())}."
         )
     bands = list(SPECTRAL_INDICES[key]["bands"])
-    if include_cloud_mask:
-        mask_band = "QA_PIXEL" if sensor == "landsat-c2-l2" else "SCL"
+    if include_cloud_mask and not s_norm.startswith("modis"):
+        mask_band = "QA_PIXEL" if s_norm == "landsat-c2-l2" else "SCL"
         if mask_band not in bands:
             bands.append(mask_band)
     return bands
@@ -748,6 +749,14 @@ compute_spectral_index = compute_index
 def get_supported_indices_for_sensor(sensor: str) -> list[str]:
     """Return ordered list of spectral index codes supported by ``sensor``."""
     s_norm = str(sensor or "sentinel-2-l2a").strip().lower()
+    if s_norm == "modis-11a2-061":
+        return ["LST"]
+    if s_norm == "modis-09a1-061":
+        return [
+            code
+            for code, meta in SPECTRAL_INDICES_META.items()
+            if not meta.get("s2_only") and not meta.get("landsat_only")
+        ]
     return [
         code
         for code, meta in SPECTRAL_INDICES_META.items()

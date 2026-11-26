@@ -171,8 +171,10 @@ from geodezija_crs import (
     clip_to_aoi_polygon,
     export_to_geotiff_bytes,
     format_crs_label,
+    get_auto_metric_epsg,
     get_auto_utm_epsg,
     get_best_metric_crs,
+    get_dynamic_aoi_limits,
     get_ram_limits,
     get_runtime_environment,
     get_safe_processing_resolution,
@@ -222,9 +224,13 @@ from stac_loader import (
     INTERVAL_MONTHLY,
     INTERVAL_SEASONAL,
     INTERVAL_YEARLY,
+    MODIS_MIN_DATE,
+    MODIS_SENSORS,
     SEASON_GLACIER_ABLATION,
     SEASON_SUMMER,
     SENSOR_LANDSAT,
+    SENSOR_MODIS_LST,
+    SENSOR_MODIS_SR,
     SENSOR_S1,
     SENSOR_S2,
     TEMPORAL_INTERVAL_KEYS,
@@ -657,7 +663,13 @@ SLOVENIA_PLACES_FALLBACK: dict[str, tuple[float, float]] = {
     "Velika planina": (46.2940, 14.6470),
 }
 
-SENSOR_KEYS: list[str] = [SENSOR_S2, SENSOR_LANDSAT, SENSOR_S1]
+SENSOR_KEYS: list[str] = [
+    SENSOR_S2,
+    SENSOR_LANDSAT,
+    SENSOR_S1,
+    SENSOR_MODIS_SR,
+    SENSOR_MODIS_LST,
+]
 SENSOR_META: dict[str, dict[str, Any]] = {
     SENSOR_S2: {
         "label_key": "sensor_s2_label",
@@ -665,7 +677,7 @@ SENSOR_META: dict[str, dict[str, Any]] = {
         "short_name": "Sentinel-2 L2A",
         "file_prefix": "S2L2A",
         "min_date": date(2015, 6, 23),
-        "res_options": [10, 20, 30, 60],
+        "res_options": [10, 20, 30, 60, 100, 250],
         "default_res": 10,
     },
     SENSOR_LANDSAT: {
@@ -674,7 +686,7 @@ SENSOR_META: dict[str, dict[str, Any]] = {
         "short_name": "Landsat C2 L2",
         "file_prefix": "LandsatC2L2",
         "min_date": date(1984, 1, 1),
-        "res_options": [30, 60],
+        "res_options": [30, 60, 100, 250],
         "default_res": 30,
     },
     SENSOR_S1: {
@@ -685,6 +697,51 @@ SENSOR_META: dict[str, dict[str, Any]] = {
         "min_date": date(2014, 10, 1),
         "res_options": [10, 20, 30, 60],
         "default_res": 10,
+    },
+    SENSOR_MODIS_SR: {
+        "label_key": "sensor_modis_sr_label",
+        "pill_key": "sensor_modis_sr_pill",
+        "short_name": "MODIS 09A1 (500 m–1 km)",
+        "file_prefix": "MODIS09A1",
+        "min_date": MODIS_MIN_DATE,
+        "res_options": [500, 1000, 2000],
+        "default_res": 500,
+    },
+    SENSOR_MODIS_LST: {
+        "label_key": "sensor_modis_lst_label",
+        "pill_key": "sensor_modis_lst_pill",
+        "short_name": "MODIS 11A2 LST (1 km)",
+        "file_prefix": "MODIS11A2",
+        "min_date": MODIS_MIN_DATE,
+        "res_options": [1000, 2000],
+        "default_res": 1000,
+    },
+}
+
+CONTINENTAL_POLAR_PRESETS: dict[str, dict[str, Any]] = {
+    "greenland": {
+        "label_key": "preset_greenland",
+        "lat": 72.0,
+        "lon": -40.0,
+        "radius_m": 550_000,
+        "sensor": SENSOR_MODIS_SR,
+        "res_m": 1000,
+    },
+    "antarctica": {
+        "label_key": "preset_antarctica",
+        "lat": -75.0,
+        "lon": -106.0,
+        "radius_m": 550_000,
+        "sensor": SENSOR_MODIS_SR,
+        "res_m": 1000,
+    },
+    "amazon_rondonia": {
+        "label_key": "preset_amazon",
+        "lat": -10.5,
+        "lon": -62.5,
+        "radius_m": 220_000,
+        "sensor": SENSOR_MODIS_SR,
+        "res_m": 500,
     },
 }
 
@@ -872,7 +929,7 @@ def _render_index_info_card(
     sensor_note = ""
     if meta.get("s2_only") and active_sensor != SENSOR_S2:
         sensor_note = f'<div style="margin-top:5px;font-size:12px;color:#B45309;">{t("idx_s2_only_badge", lang=lang)}</div>'
-    elif meta.get("landsat_only") and active_sensor != SENSOR_LANDSAT:
+    elif meta.get("landsat_only") and active_sensor not in (SENSOR_LANDSAT, SENSOR_MODIS_LST):
         sensor_note = f'<div style="margin-top:5px;font-size:12px;color:#B45309;">{t("idx_ls_only_badge", lang=lang)}</div>'
 
     st.markdown(
@@ -2252,6 +2309,46 @@ def _apply_snow_glacier_preset(preset_key: str) -> None:
     st.session_state["tab3_ch_metric_landsat-c2-l2"] = "NDSI"
     st.session_state["tab3_tl_layer_sentinel-2-l2a"] = "NDSI"
     st.session_state["tab3_tl_layer_landsat-c2-l2"] = "NDSI"
+    st.session_state["map_jump_version"] = int(st.session_state.get("map_jump_version", 0)) + 1
+    st.session_state["search_performed"] = False
+    st.session_state["stac_items"] = []
+    st.session_state["stac_summary_df"] = pd.DataFrame()
+    _clear_loaded_products()
+
+
+def _apply_continental_preset(preset_key: str) -> None:
+    """1-klik preklop na kontinentalni / polarni primer: MODIS 500m–1km, Polarni CRS (EPSG:3413/3031) ali UTM."""
+    spec = CONTINENTAL_POLAR_PRESETS.get(preset_key)
+    if spec is None:
+        return
+    target_sensor = str(spec["sensor"])
+    target_res = int(spec["res_m"])
+    dyn_lims = get_dynamic_aoi_limits(target_sensor, target_res)
+    clamped_r = min(int(spec["radius_m"]), int(dyn_lims["max_radius_m"]))
+    default_idx = "NDVI" if preset_key == "amazon_rondonia" else "NDSI"
+
+    st.session_state["selected_sensor"] = target_sensor
+    st.session_state["active_sensor"] = target_sensor
+    st.session_state["sidebar_sensor_select"] = target_sensor
+    st.session_state["main_bar_sensor_select"] = target_sensor
+    st.session_state["selected_resolution"] = target_res
+    st.session_state[f"sidebar_res_select_{target_sensor}"] = target_res
+    st.session_state["last_rec_res_key"] = f"{target_sensor}_{target_res}"
+
+    st.session_state["map_lat"] = float(spec["lat"])
+    st.session_state["map_lon"] = float(spec["lon"])
+    st.session_state["map_radius_m"] = clamped_r
+    st.session_state["ws1_map_radius_slider"] = clamped_r
+    st.session_state["active_location_label"] = t(spec["label_key"])
+    st.session_state["pending_aoi_mode"] = "map"
+    st.session_state["drawn_polygon_4326"] = None
+    st.session_state["sidebar_crs_mode"] = "auto"
+    st.session_state["tab2_index_select"] = default_idx
+    st.session_state[f"tab3_ts_metric_{target_sensor}"] = default_idx
+    st.session_state[f"tab3_ch_metric_{target_sensor}"] = default_idx
+    st.session_state[f"tab3_tl_layer_{target_sensor}"] = default_idx
+    st.session_state["map_zoom"] = 5
+    st.session_state["live_map_zoom"] = 5
     st.session_state["map_jump_version"] = int(st.session_state.get("map_jump_version", 0)) + 1
     st.session_state["search_performed"] = False
     st.session_state["stac_items"] = []
@@ -4221,7 +4318,9 @@ def _resolve_active_aoi_state(
 def _sync_ws1_radius() -> None:
     val = st.session_state.get("ws1_map_radius_slider")
     if val is not None:
-        max_r = int(get_ram_limits()["max_radius_m"])
+        cur_sensor = str(st.session_state.get("selected_sensor", SENSOR_S2))
+        cur_res = float(st.session_state.get("selected_resolution", SENSOR_META.get(cur_sensor, {}).get("default_res", 10)))
+        max_r = int(get_dynamic_aoi_limits(cur_sensor, cur_res)["max_radius_m"])
         st.session_state["map_radius_m"] = min(int(val), max_r)
 
 
@@ -4397,7 +4496,14 @@ def _render_interactive_aoi_section(
                 use_pills=True,
             )
         with c_aoi_ctrl:
-            ram_lims_aoi = get_ram_limits()
+            cur_sensor_ws1 = str(st.session_state.get("selected_sensor", SENSOR_S2))
+            cur_res_ws1 = float(
+                st.session_state.get(
+                    "selected_resolution",
+                    SENSOR_META.get(cur_sensor_ws1, {}).get("default_res", 10),
+                )
+            )
+            ram_lims_aoi = get_dynamic_aoi_limits(cur_sensor_ws1, cur_res_ws1)
             max_rad_m = int(ram_lims_aoi["max_radius_m"])
             max_area_lim = float(ram_lims_aoi["max_area_km2"])
             if aoi_mode_key in ("map", "preset"):
@@ -4407,11 +4513,12 @@ def _render_interactive_aoi_section(
                     st.session_state["ws1_map_radius_slider"] = cur_rad
                 elif int(st.session_state["ws1_map_radius_slider"]) > max_rad_m:
                     st.session_state["ws1_map_radius_slider"] = max_rad_m
+                rad_step = 5000 if max_rad_m >= 100_000 else (1000 if max_rad_m >= 25_000 else 250)
                 st.slider(
                     t("radius_label"),
                     min_value=500,
                     max_value=max_rad_m,
-                    step=250,
+                    step=rad_step,
                     key="ws1_map_radius_slider",
                     on_change=_sync_ws1_radius,
                     help=t("radius_help"),
@@ -4476,6 +4583,18 @@ def _render_interactive_aoi_section(
                 _apply_slovenia_preset_ws1(chosen_preset)
                 st.rerun()
             st.caption(t(SLOVENIA_PRESETS[chosen_preset]["desc_key"]))
+
+        with st.expander(t("continental_presets_header"), expanded=False):
+            cp_cols = st.columns(3)
+            for cp_col, (cp_key, cp_spec) in zip(cp_cols, CONTINENTAL_POLAR_PRESETS.items()):
+                with cp_col:
+                    st.button(
+                        t(cp_spec["label_key"]),
+                        width="stretch",
+                        key=f"ws1_continental_preset_{cp_key}",
+                        on_click=_apply_continental_preset,
+                        args=(cp_key,),
+                    )
 
     if selected_basemap != prev_basemap:
         st.session_state["map_basemap"] = selected_basemap
@@ -9424,8 +9543,11 @@ def main() -> None:
     _clamp_dates_for_sensor(sensor)
 
     cur_lang_pre = str(st.session_state.get("lang", "sl"))
-    # Enforce hard RAM radius cap before resolving AOI so searches are never blocked
-    _ram_lims_main = get_ram_limits()
+    # Enforce dynamic pixel-budget radius cap before resolving AOI so MODIS & coarse overviews unlock larger extents
+    _cur_res_main = float(
+        st.session_state.get("selected_resolution", sensor_cfg["default_res"])
+    )
+    _ram_lims_main = get_dynamic_aoi_limits(sensor, _cur_res_main)
     _max_rad_main = int(_ram_lims_main["max_radius_m"])
     if int(st.session_state.get("map_radius_m", 2000)) > _max_rad_main:
         st.session_state["map_radius_m"] = _max_rad_main
@@ -9449,11 +9571,11 @@ def main() -> None:
     if bbox_4326 is not None and aoi_error is None:
         if aoi_polygon_4326 is not None:
             area_km2, aoi_valid, base_rec_res = validate_aoi_geometry(aoi_polygon_4326, sensor=sensor)
-            _, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326, sensor=sensor)
+            _, bbox_ok, bbox_rec_res = validate_aoi_size(bbox_4326, sensor=sensor, resolution_m=_cur_res_main)
             aoi_valid = aoi_valid and bbox_ok
             base_rec_res = max(base_rec_res, bbox_rec_res)
         else:
-            area_km2, aoi_valid, base_rec_res = validate_aoi_size(bbox_4326, sensor=sensor)
+            area_km2, aoi_valid, base_rec_res = validate_aoi_size(bbox_4326, sensor=sensor, resolution_m=_cur_res_main)
         rec_res = base_rec_res
         res_key = f"{sensor}_{rec_res}"
         if st.session_state["last_rec_res_key"] != res_key:
@@ -10121,6 +10243,17 @@ def main() -> None:
                                 key=f"tab2_empty_snow_preset_{sp_key}",
                                 on_click=_apply_snow_glacier_preset,
                                 args=(sp_key,),
+                            )
+                    st.markdown(f"**{t('continental_presets_header')}**")
+                    cp2_cols = st.columns(3)
+                    for cp2_col, (cp2_key, cp2_spec) in zip(cp2_cols, CONTINENTAL_POLAR_PRESETS.items()):
+                        with cp2_col:
+                            st.button(
+                                t(cp2_spec["label_key"]),
+                                width="stretch",
+                                key=f"tab2_empty_continental_preset_{cp2_key}",
+                                on_click=_apply_continental_preset,
+                                args=(cp2_key,),
                             )
 
             # --- Način 2A: Sentinel-1 SAR Water / Flood Mask ---

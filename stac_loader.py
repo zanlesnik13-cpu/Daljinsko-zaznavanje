@@ -85,13 +85,19 @@ STAC_API_URL: str = "https://planetarycomputer.microsoft.com/api/stac/v1"
 SENSOR_S2: str = "sentinel-2-l2a"
 SENSOR_LANDSAT: str = "landsat-c2-l2"
 SENSOR_S1: str = "sentinel-1-rtc"
+SENSOR_MODIS_SR: str = "modis-09A1-061"
+SENSOR_MODIS_LST: str = "modis-11A2-061"
+MODIS_SENSORS: tuple[str, ...] = (SENSOR_MODIS_SR, SENSOR_MODIS_LST)
 
 SENTINEL2_COLLECTION: str = SENSOR_S2
 LANDSAT_COLLECTION: str = SENSOR_LANDSAT
 SENTINEL1_COLLECTION: str = SENSOR_S1
+MODIS_SR_COLLECTION: str = SENSOR_MODIS_SR
+MODIS_LST_COLLECTION: str = SENSOR_MODIS_LST
 
 # Historical archive bounds, operational Landsat missions & swath coverage defaults
 HISTORICAL_MIN_DATE: date = date(1984, 1, 1)
+MODIS_MIN_DATE: date = date(2000, 2, 18)
 DEFAULT_MIN_AOI_COVERAGE_PCT: float = 90.0
 LANDSAT_OPERATIONAL_PLATFORMS: list[str] = [
     "landsat-4",
@@ -1708,6 +1714,205 @@ def load_sentinel1_scene(
 # ---------------------------------------------------------------------------
 # 4. UNIFIED MULTI-SENSOR DISPATCHERS
 # ---------------------------------------------------------------------------
+# 4. CONTINENTAL / POLAR MODIS (modis-09A1-061 500 m SR & modis-11A2-061 1 km LST)
+# ---------------------------------------------------------------------------
+LOGICAL_TO_MODIS_ASSET: dict[str, str] = {
+    "B04": "sur_refl_b01",
+    "red": "sur_refl_b01",
+    "B03": "sur_refl_b04",
+    "green": "sur_refl_b04",
+    "B02": "sur_refl_b03",
+    "blue": "sur_refl_b03",
+    "B08": "sur_refl_b02",
+    "nir": "sur_refl_b02",
+    "B11": "sur_refl_b06",
+    "swir16": "sur_refl_b06",
+    "B12": "sur_refl_b07",
+    "swir22": "sur_refl_b07",
+    "LST": "LST_Day_1km",
+    "LST_Day_1km": "LST_Day_1km",
+    # Direct MODIS asset names also accepted
+    "sur_refl_b01": "sur_refl_b01",
+    "sur_refl_b02": "sur_refl_b02",
+    "sur_refl_b03": "sur_refl_b03",
+    "sur_refl_b04": "sur_refl_b04",
+    "sur_refl_b06": "sur_refl_b06",
+    "sur_refl_b07": "sur_refl_b07",
+}
+MODIS_ASSET_TO_LOGICAL: dict[str, str] = {
+    "sur_refl_b01": "B04",
+    "sur_refl_b04": "B03",
+    "sur_refl_b03": "B02",
+    "sur_refl_b02": "B08",
+    "sur_refl_b06": "B11",
+    "sur_refl_b07": "B12",
+    "LST_Day_1km": "LST",
+}
+
+
+def calibrate_modis_reflectance_array(raw_arr: np.ndarray) -> np.ndarray:
+    """Apply official MODIS 09A1 surface reflectance scale (``* 0.0001``), mask fill, and clip to ``[0, 1]``."""
+    arr = np.asarray(raw_arr, dtype=np.float32)
+    valid = np.isfinite(arr) & (arr > np.float32(-100.0)) & (arr < np.float32(16000.0))
+    out = np.full(arr.shape, np.nan, dtype=np.float32)
+    if np.any(valid):
+        scaled = arr[valid] * np.float32(0.0001)
+        out[valid] = np.clip(scaled, np.float32(0.0), np.float32(1.0))
+    return out
+
+
+def calibrate_modis_lst_array(raw_arr: np.ndarray) -> np.ndarray:
+    """Apply official MODIS 11A2 LST scale (``* 0.02 - 273.15`` °C), masking ``<= 0`` fill to ``NaN``."""
+    arr = np.asarray(raw_arr, dtype=np.float32)
+    valid = np.isfinite(arr) & (arr > np.float32(0.0)) & (arr < np.float32(65535.0))
+    out = np.full(arr.shape, np.nan, dtype=np.float32)
+    if np.any(valid):
+        scaled = arr[valid].astype(np.float64) * 0.02 - 273.15
+        out[valid] = np.clip(scaled, -90.0, 80.0).astype(np.float32)
+    return out
+
+
+def search_modis(
+    bbox_4326: Sequence[float],
+    start_date: str | date | datetime,
+    end_date: str | date | datetime,
+    *,
+    collection: str = SENSOR_MODIS_SR,
+    limit: int | None = None,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+    min_coverage_pct: float = 50.0,
+    interval_mode: str = INTERVAL_ALL,
+    target_season: str = SEASON_SUMMER,
+) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
+    """Search Terra MODIS 8-day composites (``modis-09A1-061`` or ``modis-11A2-061``) on Planetary Computer."""
+    if len(bbox_4326) != 4:
+        raise ValueError(
+            f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
+        )
+    coll = str(collection or SENSOR_MODIS_SR).strip()
+    raw_items = _fetch_stac_items_full(
+        collection=coll,
+        bbox_4326=bbox_4326,
+        start_date=start_date,
+        end_date=end_date,
+        query=None,
+        max_items_per_window=800,
+        page_limit=250,
+    )
+    return _finalize_search_results(
+        raw_items,
+        sensor=coll,
+        bbox_4326=bbox_4326,
+        aoi_polygon_4326=aoi_polygon_4326,
+        min_coverage_pct=min(float(min_coverage_pct), 60.0),
+        interval_mode=interval_mode,
+        target_season=target_season,
+        limit=limit,
+    )
+
+
+def load_modis_scene(
+    item: StacItemOrGroup,
+    bbox_4326: Sequence[float],
+    bands: Sequence[str],
+    *,
+    collection: str = SENSOR_MODIS_SR,
+    target_epsg: int | str = "EPSG:3413",
+    resolution: float = 1000.0,
+    aoi_polygon_4326: dict[str, Any] | None = None,
+) -> xr.Dataset:
+    """Stream, mosaic, and calibrate a MODIS 8-day composite onto ``target_epsg`` (Polar/UTM/D96)."""
+    if not bands:
+        raise ValueError("At least one MODIS band must be requested.")
+    if len(bbox_4326) != 4:
+        raise ValueError("bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat].")
+
+    coll = str(collection or SENSOR_MODIS_SR).strip()
+    is_lst_coll = coll.lower() == SENSOR_MODIS_LST.lower()
+
+    req_assets: list[str] = []
+    for b in bands:
+        if str(b) in ("SCL", "QA_PIXEL", "qa_pixel"):
+            continue
+        asset = LOGICAL_TO_MODIS_ASSET.get(str(b))
+        if asset and asset not in req_assets:
+            req_assets.append(asset)
+    if not req_assets:
+        req_assets = ["LST_Day_1km"] if is_lst_coll else ["sur_refl_b01", "sur_refl_b04", "sur_refl_b03"]
+
+    item_list = _normalize_item_group(item)
+    if not item_list:
+        raise ValueError("MODIS item group is empty.")
+    signed_items = [planetary_computer.sign(it) for it in item_list]
+    crs_str = _normalize_crs_str(target_epsg)
+    safe_res = max(500.0, float(resolution))
+    if is_lst_coll:
+        safe_res = max(1000.0, safe_res)
+
+    _configure_odc_rio()
+    raw_ds = odc.stac.load(
+        signed_items,
+        bands=req_assets,
+        bbox=list(bbox_4326),
+        crs=crs_str,
+        resolution=safe_res,
+        groupby="solar_day",
+        resampling="bilinear",
+    )
+    raw_ds = raw_ds.compute()
+    raw_ds = mosaic_tile_stack(raw_ds, sensor=coll)
+
+    calibrated: dict[str, xr.DataArray] = {}
+    for asset_name in req_assets:
+        if asset_name not in raw_ds.data_vars:
+            continue
+        da = raw_ds[asset_name]
+        logical_name = MODIS_ASSET_TO_LOGICAL.get(asset_name, asset_name)
+        if asset_name == "LST_Day_1km" or logical_name == "LST":
+            arr_cal = calibrate_modis_lst_array(da.values)
+            units = "°C"
+        else:
+            arr_cal = calibrate_modis_reflectance_array(da.values)
+            units = "reflectance"
+        out_da = xr.DataArray(
+            arr_cal,
+            dims=da.dims,
+            coords=da.coords,
+            name=logical_name,
+            attrs={"units": units, "source_asset": asset_name, "sensor": coll},
+        )
+        out_da = out_da.rio.write_crs(crs_str, inplace=False).rio.write_nodata(np.nan, inplace=False)
+        calibrated[logical_name] = out_da
+
+    if not calibrated:
+        raise RuntimeError(f"No valid MODIS bands loaded from {coll} for requested bands {req_assets}.")
+
+    meta = _merge_group_metadata(signed_items, sensor=coll)
+    ds_out = xr.Dataset(
+        data_vars=calibrated,
+        attrs={
+            "sensor": coll,
+            "platform": str(meta.get("platform") or "Terra MODIS"),
+            "scene_id": str(meta.get("scene_id") or signed_items[0].id),
+            "datetime": str(meta.get("datetime") or ""),
+            "mgrs_tile": str(meta.get("mgrs_tile") or "MODIS-8D"),
+            "resolution_m": float(safe_res),
+            "crs": crs_str,
+        },
+    ).rio.write_crs(crs_str, inplace=False)
+
+    if aoi_polygon_4326 is not None:
+        ds_out = clip_to_aoi_polygon(ds_out, aoi_polygon_4326, drop=False)
+    else:
+        ds_out = _clip_dataset_to_upright_metric_box(ds_out, bbox_4326, crs_str)
+    del raw_ds
+    gc.collect()
+    return ds_out
+
+
+# ---------------------------------------------------------------------------
+# Unified Multi-Sensor Dispatchers
+# ---------------------------------------------------------------------------
 @_cache_data(ttl=3600, max_entries=32, show_spinner=False)
 def search_scenes(
     sensor: str,
@@ -1759,6 +1964,18 @@ def search_scenes(
             interval_mode=interval_mode,
             target_season=target_season,
         )
+    if sensor in MODIS_SENSORS:
+        return search_modis(
+            bbox_4326=bbox_4326,
+            start_date=start_date,
+            end_date=end_date,
+            collection=sensor,
+            limit=limit,
+            aoi_polygon_4326=aoi_polygon_4326,
+            min_coverage_pct=min_coverage_pct,
+            interval_mode=interval_mode,
+            target_season=target_season,
+        )
     raise ValueError(f"Unsupported sensor identifier: {sensor!r}.")
 
 
@@ -1772,9 +1989,10 @@ def load_scene(
     aoi_polygon_4326: dict[str, Any] | None = None,
 ) -> xr.Dataset:
     """Dispatch clipped COG loading and same-day tile mosaicking to the selected sensor loader."""
-    safe_res = _safe_float(resolution, 30.0 if sensor == SENSOR_LANDSAT else 10.0)
+    default_res = 1000.0 if sensor == SENSOR_MODIS_LST else (500.0 if sensor == SENSOR_MODIS_SR else (30.0 if sensor == SENSOR_LANDSAT else 10.0))
+    safe_res = _safe_float(resolution, default_res)
     if safe_res <= 0.0:
-        safe_res = 30.0 if sensor == SENSOR_LANDSAT else 10.0
+        safe_res = default_res
     if sensor == SENSOR_S2:
         return load_sentinel2_scene(
             item=item,
@@ -1798,6 +2016,16 @@ def load_scene(
             item=item,
             bbox_4326=bbox_4326,
             polarizations=bands,
+            target_epsg=target_epsg,
+            resolution=safe_res,
+            aoi_polygon_4326=aoi_polygon_4326,
+        )
+    if sensor in MODIS_SENSORS:
+        return load_modis_scene(
+            item=item,
+            bbox_4326=bbox_4326,
+            bands=bands,
+            collection=sensor,
             target_epsg=target_epsg,
             resolution=safe_res,
             aoi_polygon_4326=aoi_polygon_4326,

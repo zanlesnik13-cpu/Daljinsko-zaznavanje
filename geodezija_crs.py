@@ -34,10 +34,14 @@ from shapely.ops import transform as shapely_transform
 EPSG_D96TM: int = 3794
 EPSG_WGS84: int = 4326
 EPSG_UTM33N: int = 32633
+EPSG_POLAR_NORTH: int = 3413
+EPSG_POLAR_SOUTH: int = 3031
 
 CRS_D96TM: str = "EPSG:3794"
 CRS_WGS84: str = "EPSG:4326"
 CRS_UTM33N: str = "EPSG:32633"
+CRS_POLAR_NORTH: str = "EPSG:3413"
+CRS_POLAR_SOUTH: str = "EPSG:3031"
 
 SUPPORTED_CRS: dict[str, dict[str, object]] = {
     CRS_D96TM: {
@@ -60,6 +64,20 @@ SUPPORTED_CRS: dict[str, dict[str, object]] = {
         "short_name": "UTM 33N",
         "units": "m",
         "axes": ("Easting (E)", "Northing (N)"),
+    },
+    CRS_POLAR_NORTH: {
+        "epsg": EPSG_POLAR_NORTH,
+        "name": "WGS 84 / NSIDC Sea Ice Polar Stereographic North",
+        "short_name": "Polar North",
+        "units": "m",
+        "axes": ("X [m]", "Y [m]"),
+    },
+    CRS_POLAR_SOUTH: {
+        "epsg": EPSG_POLAR_SOUTH,
+        "name": "WGS 84 / Antarctic Polar Stereographic",
+        "short_name": "Polar South",
+        "units": "m",
+        "axes": ("X [m]", "Y [m]"),
     },
 }
 
@@ -196,6 +214,65 @@ def get_ram_limits(low_ram_override: bool | None = None) -> dict[str, object]:
     return dict(get_runtime_environment())
 
 
+def get_dynamic_aoi_limits(
+    sensor: str | None = None,
+    resolution_m: float | int = 10,
+    low_ram_override: bool | None = None,
+) -> dict[str, object]:
+    """Compute resolution-aware pixel-budget AOI limits (``max_radius_m``, ``max_area_km2``, ``max_pixels``).
+
+    On 1 GB Streamlit Cloud, caps per-band pixels at ~1,000,000 px (4,000,000 px on High-RAM):
+    - Sentinel-2 / Landsat / S1 at 10–30 m: up to 15 km radius (~900 km²) on 1 GB Cloud
+    - Sentinel-2 / Landsat at 100 m / 250 m overviews: up to 50–80 km radius (~10,000–25,600 km²)
+    - MODIS at 500 m: up to 250 km radius (~250,000 km²)
+    - MODIS at 1000 m / 2000 m: up to 600–1200 km radius (1.44–5.76M km², entire Greenland / Amazon / West Antarctica)
+    """
+    base = get_ram_limits(low_ram_override=low_ram_override)
+    high_ram = bool(base["high_ram"])
+    s_norm = str(sensor or "sentinel-2-l2a").strip().lower()
+    is_modis = s_norm.startswith("modis")
+    res_f = max(10.0, float(resolution_m or (500.0 if is_modis else 10.0)))
+    max_pixels = 4_000_000 if high_ram else 1_000_000
+
+    if is_modis:
+        if res_f >= 2000.0:
+            max_rad = 1_600_000 if high_ram else 1_200_000
+        elif res_f >= 1000.0:
+            max_rad = 1_200_000 if high_ram else 600_000
+        else:
+            max_rad = 500_000 if high_ram else 250_000
+        max_area = float((2.0 * max_rad) ** 2) / 1e6
+        return {
+            "sensor": s_norm,
+            "resolution_m": int(round(res_f)),
+            "high_ram": high_ram,
+            "max_pixels": max_pixels,
+            "max_radius_m": int(max_rad),
+            "max_area_km2": round(max_area, 1),
+            "is_continental": True,
+        }
+
+    # Optical / SAR regional & local sensors
+    if res_f >= 250.0:
+        max_rad = 120_000 if high_ram else 80_000
+    elif res_f >= 100.0:
+        max_rad = 80_000 if high_ram else 50_000
+    elif res_f >= 60.0:
+        max_rad = 60_000 if high_ram else 30_000
+    else:
+        max_rad = int(base["max_radius_m"])
+    max_area = float((2.0 * max_rad) ** 2) / 1e6
+    return {
+        "sensor": s_norm,
+        "resolution_m": int(round(res_f)),
+        "high_ram": high_ram,
+        "max_pixels": max_pixels,
+        "max_radius_m": int(max_rad),
+        "max_area_km2": round(max_area, 1),
+        "is_continental": False,
+    }
+
+
 def get_safe_processing_resolution(
     requested_res_m: int | float,
     area_km2: float,
@@ -204,22 +281,43 @@ def get_safe_processing_resolution(
 ) -> tuple[int, bool]:
     """Return ``(effective_resolution_m, was_adjusted)`` so large valid AOIs never crash 1 GB RAM.
 
-    On 1 GB Streamlit Cloud:
-    - ``area_km2 > 400 km²`` -> minimum ``30 m`` (or ``60 m`` if > 900 km²)
-    - ``area_km2 > 150 km²`` -> minimum ``20 m``
-    - Landsat always minimum ``30 m``.
-    On High-RAM environments (Codespaces / HF / Local), respects the user's chosen resolution.
+    Respects MODIS continental resolutions (500 m / 1000 m / 2000 m), Landsat >= 30 m,
+    and automatically bumps resolution upward when pixel count exceeds the RAM budget.
     """
+    s_norm = str(sensor or "").strip().lower()
+    is_modis = s_norm.startswith("modis")
+    is_modis_lst = s_norm == "modis-11a2-061"
+    is_landsat = s_norm == "landsat-c2-l2"
+
     req = max(10, int(round(float(requested_res_m))))
-    is_landsat = bool(sensor and str(sensor).strip().lower() == "landsat-c2-l2")
-    if is_landsat and req < 30:
+    if is_modis_lst and req < 1000:
+        req = 1000
+    elif is_modis and req < 500:
+        req = 500
+    elif is_landsat and req < 30:
         req = 30
 
     limits = get_ram_limits(low_ram_override=low_ram_override)
-    if bool(limits["high_ram"]):
+    high_ram = bool(limits["high_ram"])
+
+    if is_modis:
+        max_px = 4_000_000 if high_ram else 1_200_000
+        est_px = (float(area_km2) * 1e6) / float(req * req)
+        if est_px <= max_px:
+            return int(req), False
+        for cand in (500, 1000, 2000, 4000):
+            if cand >= req and (float(area_km2) * 1e6) / float(cand * cand) <= max_px:
+                return int(cand), (int(cand) > int(req))
+        return 2000, (2000 > int(req))
+
+    if high_ram:
         return req, False
 
-    if area_km2 > float(limits["max_area_km2"]) * 1.02:
+    if area_km2 > 10_000.0:
+        safe = max(req, 250)
+    elif area_km2 > 3_600.0:
+        safe = max(req, 100)
+    elif area_km2 > float(limits["max_area_km2"]) * 1.02:
         safe = max(req, 60)
     elif area_km2 > float(limits["res_20m_max_km2"]):
         safe = max(req, 30)
@@ -327,6 +425,26 @@ def get_auto_utm_epsg(lat: float, lon: float) -> tuple[int, str]:
     return epsg, f"WGS 84 / UTM {zone}{hemi} (EPSG:{epsg})"
 
 
+def get_auto_metric_epsg(lat: float, lon: float) -> int:
+    """Return the optimal projected metric EPSG integer anywhere on Earth, including both poles.
+
+    - Slovenia (``is_in_slovenia``): ``3794`` (D96/TM)
+    - Arctic / Greenland (``lat >= 70.0``): ``3413`` (WGS 84 / NSIDC Sea Ice Polar Stereographic North)
+    - Antarctica (``lat <= -65.0``): ``3031`` (WGS 84 / Antarctic Polar Stereographic)
+    - Everywhere else: exact local Auto-UTM (``326xx`` / ``327xx``).
+    """
+    lat_f = float(lat)
+    lon_f = float(lon)
+    if is_in_slovenia(lat_f, lon_f):
+        return EPSG_D96TM
+    if lat_f >= 70.0:
+        return EPSG_POLAR_NORTH
+    if lat_f <= -65.0:
+        return EPSG_POLAR_SOUTH
+    epsg, _ = get_auto_utm_epsg(lat_f, lon_f)
+    return int(epsg)
+
+
 def get_best_metric_crs(
     lat: float,
     lon: float,
@@ -339,20 +457,25 @@ def get_best_metric_crs(
     lat, lon : float
         AOI center coordinates in WGS84 degrees.
     mode : str, default ``"auto"``
-        - ``"auto"``: ``EPSG:3794`` (D96/TM) inside Slovenia, exact local UTM worldwide.
+        - ``"auto"``: ``EPSG:3794`` (D96/TM) inside Slovenia, ``EPSG:3413`` in Arctic/Greenland
+          (``lat >= 70°``), ``EPSG:3031`` in Antarctica (``lat <= -65°``), and local Auto-UTM elsewhere.
         - ``"d96"``: Force ``EPSG:3794`` (D96/TM).
         - ``"utm"``: Force exact local UTM (``EPSG:326xx`` / ``EPSG:327xx``).
 
     Returns
     -------
     tuple[str, str]
-        ``(crs_str, display_name)``, e.g. ``("EPSG:32632", "WGS 84 / UTM 32N (EPSG:32632)")``.
+        ``(crs_str, display_name)``, e.g. ``("EPSG:3413", "Arctic Polar Stereographic (EPSG:3413)")``.
     """
     m = str(mode or "auto").strip().lower()
-    if m == "d96" or (m == "auto" and is_in_slovenia(lat, lon)):
+    if m == "d96":
         return CRS_D96TM, "D96/TM (EPSG:3794)"
-    epsg, name = get_auto_utm_epsg(lat, lon)
-    return f"EPSG:{epsg}", name
+    if m == "utm":
+        epsg, name = get_auto_utm_epsg(lat, lon)
+        return f"EPSG:{epsg}", name
+    epsg_auto = get_auto_metric_epsg(lat, lon)
+    crs_s = f"EPSG:{epsg_auto}"
+    return crs_s, format_crs_label(crs_s, short=False)
 
 
 def format_crs_label(
@@ -360,11 +483,15 @@ def format_crs_label(
     *,
     short: bool = False,
 ) -> str:
-    """Return a clean human-readable label for D96/TM or any global UTM EPSG code."""
+    """Return a clean human-readable label for D96/TM, Polar Stereographic (3413/3031), or any global UTM EPSG."""
     crs_obj = normalize_crs(epsg_or_crs)
     epsg = crs_obj.to_epsg()
     if epsg == EPSG_D96TM:
         return "D96/TM (3794)" if short else "D96/TM (EPSG:3794)"
+    if epsg == EPSG_POLAR_NORTH:
+        return "Polar North (3413)" if short else "Arctic Polar Stereographic (EPSG:3413)"
+    if epsg == EPSG_POLAR_SOUTH:
+        return "Polar South (3031)" if short else "Antarctic Polar Stereographic (EPSG:3031)"
     if epsg is not None and 32601 <= epsg <= 32660:
         zone = epsg - 32600
         return f"UTM {zone}N ({epsg})" if short else f"WGS 84 / UTM {zone}N (EPSG:{epsg})"
@@ -518,34 +645,47 @@ def _recommended_resolution_for_area(
     area_km2: float,
     sensor: str | None = None,
 ) -> int:
-    """Return a RAM-safe target spatial resolution (10 / 20 / 30 / 60 m) for the active runtime."""
+    """Return a RAM-safe target spatial resolution (10–2000 m) for the active sensor and runtime."""
+    s_norm = str(sensor or "").strip().lower()
+    if s_norm.startswith("modis"):
+        if s_norm == "modis-11a2-061":
+            return 1000 if area_km2 <= 1_500_000.0 else 2000
+        if area_km2 <= 260_000.0:
+            return 500
+        if area_km2 <= 1_500_000.0:
+            return 1000
+        return 2000
     env = get_runtime_environment()
     max_10m = float(env["res_10m_max_km2"])
     max_20m = float(env["res_20m_max_km2"])
     max_30m = float(env["max_area_km2"])
-    if sensor and str(sensor).strip().lower() == "landsat-c2-l2":
-        return 30 if area_km2 <= max_30m * 1.02 else 60
+    if s_norm == "landsat-c2-l2":
+        if area_km2 <= max_30m * 1.02:
+            return 30
+        if area_km2 <= 3_600.0:
+            return 60
+        return 100 if area_km2 <= 10_000.0 else 250
     if area_km2 <= max_10m:
         return 10
     if area_km2 <= max_20m:
         return 20
     if area_km2 <= max_30m * 1.02:
         return 30
-    return 60
+    if area_km2 <= 3_600.0:
+        return 60
+    return 100 if area_km2 <= 10_000.0 else 250
 
 
 def validate_aoi_size(
     bbox_4326: Sequence[float],
     max_area_km2: float | None = None,
     sensor: str | None = None,
+    resolution_m: float | int | None = None,
 ) -> tuple[float, bool, int]:
     """Validate an EPSG:4326 AOI bounding box by computing exact metric area worldwide.
 
-    Computes exact area in ``EPSG:3794`` inside Slovenia or in the exact local
-    UTM zone (``EPSG:326xx`` / ``EPSG:327xx``) anywhere else on Earth, eliminating
-    global projection distortion. Automatically uses high-RAM limits (4000 km²,
-    full native 10 m Sentinel up to 1200 km²) on GitHub Codespaces, Hugging Face
-    Spaces, and local machines, while staying RAM-safe on 1 GB Streamlit Cloud.
+    Computes exact area in ``EPSG:3794`` (Slovenia), Polar Stereographic ``EPSG:3413`` / ``EPSG:3031``
+    (Arctic / Antarctica), or local Auto-UTM elsewhere, using pixel-budget limits for MODIS and high-res sensors.
     """
     if len(bbox_4326) != 4:
         raise ValueError(
@@ -558,11 +698,15 @@ def validate_aoi_size(
             f"Invalid bbox_4326 ordering: min must be strictly less than max, got {bbox_4326}."
         )
 
-    eff_max_area = (
-        float(max_area_km2)
-        if max_area_km2 is not None
-        else float(get_runtime_environment()["max_area_km2"])
-    )
+    if max_area_km2 is not None:
+        eff_max_area = float(max_area_km2)
+    elif sensor and str(sensor).strip().lower().startswith("modis"):
+        eff_res = float(resolution_m) if resolution_m is not None else 2000.0
+        eff_max_area = float(get_dynamic_aoi_limits(sensor, eff_res)["max_area_km2"])
+    elif resolution_m is not None and float(resolution_m) >= 60.0:
+        eff_max_area = float(get_dynamic_aoi_limits(sensor, float(resolution_m))["max_area_km2"])
+    else:
+        eff_max_area = float(get_runtime_environment()["max_area_km2"])
 
     geom_4326 = box(min_lon, min_lat, max_lon, max_lat)
     max_seg = max((max_lon - min_lon) / 16.0, (max_lat - min_lat) / 16.0, 1e-4)
@@ -575,8 +719,7 @@ def validate_aoi_size(
     geom_metric = shapely_transform(transformer.transform, geom_4326)
     area_km2 = float(geom_metric.area / 1_000_000.0)
 
-    # Allow 2% meridian-convergence envelope tolerance so a 15 km radius (900 km²) square is never blocked
-    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area * 1.02)
+    is_valid = (area_km2 > 0.0) and (area_km2 <= eff_max_area * 1.05)
     recommended_resolution_m = _recommended_resolution_for_area(area_km2, sensor=sensor)
 
     return (round(area_km2, 4), is_valid, recommended_resolution_m)

@@ -42,6 +42,7 @@ from analize import (
 from geodezija_crs import clip_to_aoi_polygon, get_parallel_workers
 from map_overlay import raster_to_map_overlay_png, render_diverging_change_overlay
 from stac_loader import (
+    MODIS_SENSORS,
     SENSOR_LANDSAT,
     SENSOR_S1,
     SENSOR_S2,
@@ -249,7 +250,7 @@ def extract_time_series(
     time bucket until a genuinely cloud-free observation over the AOI is found.
     """
     idx_key = index_name.strip().upper()
-    use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
+    use_cloud_mask = mask_clouds and (sensor != SENSOR_S1) and (sensor not in MODIS_SENSORS)
     req_bands = get_required_bands_for_sensor(sensor, idx_key, include_cloud_mask=use_cloud_mask)
 
     epoch_groups = _normalize_epoch_groups(items)
@@ -471,7 +472,7 @@ def compute_change_detection(
     Sentinel-1 SAR RTC (backscatter difference in dB, e.g. ``Delta VV [dB]``).
     """
     idx_key = index_name.strip().upper()
-    use_cloud_mask = mask_clouds and (sensor != SENSOR_S1)
+    use_cloud_mask = mask_clouds and (sensor != SENSOR_S1) and (sensor not in MODIS_SENSORS)
     req_bands = get_required_bands_for_sensor(sensor, idx_key, include_cloud_mask=use_cloud_mask)
 
     ds_t1 = load_scene(
@@ -1890,8 +1891,8 @@ def build_multidate_visual_frames(
             except Exception as exc:
                 logger.warning("RGB frame render skipped for %s: %s", act_date, exc)
 
-        # Cloud-masked dataset for clean spectral indices
-        if not is_sar:
+        # Cloud-masked dataset for clean spectral indices (MODIS 8-day composites are pre-composited)
+        if not is_sar and sensor not in MODIS_SENSORS:
             try:
                 ds_masked, _ = apply_cloud_mask(ds_ep, mask_clouds=True, sensor=sensor)
             except Exception:
@@ -2032,11 +2033,14 @@ def build_multidate_visual_frames(
         gc.collect()
 
         if rgb_uri or idx_uri:
-            sensor_fam = (
-                "Landsat (30 m)"
-                if sensor == SENSOR_LANDSAT
-                else ("Sentinel-1 SAR" if sensor == SENSOR_S1 else "Sentinel-2 (10–20 m)")
-            )
+            if sensor in MODIS_SENSORS:
+                sensor_fam = "MODIS (500 m–1 km)"
+            elif sensor == SENSOR_LANDSAT:
+                sensor_fam = "Landsat (30 m)"
+            elif sensor == SENSOR_S1:
+                sensor_fam = "Sentinel-1 SAR"
+            else:
+                sensor_fam = "Sentinel-2 (10–20 m)"
             rel_ok_fr, q_note_fr = assess_scene_analysis_reliability(
                 act_date,
                 sensor_fam,
