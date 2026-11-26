@@ -5298,15 +5298,35 @@ def _render_tab1_scene_viewer_fragment(
             key="tab1_plotly_raster_viewer",
         )
 
-    cloud_disp = "— (SAR)" if meta["cloud_cover"] is None else f"{meta['cloud_cover']:.1f} %"
+    if active_sensor == SENSOR_S1:
+        cloud_disp = "— (SAR)"
+    elif active_sensor in MODIS_SENSORS:
+        cloud_disp = "8-dnevni mozaik" if lang == "sl" else "8-day composite"
+    else:
+        cloud_disp = "—" if meta["cloud_cover"] is None else f"{meta['cloud_cover']:.1f} %"
+
     if active_sensor == SENSOR_S2:
         pb_val = ds_show.attrs.get("processing_baseline", "—")
         off_yn = t("yes") if ds_show.attrs.get("radiometric_offset_applied") else t("no")
         cal_str = f"ESA PB {pb_val} (offset -1000: {off_yn})"
     elif active_sensor == SENSOR_LANDSAT:
         cal_str = "USGS C2 L2 (DN × 0.0000275 − 0.2)"
-    else:
+    elif active_sensor == SENSOR_MODIS_SR:
+        cal_str = (
+            "Produkt: 8-dnevni mozaik odboja (MOD09A1/MYD09A1, ×0.0001)"
+            if lang == "sl"
+            else "Product: 8-day Surface Reflectance Composite (MOD09A1/MYD09A1, ×0.0001)"
+        )
+    elif active_sensor == SENSOR_MODIS_LST:
+        cal_str = (
+            "Produkt: 8-dnevni LST mozaik (MOD11A2, ×0.02 − 273.15 °C)"
+            if lang == "sl"
+            else "Product: 8-day LST Composite (MOD11A2, ×0.02 − 273.15 °C)"
+        )
+    elif active_sensor == SENSOR_S1:
         cal_str = "Sentinel-1 RTC (10·log10 dB)"
+    else:
+        cal_str = str(active_sensor)
 
     st.caption(
         t(
@@ -5317,6 +5337,8 @@ def _render_tab1_scene_viewer_fragment(
             pb=cal_str,
         )
     )
+    if active_sensor in MODIS_SENSORS:
+        st.caption(t("modis_ocean_gee_hint", lang=lang))
 
     tif_bytes = st.session_state.get("loaded_tif_bytes")
     if tif_bytes:

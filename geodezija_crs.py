@@ -301,7 +301,7 @@ def get_safe_processing_resolution(
     high_ram = bool(limits["high_ram"])
 
     if is_modis:
-        max_px = 4_000_000 if high_ram else 1_200_000
+        max_px = 4_000_000 if high_ram else 1_450_000
         est_px = (float(area_km2) * 1e6) / float(req * req)
         if est_px <= max_px:
             return int(req), False
@@ -649,10 +649,10 @@ def _recommended_resolution_for_area(
     s_norm = str(sensor or "").strip().lower()
     if s_norm.startswith("modis"):
         if s_norm == "modis-11a2-061":
-            return 1000 if area_km2 <= 1_500_000.0 else 2000
+            return 1000 if area_km2 <= 2_500_000.0 else 2000
         if area_km2 <= 260_000.0:
             return 500
-        if area_km2 <= 1_500_000.0:
+        if area_km2 <= 2_500_000.0:
             return 1000
         return 2000
     env = get_runtime_environment()

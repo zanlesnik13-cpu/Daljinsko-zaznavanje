@@ -553,6 +553,7 @@ def _fetch_stac_items_full(
     start_date: str | date | datetime,
     end_date: str | date | datetime,
     query: dict[str, Any] | None = None,
+    intersects: dict[str, Any] | None = None,
     max_items_per_window: int = 1000,
     page_limit: int = 250,
 ) -> list[pystac.Item]:
@@ -574,11 +575,14 @@ def _fetch_stac_items_full(
     for dt_range in windows:
         kwargs: dict[str, Any] = {
             "collections": [collection],
-            "bbox": bbox_floats,
             "datetime": dt_range,
             "limit": int(page_limit),
             "max_items": int(per_window_cap),
         }
+        if intersects is not None:
+            kwargs["intersects"] = intersects
+        else:
+            kwargs["bbox"] = bbox_floats
         if query:
             kwargs["query"] = query
         search = catalog.search(**kwargs)
@@ -1832,6 +1836,84 @@ def calibrate_modis_lst_array(raw_arr: np.ndarray) -> np.ndarray:
     return out
 
 
+def _build_polar_search_geojson(
+    bbox_4326: Sequence[float],
+    n_edge_pts: int = 24,
+) -> tuple[dict[str, Any] | None, list[float]]:
+    """Build a densified WGS84 perimeter polygon for polar AOIs (|lat| >= 65°).
+
+    In Polar Stereographic projections (EPSG:3413 / EPSG:3031), a square metric AOI maps
+    to a strongly curved wedge in WGS84. Sampling perimeter points in the polar CRS and
+    transforming them to WGS84 ensures STAC ``intersects`` returns ALL northern/eastern
+    MODIS sinusoidal tiles with zero missing corner cutouts.
+    """
+    min_lon, min_lat, max_lon, max_lat = [float(v) for v in bbox_4326]
+    if max_lat < 65.0 and min_lat > -65.0:
+        return None, [min_lon, min_lat, max_lon, max_lat]
+
+    from pyproj import Transformer
+
+    polar_crs = "EPSG:3413" if (0.5 * (min_lat + max_lat)) >= 0.0 else "EPSG:3031"
+    to_polar = Transformer.from_crs("EPSG:4326", polar_crs, always_xy=True)
+    to_wgs = Transformer.from_crs(polar_crs, "EPSG:4326", always_xy=True)
+
+    # Sample the 4 edges of the input WGS84 box into polar space to find the full metric extent
+    lons_in = np.concatenate(
+        [
+            np.linspace(min_lon, max_lon, n_edge_pts),
+            np.full(n_edge_pts, max_lon),
+            np.linspace(max_lon, min_lon, n_edge_pts),
+            np.full(n_edge_pts, min_lon),
+        ]
+    )
+    lats_in = np.concatenate(
+        [
+            np.full(n_edge_pts, min_lat),
+            np.linspace(min_lat, max_lat, n_edge_pts),
+            np.full(n_edge_pts, max_lat),
+            np.linspace(max_lat, min_lat, n_edge_pts),
+        ]
+    )
+    xs, ys = to_polar.transform(lons_in, lats_in)
+    xmin, xmax = float(np.min(xs)), float(np.max(xs))
+    ymin, ymax = float(np.min(ys)), float(np.max(ys))
+
+    # Densify the true metric polar rectangle perimeter back into WGS84
+    px = np.concatenate(
+        [
+            np.linspace(xmin, xmax, n_edge_pts, endpoint=False),
+            np.full(n_edge_pts, xmax),
+            np.linspace(xmax, xmin, n_edge_pts, endpoint=False),
+            np.full(n_edge_pts, xmin),
+        ]
+    )
+    py = np.concatenate(
+        [
+            np.full(n_edge_pts, ymin),
+            np.linspace(ymin, ymax, n_edge_pts, endpoint=False),
+            np.full(n_edge_pts, ymax),
+            np.linspace(ymax, ymin, n_edge_pts, endpoint=False),
+        ]
+    )
+    w_lons, w_lats = to_wgs.transform(px, py)
+    w_lons = np.clip(w_lons, -180.0, 180.0)
+    w_lats = np.clip(w_lats, -89.9, 89.9)
+
+    ring = [[float(lo), float(la)] for lo, la in zip(w_lons, w_lats)]
+    if ring and ring[0] != ring[-1]:
+        ring.append(ring[0])
+    expanded_bbox = [
+        float(np.min(w_lons)),
+        float(np.min(w_lats)),
+        float(np.max(w_lons)),
+        float(np.max(w_lats)),
+    ]
+    # Avoid invalid antimeridian-wrapping GeoJSON polygons; fall back to expanded bbox if span > 170°
+    if (expanded_bbox[2] - expanded_bbox[0]) > 170.0:
+        return None, expanded_bbox
+    return {"type": "Polygon", "coordinates": [ring]}, expanded_bbox
+
+
 def search_modis(
     bbox_4326: Sequence[float],
     start_date: str | date | datetime,
@@ -1844,27 +1926,29 @@ def search_modis(
     interval_mode: str = INTERVAL_ALL,
     target_season: str = SEASON_SUMMER,
 ) -> tuple[list[list[pystac.Item]], pd.DataFrame]:
-    """Search Terra MODIS 8-day composites (``modis-09A1-061`` or ``modis-11A2-061``) on Planetary Computer."""
+    """Search Terra/Aqua MODIS 8-day composites (``modis-09A1-061`` or ``modis-11A2-061``) on Planetary Computer."""
     if len(bbox_4326) != 4:
         raise ValueError(
             f"bbox_4326 must contain 4 values [min_lon, min_lat, max_lon, max_lat], got {len(bbox_4326)}."
         )
     coll = str(collection or SENSOR_MODIS_SR).strip()
+    polar_geom, expanded_bbox = _build_polar_search_geojson(bbox_4326)
     raw_items = _fetch_stac_items_full(
         collection=coll,
-        bbox_4326=bbox_4326,
+        bbox_4326=expanded_bbox,
         start_date=start_date,
         end_date=end_date,
         query=None,
-        max_items_per_window=800,
+        intersects=polar_geom,
+        max_items_per_window=1200,
         page_limit=250,
     )
     return _finalize_search_results(
         raw_items,
         sensor=coll,
-        bbox_4326=bbox_4326,
-        aoi_polygon_4326=aoi_polygon_4326,
-        min_coverage_pct=min(float(min_coverage_pct), 60.0),
+        bbox_4326=expanded_bbox,
+        aoi_polygon_4326=aoi_polygon_4326 or polar_geom,
+        min_coverage_pct=min(float(min_coverage_pct), 40.0),
         interval_mode=interval_mode,
         target_season=target_season,
         limit=limit,

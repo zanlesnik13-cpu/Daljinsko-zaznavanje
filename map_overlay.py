@@ -176,13 +176,41 @@ def _stretch_channel_01(
     return stretched.astype(np.float32, copy=False)
 
 
+def _bounds_3857_to_4326(reproj: xr.DataArray) -> tuple[float, float, float, float]:
+    """Convert an EPSG:3857 (or EPSG:4326) raster's bounds to WGS84 ``(west, south, east, north)``."""
+    xmin, ymin, xmax, ymax = [float(v) for v in reproj.rio.bounds()]
+    crs_obj = reproj.rio.crs
+    if crs_obj is not None and str(crs_obj).upper() not in ("EPSG:4326", "OGC:CRS84"):
+        from pyproj import Transformer
+
+        tr = Transformer.from_crs(crs_obj, "EPSG:4326", always_xy=True)
+        west, south = tr.transform(xmin, ymin)
+        east, north = tr.transform(xmax, ymax)
+    else:
+        west, south, east, north = xmin, ymin, xmax, ymax
+    south = float(np.clip(south, -85.05, 85.05))
+    north = float(np.clip(north, -85.05, 85.05))
+    west = float(np.clip(west, -180.0, 180.0))
+    east = float(np.clip(east, -180.0, 180.0))
+    return west, south, east, north
+
+
 def _prepare_vis_dataarray(
     da: xr.DataArray,
     src_epsg: int | str,
     resampling: Resampling,
     nodata: float | int,
 ) -> xr.DataArray:
-    """Ensure CRS/spatial dims and reproject ONLY a visualization copy to EPSG:4326."""
+    """Ensure CRS/spatial dims and reproject a visualization copy to Web Mercator (EPSG:3857).
+
+    Leaflet ``L.imageOverlay`` stretches PNG pixels linearly in Web Mercator (EPSG:3857)
+    projection space, not equirectangular EPSG:4326. Reprojecting directly to EPSG:3857
+    guarantees pixel-perfect basemap and AOI alignment even across Greenland and Antarctica
+    (70°–83° N/S), while clamping latitude safely inside ``[-85.0, 85.0]`` prevents Mercator
+    overflow near the exact poles.
+    """
+    from rasterio.warp import transform_bounds as _rio_transform_bounds
+
     work = da
     if "time" in work.dims and work.sizes["time"] == 1:
         work = work.isel(time=0, drop=True)
@@ -198,7 +226,22 @@ def _prepare_vis_dataarray(
         work = work.rio.write_crs(crs_str, inplace=False)
 
     work = work.rio.write_nodata(nodata, inplace=False)
-    reproj = work.rio.reproject("EPSG:4326", resampling=resampling, nodata=nodata)
+
+    # Guard against latitudes exceeding Web Mercator's ±85° safe domain
+    try:
+        w4326, s4326, e4326, n4326 = _rio_transform_bounds(
+            work.rio.crs, "EPSG:4326", *work.rio.bounds(), densify_pts=21
+        )
+        if s4326 < -85.0 or n4326 > 85.0:
+            tmp_4326 = work.rio.reproject("EPSG:4326", resampling=resampling, nodata=nodata)
+            y_v = tmp_4326.coords["y"].values
+            y_mask = (y_v >= -85.0) & (y_v <= 85.0)
+            if np.any(y_mask):
+                work = tmp_4326.isel(y=y_mask).rio.write_crs("EPSG:4326", inplace=False).rio.write_nodata(nodata, inplace=False)
+    except Exception:
+        pass
+
+    reproj = work.rio.reproject("EPSG:3857", resampling=resampling, nodata=nodata)
     return reproj
 
 
@@ -304,7 +347,7 @@ def raster_to_map_overlay_png(
                 stacked = stacked.rio.write_crs(src_crs_saved, inplace=False)
 
         reproj = _prepare_vis_dataarray(stacked, src_epsg=src_epsg, resampling=Resampling.bilinear, nodata=np.nan)
-        west, south, east, north = reproj.rio.bounds()
+        west, south, east, north = _bounds_3857_to_4326(reproj)
         y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
 
         arr3 = reproj.values.astype(np.float32, copy=False)  # (3, H, W)
@@ -352,7 +395,7 @@ def raster_to_map_overlay_png(
     if discrete_rgba_map is not None:
         da_u8 = da_in.astype(np.uint8, copy=False)
         reproj = _prepare_vis_dataarray(da_u8, src_epsg=src_epsg, resampling=Resampling.nearest, nodata=255)
-        west, south, east, north = reproj.rio.bounds()
+        west, south, east, north = _bounds_3857_to_4326(reproj)
         y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
         vals = reproj.values.astype(np.uint8, copy=False)
 
@@ -367,7 +410,7 @@ def raster_to_map_overlay_png(
 
     da_f32 = da_in.astype(np.float32, copy=False)
     reproj = _prepare_vis_dataarray(da_f32, src_epsg=src_epsg, resampling=Resampling.bilinear, nodata=np.nan)
-    west, south, east, north = reproj.rio.bounds()
+    west, south, east, north = _bounds_3857_to_4326(reproj)
     y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
     vals = reproj.values.astype(np.float32, copy=False)
 
@@ -418,7 +461,7 @@ def render_diverging_change_overlay(
         resampling=Resampling.bilinear,
         nodata=np.nan,
     )
-    west, south, east, north = reproj.rio.bounds()
+    west, south, east, north = _bounds_3857_to_4326(reproj)
     y_coords = np.asarray(reproj.coords["y"].values, dtype=np.float64)
     vals = np.asarray(reproj.values, dtype=np.float32)
     finite = np.isfinite(vals)
