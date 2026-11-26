@@ -9268,7 +9268,10 @@ def _render_sidebar_gee_settings(lang: str) -> None:
 
     st_gee = get_gee_status()
     connected = bool(st_gee.get("connected"))
-    proj_cur = str(st_gee.get("project_id") or "")
+    raw_proj_cur = str(st_gee.get("project_id") or "").splitlines()[0].strip() if st_gee.get("project_id") else ""
+    if "{" in raw_proj_cur or "private_key" in raw_proj_cur.lower():
+        raw_proj_cur = ""
+    proj_cur = raw_proj_cur[:48]
     mode_cur = str(st_gee.get("mode") or "none")
     err_cur = str(st_gee.get("error") or "")
 
