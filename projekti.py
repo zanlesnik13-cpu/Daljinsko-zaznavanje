@@ -97,8 +97,68 @@ def sanitize_json_payload(obj: Any, *, depth: int = 0) -> Any:
     return str(obj)[:400]
 
 
+_REPLAY_PLAN_KEYS: tuple[str, ...] = (
+    "action",
+    "task_type",
+    "location_name",
+    "place_name",
+    "lat",
+    "lon",
+    "radius_m",
+    "bbox_4326",
+    "target_epsg",
+    "crs",
+    "start_date",
+    "end_date",
+    "event_date",
+    "target_season",
+    "interval",
+    "index",
+    "index_name",
+    "index_code",
+    "primary_index",
+    "complementary_indices",
+    "sensor",
+    "sensors",
+    "fusion_mode",
+    "resolution_m",
+    "max_cloud",
+    "include_comparison",
+    "disaster_type",
+    "layer_type",
+    "engine",
+    "user_prompt",
+    "user_query",
+)
+
+
+def _extract_compact_replay_plan(raw_plan: Any) -> dict[str, Any]:
+    """Build a strictly JSON-serializable, compact replay plan with zero binary/base64 blobs."""
+    if not isinstance(raw_plan, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k in _REPLAY_PLAN_KEYS:
+        val = raw_plan.get(k)
+        if val is not None:
+            out[k] = sanitize_json_payload(val)
+    # Canonical aliases so downstream replay always finds core keys cleanly
+    if "location_name" not in out and out.get("place_name"):
+        out["location_name"] = out["place_name"]
+    if "place_name" not in out and out.get("location_name"):
+        out["place_name"] = out["location_name"]
+    if "index" not in out and (out.get("index_name") or out.get("primary_index") or out.get("index_code")):
+        out["index"] = out.get("index_name") or out.get("primary_index") or out.get("index_code")
+    if "index_name" not in out and out.get("index"):
+        out["index_name"] = out["index"]
+    if "action" not in out and out.get("task_type"):
+        out["action"] = out["task_type"]
+    if "sensors" not in out and out.get("sensor"):
+        out["sensors"] = [out["sensor"]]
+    return out
+
+
 def sanitize_chat_messages(messages: Any) -> list[dict[str, Any]]:
-    """Return a compact, JSON-safe list of text AI chat turns (no binary rasters/images)."""
+    """Return a compact, JSON-safe list of AI chat turns (strips heavy visual blobs, keeps replay_plan)."""
     if not isinstance(messages, (list, tuple)):
         return []
     cleaned: list[dict[str, Any]] = []
@@ -115,28 +175,33 @@ def sanitize_chat_messages(messages: Any) -> list[dict[str, Any]]:
         }
         if raw.get("action"):
             entry["action"] = str(raw["action"])
+        if raw.get("result_id"):
+            entry["result_id"] = str(raw["result_id"])[:120]
         if raw.get("fallback_note"):
             entry["fallback_note"] = str(raw["fallback_note"])[:500]
-        plan = raw.get("plan")
-        if isinstance(plan, dict):
-            compact_plan = {
-                k: sanitize_json_payload(plan.get(k))
-                for k in (
-                    "task_type",
-                    "location_name",
-                    "sensor",
-                    "index_code",
-                    "start_date",
-                    "end_date",
-                    "disaster_type",
-                    "radius_m",
-                    "resolution_m",
-                    "layer_type",
-                )
-                if plan.get(k) is not None
+
+        raw_replay = raw.get("replay_plan") if isinstance(raw.get("replay_plan"), dict) else raw.get("plan")
+        compact_plan = _extract_compact_replay_plan(raw_replay)
+        if isinstance(raw.get("plan"), dict):
+            plan_merged = _extract_compact_replay_plan(raw.get("plan"))
+            plan_merged.update(compact_plan)
+            compact_plan = plan_merged
+        if compact_plan:
+            entry["plan"] = dict(compact_plan)
+            entry["replay_plan"] = dict(compact_plan)
+
+        res_meta = raw.get("result_meta")
+        if isinstance(res_meta, dict):
+            compact_meta = {
+                k: sanitize_json_payload(res_meta.get(k))
+                for k in ("is_visual_analysis", "summary_metrics", "engine", "resolved_place", "crs")
+                if res_meta.get(k) is not None
             }
-            if compact_plan:
-                entry["plan"] = compact_plan
+            if compact_meta:
+                entry["result_meta"] = compact_meta
+        elif entry.get("action") == "run_analysis" or bool(compact_plan.get("task_type") or compact_plan.get("action")):
+            entry["result_meta"] = {"is_visual_analysis": True}
+
         cleaned.append(entry)
     return cleaned
 

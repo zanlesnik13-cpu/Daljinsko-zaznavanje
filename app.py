@@ -121,8 +121,10 @@ from ai_pomocnik import (
     execute_ai_plan,
     generate_conversational_reply,
     get_active_gemini_api_key,
+    has_visual_plan,
     list_available_gemini_models,
     parse_eo_request,
+    replay_visual_analysis_no_llm,
     resolve_gemini_model_id,
     route_user_message,
     verify_gemini_api_connection,
@@ -7223,12 +7225,78 @@ def _render_ai_chat_turn(
                 if fb_chat:
                     st.caption(f"ℹ️ {fb_chat}")
                 res_id = asst_msg.get("result_id")
-                if res_id:
+                has_live_visuals = bool(
+                    res_id and isinstance((chat_results or {}).get(str(res_id)), dict)
+                )
+                if has_live_visuals:
                     _render_ai_chat_analysis_fragment(
                         result_id=str(res_id),
                         target_crs=target_crs,
                         lang=lang,
                     )
+                elif has_visual_plan(asst_msg):
+                    with st.container(border=True):
+                        rc_txt, rc_btn = st.columns([2.2, 1.35], vertical_alignment="center")
+                        with rc_txt:
+                            st.caption(t("ai_replay_saved_note", lang=lang))
+                        with rc_btn:
+                            replay_clicked = st.button(
+                                t("ai_replay_btn", lang=lang),
+                                type="primary",
+                                width="stretch",
+                                key=f"ai_replay_no_llm_{thread_id}_{t_idx}",
+                                help=t("ai_replay_btn_help", lang=lang),
+                            )
+                    if replay_clicked:
+                        with st.spinner(t("ai_replay_spinner", lang=lang)):
+                            try:
+                                restored_out = replay_visual_analysis_no_llm(
+                                    asst_msg,
+                                    user_prompt=user_text,
+                                    lang=lang,
+                                )
+                                new_res_key = str(
+                                    res_id
+                                    or f"ai_replay_{t_idx}_{datetime.now().strftime('%H%M%S')}"
+                                )
+                                res_store = dict(st.session_state.get("ai_chat_results") or {})
+                                res_store[new_res_key] = restored_out
+                                if len(res_store) > 6:
+                                    oldest_k = next(iter(res_store))
+                                    if oldest_k != new_res_key:
+                                        res_store.pop(oldest_k, None)
+                                st.session_state["ai_chat_results"] = res_store
+                                st.session_state["tab6_ai_result"] = restored_out
+                                st.session_state["tab6_sent_to_carto"] = False
+                                if isinstance(restored_out.get("analysis_context"), dict):
+                                    st.session_state["ai_last_analysis_context"] = restored_out["analysis_context"]
+                                # Attach restored result_id to the exact assistant message while keeping content untouched
+                                asst_msg["result_id"] = new_res_key
+                                asst_idx = turn.get("asst_msg_idx")
+                                cur_msgs_ref = st.session_state.get("ai_chat_messages")
+                                if (
+                                    isinstance(cur_msgs_ref, list)
+                                    and isinstance(asst_idx, int)
+                                    and 0 <= asst_idx < len(cur_msgs_ref)
+                                ):
+                                    cur_msgs_ref[asst_idx]["result_id"] = new_res_key
+                                # Update 3-thread LRU runtime cache for this thread
+                                rt_cache = dict(st.session_state.get("_ai_thread_runtime_cache") or {})
+                                rt_cache[str(thread_id)] = {
+                                    "ai_chat_results": dict(res_store),
+                                    "ai_last_analysis_context": st.session_state.get("ai_last_analysis_context"),
+                                    "ai_last_map_layout": st.session_state.get("ai_last_map_layout"),
+                                    "tab6_ai_result": restored_out,
+                                }
+                                while len(rt_cache) > 3:
+                                    oldest_tid = next(iter(rt_cache))
+                                    if oldest_tid == str(thread_id):
+                                        break
+                                    rt_cache.pop(oldest_tid, None)
+                                st.session_state["_ai_thread_runtime_cache"] = rt_cache
+                                st.rerun()
+                            except Exception as _rep_exc:
+                                st.error(t("ai_replay_error", lang=lang, err=_rep_exc))
         else:
             collapsed_lbl = build_collapsed_turn_label(
                 turn,
@@ -13336,12 +13404,46 @@ def main() -> None:
                             or route_res.get("fallback_note_en" if lang == "en" else "fallback_note_sl")
                             or ""
                         )
+                        replay_plan_payload = {
+                            "action": str(parsed_plan.get("task_type") or "spectral_index"),
+                            "task_type": str(parsed_plan.get("task_type") or "spectral_index"),
+                            "location_name": str(ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""),
+                            "place_name": str(ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""),
+                            "lat": round(float(ai_out["lat"]), 6),
+                            "lon": round(float(ai_out["lon"]), 6),
+                            "radius_m": int(parsed_plan.get("radius_m", 2500)),
+                            "bbox_4326": list(ai_out.get("bbox_4326") or []),
+                            "target_epsg": str(ai_out.get("crs") or ""),
+                            "start_date": str(parsed_plan.get("start_date") or ""),
+                            "end_date": str(parsed_plan.get("end_date") or ""),
+                            "event_date": str(parsed_plan.get("event_date") or ""),
+                            "target_season": str(parsed_plan.get("target_season") or ""),
+                            "interval": str(ai_out.get("adaptive_interval") or parsed_plan.get("interval") or ""),
+                            "index": str(parsed_plan.get("index_name") or "NDVI"),
+                            "index_name": str(parsed_plan.get("index_name") or "NDVI"),
+                            "primary_index": str(parsed_plan.get("index_name") or "NDVI"),
+                            "complementary_indices": list(ai_out.get("extra_indices") or []),
+                            "sensor": str(parsed_plan.get("sensor") or ""),
+                            "sensors": [str(parsed_plan.get("sensor") or "")],
+                            "fusion_mode": str(parsed_plan.get("fusion_mode") or ""),
+                            "resolution_m": int(parsed_plan.get("resolution_m", 10)),
+                            "include_comparison": bool(parsed_plan.get("include_comparison", False)),
+                            "engine": str(ai_out.get("engine") or "stac"),
+                            "user_prompt": str(incoming_prompt),
+                        }
                         st.session_state["ai_chat_messages"].append(
                             {
                                 "role": "assistant",
                                 "content": str(reply_res.get("text") or ""),
                                 "action": "run_analysis",
                                 "plan": parsed_plan,
+                                "replay_plan": replay_plan_payload,
+                                "result_meta": {
+                                    "is_visual_analysis": True,
+                                    "engine": str(ai_out.get("engine") or "stac"),
+                                    "resolved_place": str(ai_out.get("resolved_place") or parsed_plan.get("place_name") or ""),
+                                    "crs": str(ai_out.get("crs") or ""),
+                                },
                                 "result_id": res_key,
                                 "fallback_note": fb_note_str,
                             }

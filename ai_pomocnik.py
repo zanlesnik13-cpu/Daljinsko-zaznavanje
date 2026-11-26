@@ -5287,3 +5287,106 @@ def generate_conversational_reply(
         "fallback_note_en": "",
     }
 
+
+# ---------------------------------------------------------------------------
+# Zero-LLM Visual Replay for Saved AI Conversations
+# ---------------------------------------------------------------------------
+_NON_VISUAL_ACTIONS: frozenset[str] = frozenset({"chat", "ask_clarification", "answer_only", "none"})
+
+
+def has_visual_plan(assistant_msg: dict[str, Any] | None) -> bool:
+    """Return True if a saved assistant message represents a satellite/geodetic visual analysis."""
+    if not isinstance(assistant_msg, dict):
+        return False
+    action = str(assistant_msg.get("action") or "").strip().lower()
+    if action in _NON_VISUAL_ACTIONS:
+        return False
+    if action == "run_analysis":
+        return True
+    res_meta = assistant_msg.get("result_meta")
+    if isinstance(res_meta, dict) and bool(res_meta.get("is_visual_analysis")):
+        return True
+    if assistant_msg.get("result_id"):
+        return True
+    rp = assistant_msg.get("replay_plan") or assistant_msg.get("plan")
+    if isinstance(rp, dict) and (rp.get("task_type") or rp.get("action") or rp.get("sensor") or rp.get("index") or rp.get("index_name")):
+        return True
+    return False
+
+
+def reconstruct_plan_without_llm(
+    assistant_msg: dict[str, Any],
+    user_prompt: str = "",
+) -> dict[str, Any]:
+    """Build a complete executable EO plan from saved ``replay_plan``/``plan`` with ZERO LLM calls.
+
+    Backward-compatible with older saved chats (from before ``replay_plan`` was persisted):
+    fills any missing fields strictly via the deterministic local parser
+    (``parse_eo_request_local``), NEVER calling Gemini.
+    """
+    saved_raw = assistant_msg.get("replay_plan")
+    if not isinstance(saved_raw, dict) or not saved_raw:
+        saved_raw = assistant_msg.get("plan")
+    saved: dict[str, Any] = dict(saved_raw) if isinstance(saved_raw, dict) else {}
+
+    prompt_txt = str(
+        user_prompt
+        or saved.get("user_prompt")
+        or saved.get("user_query")
+        or ""
+    ).strip()
+
+    # Use deterministic local parser ONLY to fill gaps for older saved chats
+    local_base: dict[str, Any] = {}
+    if prompt_txt:
+        try:
+            local_base = parse_eo_request_local(prompt_txt)
+        except Exception:
+            local_base = {}
+
+    merged: dict[str, Any] = dict(local_base)
+    for k, v in saved.items():
+        if v is not None and v != "":
+            merged[k] = v
+
+    # Map canonical replay aliases into validate_and_normalize_plan field names
+    if not merged.get("place_name") and merged.get("location_name"):
+        merged["place_name"] = merged["location_name"]
+    if not merged.get("index_name"):
+        merged["index_name"] = merged.get("index") or merged.get("primary_index") or merged.get("index_code")
+    if not merged.get("task_type") and merged.get("action") and str(merged["action"]) in VALID_TASKS:
+        merged["task_type"] = merged["action"]
+    if not merged.get("sensor") and isinstance(merged.get("sensors"), (list, tuple)) and merged["sensors"]:
+        merged["sensor"] = merged["sensors"][0]
+    if prompt_txt and not merged.get("user_query"):
+        merged["user_query"] = prompt_txt
+
+    norm_plan = validate_and_normalize_plan(merged, query=prompt_txt or str(merged.get("place_name") or ""))
+
+    # Preserve explicit saved coordinates/bbox/CRS/engine/fusion_mode if present
+    for keep_k in ("lat", "lon", "bbox_4326", "target_epsg", "crs", "engine", "fusion_mode", "target_season", "complementary_indices"):
+        if saved.get(keep_k) is not None and saved.get(keep_k) != "":
+            norm_plan[keep_k] = saved[keep_k]
+    if prompt_txt:
+        norm_plan["user_query"] = prompt_txt
+        norm_plan["user_prompt"] = prompt_txt
+    return norm_plan
+
+
+def replay_visual_analysis_no_llm(
+    assistant_msg: dict[str, Any],
+    user_prompt: str = "",
+    *,
+    lang: str = "sl",
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Re-execute ONLY the satellite visual analysis using the saved plan — ZERO Gemini/LLM calls.
+
+    Restores ``frames``, ``delta_overlay_uri``, ``timelapse_rgb_gif_bytes``,
+    ``timelapse_index_gif_bytes``, ``ts_df``, ``tif_bytes``, and ``analysis_context``
+    while keeping the original saved assistant text untouched.
+    """
+    plan = reconstruct_plan_without_llm(assistant_msg, user_prompt=user_prompt)
+    return execute_ai_plan(plan, lang=lang, progress_cb=progress_cb)
+
+
