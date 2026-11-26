@@ -6,7 +6,7 @@
       "id": "eae1f24f",
       "title": "Krčenja amazonskega pragozda skozi leta",
       "created_at": "2026-11-26T18:32:28Z",
-      "updated_at": "2026-11-26T20:47:03Z",
+      "updated_at": "2026-11-26T20:54:51Z",
       "pinned": false,
       "messages": [
         {
@@ -138,6 +138,15 @@
           "role": "assistant",
           "content": "Katero vročo točko krčenja pragozda v Amazoniji bi želeli podrobno analizirati v visoki ločljivosti (Landsat/Sentinel-2)? Predlagam tri najbolj reprezentativna območja t.i. loka krčenja (Arc of Deforestation):\n1. **Rondônia (Ariquemes / BR-364)** – ikoničen vzorec krčenja v obliki ribje kosti vzdolž cestnih koridorjev,\n2. **Novo Progresso, Pará (koridor BR-163)** – žarišče nedavnega obsežnega sekanja in požarov za pašnike,\n3. **Sinop / Alta Floresta (Mato Grosso)** – intenzivna preobrazba gozda v obsežne monokulture soje.",
           "action": "ask_clarification"
+        },
+        {
+          "role": "user",
+          "content": "Rondônia (Ariquemes / BR-364)"
+        },
+        {
+          "role": "assistant",
+          "content": "⚠️ Napaka pri izvedbi AI analize: HTTPSConnectionPool(host='earthengine.googleapis.com', port=443): Read timed out. (read timeout=60)",
+          "action": "error"
         }
       ],
       "last_analysis_context": {
