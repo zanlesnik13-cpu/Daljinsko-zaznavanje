@@ -1598,6 +1598,27 @@ def build_technical_summary(
     return "\n".join(lines)
 
 
+def _sfloat(val: Any, default: float = 0.0) -> float:
+    """Safely convert any value (including ``None`` or ``NaN``) to a finite ``float``."""
+    if val is None:
+        return float(default)
+    try:
+        out = float(val)
+        return out if np.isfinite(out) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _sint(val: Any, default: int = 0) -> int:
+    """Safely convert any value (including ``None``) to an ``int``."""
+    if val is None:
+        return int(default)
+    try:
+        return int(round(float(val)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def build_analysis_context_dict(
     plan: dict[str, Any],
     result: dict[str, Any],
@@ -1608,16 +1629,16 @@ def build_analysis_context_dict(
         "kind": kind,
         "place_name": str(plan.get("place_name", "")),
         "resolved_place": str(result.get("resolved_place", plan.get("place_name", ""))),
-        "lat": round(float(result.get("lat", 0.0)), 5),
-        "lon": round(float(result.get("lon", 0.0)), 5),
-        "radius_m": int(plan.get("radius_m", 4000)),
+        "lat": round(_sfloat(result.get("lat"), 0.0), 5),
+        "lon": round(_sfloat(result.get("lon"), 0.0), 5),
+        "radius_m": _sint(plan.get("radius_m"), 4000),
         "crs": str(result.get("crs", CRS_D96TM)),
         "sensor": str(plan.get("sensor", SENSOR_S2)),
         "sensors": list(plan.get("sensors") or [plan.get("sensor", SENSOR_S2)]),
         "fusion_mode": str(plan.get("fusion_mode") or FUSION_SINGLE),
         "fusion_rationale_sl": str(plan.get("fusion_rationale_sl") or ""),
         "fusion_rationale_en": str(plan.get("fusion_rationale_en") or ""),
-        "resolution_m": int(plan.get("resolution_m", 10)),
+        "resolution_m": _sint(plan.get("resolution_m"), 10),
         "task_type": str(plan.get("task_type", "")),
         "index_name": str(plan.get("index_name", "")),
         "start_date": str(plan.get("start_date", "")),
@@ -1638,9 +1659,9 @@ def build_analysis_context_dict(
                 breakdown_rows.append(
                     {
                         "class_label": str(row.get("class_label", "")),
-                        "area_ha": round(float(row.get("area_ha", 0.0)), 2),
-                        "area_km2": round(float(row.get("area_km2", 0.0)), 3),
-                        "pct": round(float(row.get("pct", 0.0)), 2),
+                        "area_ha": round(_sfloat(row.get("area_ha"), 0.0), 2),
+                        "area_km2": round(_sfloat(row.get("area_km2"), 0.0), 3),
+                        "pct": round(_sfloat(row.get("pct"), 0.0), 2),
                     }
                 )
         ctx.update(
@@ -1648,10 +1669,10 @@ def build_analysis_context_dict(
                 "disaster_type": str(dis.get("disaster_type", "")),
                 "date_pre": str(dis.get("date_pre", "")),
                 "date_event": str(dis.get("date_event", "")),
-                "affected_area_ha": round(float(d_sum.get("affected_area_ha", 0.0)), 2),
-                "affected_area_km2": round(float(d_sum.get("affected_area_km2", 0.0)), 3),
-                "affected_pct": round(float(d_sum.get("affected_pct", 0.0)), 2),
-                "permanent_water_ha": round(float(d_sum.get("permanent_water_ha", 0.0)), 2),
+                "affected_area_ha": round(_sfloat(d_sum.get("affected_area_ha"), 0.0), 2),
+                "affected_area_km2": round(_sfloat(d_sum.get("affected_area_km2"), 0.0), 3),
+                "affected_pct": round(_sfloat(d_sum.get("affected_pct"), 0.0), 2),
+                "permanent_water_ha": round(_sfloat(d_sum.get("permanent_water_ha"), 0.0), 2),
                 "mean_dnbr": d_sum.get("mean_dnbr"),
                 "mean_dndvi": d_sum.get("mean_dndvi"),
                 "severity_breakdown": breakdown_rows,
@@ -1664,13 +1685,13 @@ def build_analysis_context_dict(
                 "date_str": str(result.get("date_str", "")),
                 "tile": str(result.get("tile", "")),
                 "stats": {
-                    "min": round(float(st_d.get("min", 0.0)), 4),
-                    "max": round(float(st_d.get("max", 0.0)), 4),
-                    "mean": round(float(st_d.get("mean", 0.0)), 4),
-                    "median": round(float(st_d.get("median", 0.0)), 4),
-                    "std": round(float(st_d.get("std", 0.0)), 4),
-                    "valid_area_ha": round(float(st_d.get("valid_area_ha", 0.0)), 2),
-                    "valid_pct": round(float(st_d.get("valid_pct", 0.0)), 2),
+                    "min": round(_sfloat(st_d.get("min"), 0.0), 4),
+                    "max": round(_sfloat(st_d.get("max"), 0.0), 4),
+                    "mean": round(_sfloat(st_d.get("mean"), 0.0), 4),
+                    "median": round(_sfloat(st_d.get("median"), 0.0), 4),
+                    "std": round(_sfloat(st_d.get("std"), 0.0), 4),
+                    "valid_area_ha": round(_sfloat(st_d.get("valid_area_ha"), 0.0), 2),
+                    "valid_pct": round(_sfloat(st_d.get("valid_pct"), 0.0), 2),
                 },
             }
         )
@@ -1725,9 +1746,10 @@ def build_analysis_context_dict(
         excluded_dates = sorted(set(excluded_dates))
         n_obs = len(rel_df)
         vals = rel_df["mean"].to_numpy(dtype=np.float64) if n_obs else np.array([], dtype=np.float64)
+        fin_vals = vals[np.isfinite(vals)]
         slope = None
-        if n_obs >= 3:
-            slope = round(float(np.polyfit(np.arange(n_obs, dtype=np.float64), vals, 1)[0]), 5)
+        if n_obs >= 3 and fin_vals.size >= 3:
+            slope = round(float(np.polyfit(np.arange(fin_vals.size, dtype=np.float64), fin_vals, 1)[0]), 5)
         ctx.update(
             {
                 "n_dates": int(n_obs),
@@ -1736,20 +1758,20 @@ def build_analysis_context_dict(
                 "date_start": str(rel_df["date_str"].iloc[0]) if n_obs else str(plan.get("start_date", "")),
                 "date_end": str(rel_df["date_str"].iloc[-1]) if n_obs else str(plan.get("end_date", "")),
                 "interval": str(plan.get("interval", "")),
-                "mean": round(float(np.nanmean(vals)), 4) if n_obs else None,
-                "min": round(float(np.nanmin(vals)), 4) if n_obs else None,
-                "max": round(float(np.nanmax(vals)), 4) if n_obs else None,
-                "first_val": round(float(vals[0]), 4) if n_obs else None,
-                "last_val": round(float(vals[-1]), 4) if n_obs else None,
+                "mean": round(float(np.nanmean(fin_vals)), 4) if fin_vals.size else None,
+                "min": round(float(np.nanmin(fin_vals)), 4) if fin_vals.size else None,
+                "max": round(float(np.nanmax(fin_vals)), 4) if fin_vals.size else None,
+                "first_val": round(float(fin_vals[0]), 4) if fin_vals.size else None,
+                "last_val": round(float(fin_vals[-1]), 4) if fin_vals.size else None,
                 "trend_slope_per_obs": slope,
                 "has_visual_comparison": bool(result.get("comparison_rgb") or result.get("comparison_index")),
             }
         )
         cs_ts = result.get("change_summary") or {}
         if cs_ts:
-            ctx["delta_mean"] = round(float(cs_ts.get("mean", 0.0)), 4)
-            ctx["pos_area_ha"] = round(float(cs_ts.get("pos_area_ha", 0.0)), 2)
-            ctx["neg_area_ha"] = round(float(cs_ts.get("neg_area_ha", 0.0)), 2)
+            ctx["delta_mean"] = round(_sfloat(cs_ts.get("mean"), 0.0), 4)
+            ctx["pos_area_ha"] = round(_sfloat(cs_ts.get("pos_area_ha"), 0.0), 2)
+            ctx["neg_area_ha"] = round(_sfloat(cs_ts.get("neg_area_ha"), 0.0), 2)
         g_stats = result.get("glacier_change_stats")
         if isinstance(g_stats, dict) and g_stats:
             ctx["glacier_change_stats"] = dict(g_stats)
@@ -4631,10 +4653,12 @@ def _generate_local_conversational_reply(
             )
 
         if kind in ("time_series", "time_series_and_comparison"):
-            n_d = int(analysis_context.get("n_dates", 0))
+            n_d = _sint(analysis_context.get("n_dates"), 0)
             d1 = str(analysis_context.get("date_start", ""))
             d2 = str(analysis_context.get("date_end", ""))
-            mean_v = analysis_context.get("mean")
+            mean_v = _sfloat(analysis_context.get("mean"), 0.0)
+            min_ts = _sfloat(analysis_context.get("min"), 0.0)
+            max_ts = _sfloat(analysis_context.get("max"), 0.0)
             slope = analysis_context.get("trend_slope_per_obs")
             excl_arch = list(analysis_context.get("excluded_archive_dates") or [])
             arch_note_sl = ""
@@ -4654,11 +4678,11 @@ def _generate_local_conversational_reply(
                     f"reliable baseline starting **`{d1}`**."
                 )
             if lang == "sl":
-                trend_txt = f" Linearni trend znaša **`{slope:+.4f}` na opazovanje**." if slope is not None else ""
+                trend_txt = f" Linearni trend znaša **`{_sfloat(slope):+.4f}` na opazovanje**." if slope is not None else ""
                 return (
                     f"### Časovna vrsta **{idx}** za **{place}** (`{d1}` – `{d2}`)\n\n"
                     f"Iz satelitskega arhiva `{sensor}` (**{res_m} m**, **{crs}**) je bilo obdelanih **{n_d} kakovostnih datumov** (interval: `{analysis_context.get('interval', '')}` z istim letnim časom in samodejno zamenjavo oblačnih datumov).\n\n"
-                    f"- **Povprečna vrednost v obdobju:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{trend_txt}{arch_note_sl}\n\n"
+                    f"- **Povprečna vrednost v obdobju:** **`{mean_v:.3f}`** (min `{min_ts:.3f}`, max `{max_ts:.3f}`).{trend_txt}{arch_note_sl}\n\n"
                     f"**Predlogi za nadaljevanje:**\n"
                     f"- *»Napiši kratek povzetek tega trenda za moje poročilo.«*\n"
                     f"- *»Primerjaj {idx} za {place} med {d1[:4]} in {d2[:4]} z interaktivno zaveso.«*"
@@ -4666,7 +4690,7 @@ def _generate_local_conversational_reply(
             return (
                 f"### **{idx}** Time Series for **{place}** (`{d1}` – `{d2}`)\n\n"
                 f"Processed **{n_d} reliable dates** from `{sensor}` (**{res_m} m**, **{crs}**).\n\n"
-                f"- **Period Mean:** **`{mean_v:.3f}`** (min `{analysis_context.get('min', 0.0):.3f}`, max `{analysis_context.get('max', 0.0):.3f}`).{arch_note_en}"
+                f"- **Period Mean:** **`{mean_v:.3f}`** (min `{min_ts:.3f}`, max `{max_ts:.3f}`).{arch_note_en}"
             )
 
         if kind == "scene_rgb":

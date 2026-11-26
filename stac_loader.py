@@ -1099,7 +1099,7 @@ def _supplement_same_day_tiles(
         dt_utc = _extract_item_datetime_utc(item_list[0])
         date_str = dt_utc.strftime("%Y-%m-%d")
         target_plat = str(item_list[0].properties.get("platform") or "").strip().lower()
-        catalog = _open_stac_catalog()
+        catalog = get_stac_catalog()
         search = catalog.search(
             collections=[collection],
             bbox=[float(v) for v in bbox_4326],

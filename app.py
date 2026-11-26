@@ -6806,14 +6806,21 @@ def _snapshot_active_thread_to_store(username: str | None, *, sync_cloud: bool =
     cur_ctx = st.session_state.get("ai_last_analysis_context")
     cur_layout = st.session_state.get("ai_last_map_layout")
 
-    # Save runtime visual payloads (frames, overlays, GIFs) in-memory for instant in-session switching
+    # Save runtime visual payloads (frames, overlays, GIFs) in-memory for instant in-session switching,
+    # capped to the 3 most recently used threads so 1 GB Streamlit Cloud RAM never overflows.
     rt_cache = dict(st.session_state.get("_ai_thread_runtime_cache") or {})
+    rt_cache.pop(str(active_id), None)
     rt_cache[str(active_id)] = {
         "ai_chat_results": dict(st.session_state.get("ai_chat_results") or {}),
         "tab6_ai_result": st.session_state.get("tab6_ai_result"),
         "ai_last_analysis_context": cur_ctx,
         "ai_last_map_layout": cur_layout,
     }
+    while len(rt_cache) > 3:
+        oldest_tid = next(iter(rt_cache))
+        if oldest_tid == str(active_id):
+            break
+        rt_cache.pop(oldest_tid, None)
     st.session_state["_ai_thread_runtime_cache"] = rt_cache
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
