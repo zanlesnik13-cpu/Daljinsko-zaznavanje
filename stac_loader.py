@@ -283,14 +283,50 @@ def _configure_odc_rio() -> None:
         _ODC_RIO_CONFIGURED = True
 
 
-def _extract_item_datetime_utc(item: pystac.Item) -> datetime:
-    """Return the item's acquisition datetime normalized to UTC."""
+def _ensure_item_datetime(item: pystac.Item) -> pystac.Item:
+    """Ensure ``item.datetime`` and ``item.properties['datetime']`` are populated.
+
+    8-day composite STAC collections (such as Planetary Computer ``modis-09A1-061``
+    and ``modis-11A2-061``) leave ``item.datetime`` as ``None`` per STAC spec and
+    store the interval in ``start_datetime`` / ``end_datetime``. Normalizing this
+    in-place ensures both our metadata extractors and ``odc.stac.load`` always see
+    a valid UTC acquisition timestamp.
+    """
     dt = item.datetime
     if dt is None:
-        raw = item.properties.get("datetime")
+        raw = (
+            item.properties.get("datetime")
+            or item.properties.get("start_datetime")
+            or item.properties.get("end_datetime")
+        )
+        if raw is not None:
+            try:
+                dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+            except ValueError:
+                dt = None
+    if dt is not None:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        item.datetime = dt
+        item.properties["datetime"] = dt.isoformat().replace("+00:00", "Z")
+    return item
+
+
+def _extract_item_datetime_utc(item: pystac.Item) -> datetime:
+    """Return the item's acquisition datetime normalized to UTC (with start_datetime fallback)."""
+    _ensure_item_datetime(item)
+    dt = item.datetime
+    if dt is None:
+        raw = (
+            item.properties.get("datetime")
+            or item.properties.get("start_datetime")
+            or item.properties.get("end_datetime")
+        )
         if raw is None:
             raise ValueError(f"STAC item {item.id!r} has no acquisition datetime.")
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -351,8 +387,8 @@ StacItemOrGroup = Union[pystac.Item, Sequence[pystac.Item]]
 def _normalize_item_group(items_or_item: StacItemOrGroup) -> list[pystac.Item]:
     """Normalize a single STAC Item or a sequence of same-day STAC Items into a non-empty list."""
     if isinstance(items_or_item, pystac.Item):
-        return [items_or_item]
-    item_list = [it for it in items_or_item if isinstance(it, pystac.Item)]
+        return [_ensure_item_datetime(items_or_item)]
+    item_list = [_ensure_item_datetime(it) for it in items_or_item if isinstance(it, pystac.Item)]
     if not item_list:
         raise ValueError("Expected at least one pystac.Item to load, got an empty sequence.")
     return item_list
@@ -374,6 +410,18 @@ def _extract_tile_label(item: pystac.Item, sensor: str) -> str:
         orbit_state = str(item.properties.get("sat:orbit_state", "")).upper()
         orbit_short = orbit_state[:3] if orbit_state else ""
         return f"Orb {rel_orbit} ({orbit_short})" if rel_orbit else orbit_short
+    if sensor in MODIS_SENSORS:
+        h_tile = item.properties.get("modis:horizontal-tile")
+        v_tile = item.properties.get("modis:vertical-tile")
+        if h_tile is not None and v_tile is not None:
+            try:
+                return f"h{int(h_tile):02d}v{int(v_tile):02d}"
+            except (TypeError, ValueError):
+                pass
+        m_hv = re.search(r"(h\d{2}v\d{2})", str(item.id), re.IGNORECASE)
+        if m_hv:
+            return m_hv.group(1).lower()
+        return ""
     return _extract_mgrs_tile(item)
 
 
@@ -391,12 +439,15 @@ def _extract_platform_label(item: pystac.Item, sensor: str) -> str:
         if pol_str:
             platform = f"{platform} ({pol_str})"
         return platform
+    if sensor in MODIS_SENSORS:
+        plat = str(item.properties.get("platform") or "").strip()
+        return plat if plat else "Terra MODIS"
     return str(item.properties.get("platform", ""))
 
 
 def _merge_group_metadata(items: Sequence[pystac.Item], sensor: str) -> dict[str, Any]:
     """Summarize metadata across a group of same-day STAC items."""
-    item_list = list(items)
+    item_list = [_ensure_item_datetime(it) for it in items]
     dts = [_extract_item_datetime_utc(it) for it in item_list]
     max_dt = max(dts)
     date_str = max_dt.strftime("%Y-%m-%d")
@@ -410,6 +461,10 @@ def _merge_group_metadata(items: Sequence[pystac.Item], sensor: str) -> dict[str
     if sensor == SENSOR_S1:
         cloud_mean = np.nan
         cloud_min = np.nan
+    elif sensor in MODIS_SENSORS:
+        # 8-day MODIS composites are pre-composited without a single eo:cloud_cover field
+        cloud_mean = 0.0
+        cloud_min = 0.0
     else:
         clouds: list[float] = []
         for it in item_list:
@@ -527,7 +582,7 @@ def _fetch_stac_items_full(
         if query:
             kwargs["query"] = query
         search = catalog.search(**kwargs)
-        raw_items.extend(search.items())
+        raw_items.extend(_ensure_item_datetime(it) for it in search.items())
 
     # Deduplicate by STAC item ID in case window boundaries overlap
     seen_ids: set[str] = set()
@@ -932,6 +987,11 @@ def mosaic_tile_stack(raw_ds: xr.Dataset, sensor: str) -> xr.Dataset:
                 return np.isfinite(slice_arr) & (slice_arr > 0) & ((slice_arr.astype(np.uint16, copy=False) & 1) == 0)
             if v_str == "SCL":
                 return np.isfinite(slice_arr) & (slice_arr > 0)
+            if sensor in MODIS_SENSORS and v_str != "LST_Day_1km":
+                valid = np.isfinite(slice_arr) & (slice_arr > -100) & (slice_arr < 16000)
+                if nodata_val is not None and np.isfinite(nodata_val):
+                    valid &= slice_arr != nodata_val
+                return valid
             # Optical & thermal DN bands: 0 (and <= 0) is strictly NoData fill
             valid = np.isfinite(slice_arr) & (slice_arr > 0)
             if nodata_val is not None and np.isfinite(nodata_val):
@@ -1113,7 +1173,7 @@ def _supplement_same_day_tiles(
             limit=50,
             max_items=50,
         )
-        fetched = list(search.items())
+        fetched = [_ensure_item_datetime(it) for it in search.items()]
     except Exception:
         return item_list
 
@@ -2052,7 +2112,7 @@ def load_copernicus_dem(
             bbox=list(bbox_4326),
             max_items=8,
         )
-        items = list(search.items())
+        items = [_ensure_item_datetime(it) for it in search.items()]
         if not items:
             return None
 

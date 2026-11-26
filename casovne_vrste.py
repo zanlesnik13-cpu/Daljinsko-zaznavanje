@@ -81,13 +81,22 @@ TIME_SERIES_COLUMNS: list[str] = [
 def _item_dt_utc(item: pystac.Item) -> datetime:
     dt = item.datetime
     if dt is None:
-        raw = item.properties.get("datetime")
+        raw = (
+            item.properties.get("datetime")
+            or item.properties.get("start_datetime")
+            or item.properties.get("end_datetime")
+        )
         if raw is None:
             return datetime.min.replace(tzinfo=timezone.utc)
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    if item.datetime is None:
+        item.datetime = dt
+        item.properties["datetime"] = dt.isoformat().replace("+00:00", "Z")
+    return dt
 
 
 def _normalize_epoch_groups(
