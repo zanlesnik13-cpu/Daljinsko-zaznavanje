@@ -1,12 +1,12 @@
 {
   "version": 1,
   "username": "zan123",
-  "saved_at": "2026-11-27T17:43:30Z",
+  "saved_at": "2026-11-27T17:48:40Z",
   "aoi": {
     "location_name": "Ravne na Koroškem, Slovenija",
     "center_lat": 46.548366,
     "center_lon": 14.975029,
-    "radius_m": 4000,
+    "radius_m": 2000,
     "bbox_4326": null,
     "custom_polygon_geojson": null
   },
@@ -179,6 +179,129 @@
           "NDVI"
         ],
         "user_prompt": "Kako se je spreminjalo ravne na koroškem v zadnjih 15 letih"
+      },
+      "result_meta": {
+        "is_visual_analysis": true,
+        "engine": "stac",
+        "resolved_place": "Ravne na Koroškem, Slovenija",
+        "crs": "EPSG:3794"
+      }
+    },
+    {
+      "role": "user",
+      "content": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta"
+    },
+    {
+      "role": "assistant",
+      "content": "Za ožje območje mesta Ravne na Koroškem je bila izvedena osredotočena analiza na **pravokotnem analiznem območju velikosti 16,0 km²**, ki natančno pokriva mestno jedro, industrijski kompleks ter neposredno zaledje.\n\nPri analizi grajenih površin z indeksom **NDBI** je fizikalna ločljivost obdelave nastavljena na **20 m**, saj Sentinel-2 pasova kratkovalovnega infrardečega spektra (SWIR – pasova B11 in B12), ki sta nujna za ločevanje neprepustnih grajenih materialov od tal in rastlinstva, delujeta v nativni ločljivosti 20 m (vidni kanali RGB in NIR sicer omogočajo 10 m). Podatki Landsat 8 so bili za primerljivost interpolirani na enotno mrežo 20 m.\n\nSpodaj je podrobno strokovno poročilo izvedene analize.\n\n---\n\n### 1. Ozadje dogodka in območja\n\nMesto **Ravne na Koroškem** ($\\varphi=46,54837^\\circ, \\lambda=14,97503^\\circ$) leži v zoženem dnu Mežiške doline. Zanj je značilen izrazit preplet obsežnih industrijskih površin (jeklarski kompleks SIJ Metal Ravne z obrati in skladišči), strnjenega mestnega jedra ter reliefno razgibanih stanovanjskih sosesk na terasah (npr. Čečovje, Javornik), ki jih obkrožajo strma gozdnata pobočja. \n\nOmejenost razpoložljivega ravninskega prostora narekuje specifičen model prostorskega razvoja: novogradnje in infrastrukturne posodobitve pogosto potekajo kot zgoščevanje znotraj obstoječega stavbnega tkiva (t.i. *infill development*), sanacije industrijskih površin (brownfield) ter postopno širjenje na obrobna kmetijska zemljišča. Za detekcijo tovrstnih sprememb je bil uporabljen indeks normalizirane razlike grajenih površin (**NDBI** – *Normalized Difference Built-up Index*).\n\n---\n\n### 2. Metodologija in podatki\n\n* **Analizirano območje (AOI):** Pravokotno analizno območje z natančno površino **16,0 km²** (radij 2.000 m okrog mestnega središča).\n* **Uporabljeni satelitski senzorji:** **Landsat 8**, **Sentinel-2A** in **Sentinel-2B**.\n* **Časovni razpon opazovanja:** Od **20. avgusta 2016** do **14. avgusta 2026** (11 veljavnih letnih opazovalnih presekov).\n* **Prostorska ločljivost (ločljivost celice rastra):** **20 m** (`used_scale_m: 20`).\n* **Koordinatni referenčni sistem:** Slovenski državni ravninski sistem **EPSG:3794** (D96/TM).\n* **Spektralni indeks:**\n  $$\\text{NDBI} = \\frac{\\text{SWIR} - \\text{NIR}}{\\text{SWIR} + \\text{NIR}}$$\n  Pozitivne ali manj negativne vrednosti NDBI označujejo prisotnost neprepustnih površin (beton, asfalt, pločevinaste strehe, industrijski objekti, gola tla), medtem ko izrazito negativne vrednosti označujejo gosto vegetacijo in gozd.\n\n#### 🛰️ Zakaj je bila uporabljena kombinacija več satelitskih sistemov\n\nZa zanesljivo desetletno spremljanje (2016–2026) je bila uporabljena metodologija časovne fuzije (`temporal_landsat_s2`):\n\n1. **Časovna pokritost začetnega stanja (2016):** V letu 2016 je bil uporabljen senzor **Landsat 8 Collection 2 L2** (1 opazovanje), saj je zagotovil kakovosten, radiometrično umerjen spektralni posnetek brez oblačnosti pred polno operativnostjo tandema Sentinel-2.\n2. **Visokoločljivostna faza (2017–2026):** Za obdobje od leta 2017 dalje je bila vključena konstelacija **Sentinel-2A in Sentinel-2B** (10 opazovanj), ki prinaša bistveno večjo gostoto preletov in ostrejšo prostorsko ločljivost (20 m za SWIR pasove v primerjavi s 30 m pri Landsatu).\n3. **Kvantitativne metrike sinergije (`synergy_metrics`):**\n   * Skupno število Landsat opazovanj: **1** (leto 2016)\n   * Skupno število Sentinel-2 opazovanj: **10** (2017–2026)\n   * Prelomno leto fuzije (*transition year*): **2017**\n   * Skupno število generiranih primerjalnih časovnih slojev (*total frames*): **6**\n4. **Znanstvene omejitve fuzije:** Medtem ko Landsat 8 zajema SWIR pas (pas 6: 1,57–1,65 µm) v nativni ločljivosti 30 m, Sentinel-2 uporablja pas B11 (1,56–1,66 µm) v ločljivosti 20 m. Za fuzijo je bil Landsat interpoliran na mrežo 20 m. Manjša spektralna odstopanja v pasovni širini med senzorjema so bila normalizirana preko nivoja refleksije na površju (Surface Reflectance - L2A).\n\n---\n\n### 3. Podrobna interpretacija rezultatov\n\nAnaliza 11 časovnih presekov med letoma 2016 in 2026 kaže statistično merljive spremembe v odbojnosti površja:\n\n| Parameter | Izmerjena vrednost |\n| :--- | :--- |\n| **Povprečni NDBI celotnega obdobja** | **-0,2809** |\n| **Začetna vrednost NDBI (20. 8. 2016)** | **-0,3369** (minimalna vrednost) |\n| **Zadnja vrednost NDBI (14. 8. 2026)** | **-0,2328** (maksimalna vrednost) |\n| **Sprememba povprečja ($\\Delta$ NDBI)** | **+0,1238** |\n| **Trend rasti na opazovanje (*slope*)** | **+0,00253** |\n| **Površina s porastom NDBI ($pos\\_area$)** | **650,16 ha** |\n| **Površina s padcem NDBI ($neg\\_area$)** | **6,39 ha** |\n\n#### Fizikalni pomen vrednosti v prostoru:\n1. **Osnovna raven indeksa:** Povprečje NDBI (-0,2809) je negativno, kar je pričakovano, saj znotraj 16,0 km² velikega pravokotnika velik del površine predstavljajo gozdnata pobočja ter kmetijska območja okoli naselij Navrški Vrh, Dobja Vas in Stražišče, kjer prevladuje vegetacijski odboj (visok NIR, nizek SWIR).\n2. **Pozitivni odklon ($\\Delta = +0,1238$ in trend $+0,00253$):** Razlika med začetnim stanjem (-0,3369) in končnim stanjem (-0,2328) kaže premik proti manj negativnim vrednostim. \n   * **650,16 ha površin z naraščajočim NDBI** zajema zgoščevanje stavbnih struktur, prenovo strešnih kritin in energetskih ovojev v industrijski coni, širitev logističnih platojev in trgovskih con v Dobji vasi, pa tudi infrastrukturna gradbišča ter sušnejše poletne pogoje na travnatih površinah ob koncu opazovanega niza (avgust 2026).\n   * **Zmanjšanje NDBI na le 6,39 ha** predstavlja točkovne lokacije, kjer je prišlo do ozelenitve, renaturacije brežin ali začasnih sprememb kmetijske rabe.\n\n#### Omejitve analize:\n* Indeks NDBI je občutljiv na vlažnost tal in fenološko stanje vegetacije. Pozno poletni posnetki (avgust) lahko ob sušnih obdobjih izkazujejo višji NDBI zaradi suhe trave, kar delno prispeva k skupnemu pozitivnemu trendu, zato je treba ločiti trajne gradbene posege od sezonskih vplivov suše.\n\n---\n\n### 4. Predlogi za nadaljevanje\n\nGlede na vaše zanimanje za podrobno ločljivost predlagam naslednje korake:\n\n1. **Izvedba analize vegetacijskega pokrova (NDVI) v nativni ločljivosti 10 m:**\n   * Za razliko od NDBI sta pri indeksu NDVI rdeči (Red, B4) in bližnji infrardeči kanal (NIR, B8) na voljo v **nativni ločljivosti 10 m**, kar omogoča natančno kartiranje izgube zelenih površin na nivoju posameznih parcel.\n2. **Kombinirana analiza toplotnega otoka (UHI) z Landsat termalnim kanalom:**\n   * Preverimo lahko, kako so se zgrajene površine v industrijski coni Meža odrazile na temperaturi površja (LST v °C) v primerjavi z ohlajevalnim učinkom gozdnega zaledja.\n3. **Detekcija sprememb na točno določeni industrijski ali stanovanjski coni:**\n   * Analizo lahko omejimo na območje tovarne Metal Ravne ali naselja Javornik z natančnim izračunom letnih razlik.",
+      "action": "run_analysis",
+      "result_id": "ai_res_3_174838",
+      "replay_spec": {
+        "version": 1,
+        "action": "time_series_and_comparison",
+        "location_name": "Ravne na Koroškem, Slovenija",
+        "lat": 46.548366,
+        "lon": 14.975029,
+        "radius_m": 2000.0,
+        "bbox_4326": [
+          14.948931732744128,
+          46.5303635581242,
+          15.001109164086582,
+          46.56636204628689
+        ],
+        "target_epsg": 3794,
+        "start_date": "2016-08-20",
+        "end_date": "2026-08-14",
+        "target_season": "summer",
+        "interval": "Letno",
+        "primary_index": "NDBI",
+        "complementary_indices": [
+          "NDVI"
+        ],
+        "sensors": [
+          "Landsat 8",
+          "Sentinel-2A",
+          "Sentinel-2B"
+        ],
+        "fusion_mode": "temporal_landsat_s2",
+        "resolution_m": 20,
+        "max_cloud": 25,
+        "engine": "stac",
+        "user_prompt": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta"
+      },
+      "plan": {
+        "task_type": "time_series_and_comparison",
+        "place_name": "Ravne na Koroškem, Slovenija",
+        "lat": 46.548366,
+        "lon": 14.975029,
+        "radius_m": 2000,
+        "target_epsg": "EPSG:3794",
+        "start_date": "2016-08-20",
+        "end_date": "2026-08-14",
+        "event_date": "2026-11-27",
+        "interval": "Letno",
+        "index_name": "NDBI",
+        "sensor": "sentinel-2-l2a",
+        "sensors": [
+          "sentinel-2-l2a"
+        ],
+        "fusion_mode": "temporal_landsat_s2",
+        "resolution_m": 20,
+        "include_comparison": true,
+        "engine": "stac",
+        "user_query": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta",
+        "location_name": "Ravne na Koroškem, Slovenija",
+        "index": "NDBI",
+        "action": "time_series_and_comparison",
+        "bbox_4326": [
+          14.948931732744128,
+          46.5303635581242,
+          15.001109164086582,
+          46.56636204628689
+        ],
+        "target_season": "",
+        "primary_index": "NDBI",
+        "complementary_indices": [
+          "NDVI"
+        ],
+        "user_prompt": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta"
+      },
+      "replay_plan": {
+        "task_type": "time_series_and_comparison",
+        "place_name": "Ravne na Koroškem, Slovenija",
+        "lat": 46.548366,
+        "lon": 14.975029,
+        "radius_m": 2000,
+        "target_epsg": "EPSG:3794",
+        "start_date": "2016-08-20",
+        "end_date": "2026-08-14",
+        "event_date": "2026-11-27",
+        "interval": "Letno",
+        "index_name": "NDBI",
+        "sensor": "sentinel-2-l2a",
+        "sensors": [
+          "sentinel-2-l2a"
+        ],
+        "fusion_mode": "temporal_landsat_s2",
+        "resolution_m": 20,
+        "include_comparison": true,
+        "engine": "stac",
+        "user_query": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta",
+        "location_name": "Ravne na Koroškem, Slovenija",
+        "index": "NDBI",
+        "action": "time_series_and_comparison",
+        "bbox_4326": [
+          14.948931732744128,
+          46.5303635581242,
+          15.001109164086582,
+          46.56636204628689
+        ],
+        "target_season": "",
+        "primary_index": "NDBI",
+        "complementary_indices": [
+          "NDVI"
+        ],
+        "user_prompt": "Rad bi 10 metersko prostorsko ločljivost, lahko pa je samo območje mesta"
       },
       "result_meta": {
         "is_visual_analysis": true,
