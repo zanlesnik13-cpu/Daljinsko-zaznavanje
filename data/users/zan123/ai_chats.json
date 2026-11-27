@@ -6,7 +6,7 @@
       "id": "eae1f24f",
       "title": "Krčenja amazonskega pragozda skozi leta",
       "created_at": "2026-11-26T18:32:28Z",
-      "updated_at": "2026-11-26T21:58:41Z",
+      "updated_at": "2026-11-27T17:38:57Z",
       "pinned": false,
       "messages": [
         {
@@ -180,17 +180,31 @@
             "user_prompt": "Rondônia (Ariquemes / BR-364)"
           },
           "plan": {
+            "action": "time_series_and_comparison",
             "task_type": "time_series_and_comparison",
+            "location_name": "Amazon Rainforest (Rondônia, Brazil)",
             "place_name": "Amazon Rainforest (Rondônia, Brazil)",
             "lat": -9.9133,
             "lon": -63.0408,
             "radius_m": 250000,
+            "bbox_4326": [
+              -65.33846488927549,
+              -12.174291732895412,
+              -60.74369257858972,
+              -7.645838935344255
+            ],
             "target_epsg": "EPSG:32720",
             "start_date": "1990-01-01",
             "end_date": "2026-11-26",
             "event_date": "2026-11-26",
+            "target_season": "",
             "interval": "Letno",
+            "index": "NDVI",
             "index_name": "NDVI",
+            "primary_index": "NDVI",
+            "complementary_indices": [
+              "NDMI"
+            ],
             "sensor": "modis-09A1-061",
             "sensors": [
               "modis-09A1-061"
@@ -199,35 +213,35 @@
             "resolution_m": 500,
             "include_comparison": true,
             "engine": "gee",
-            "user_query": "Rondônia (Ariquemes / BR-364)",
-            "location_name": "Amazon Rainforest (Rondônia, Brazil)",
-            "index": "NDVI",
-            "action": "time_series_and_comparison",
-            "bbox_4326": [
-              -65.33846488927549,
-              -12.174291732895412,
-              -60.74369257858972,
-              -7.645838935344255
-            ],
-            "target_season": "",
-            "primary_index": "NDVI",
-            "complementary_indices": [
-              "NDMI"
-            ],
-            "user_prompt": "Rondônia (Ariquemes / BR-364)"
+            "user_prompt": "Rondônia (Ariquemes / BR-364)",
+            "user_query": "Rondônia (Ariquemes / BR-364)"
           },
           "replay_plan": {
+            "action": "time_series_and_comparison",
             "task_type": "time_series_and_comparison",
+            "location_name": "Amazon Rainforest (Rondônia, Brazil)",
             "place_name": "Amazon Rainforest (Rondônia, Brazil)",
             "lat": -9.9133,
             "lon": -63.0408,
             "radius_m": 250000,
+            "bbox_4326": [
+              -65.33846488927549,
+              -12.174291732895412,
+              -60.74369257858972,
+              -7.645838935344255
+            ],
             "target_epsg": "EPSG:32720",
             "start_date": "1990-01-01",
             "end_date": "2026-11-26",
             "event_date": "2026-11-26",
+            "target_season": "",
             "interval": "Letno",
+            "index": "NDVI",
             "index_name": "NDVI",
+            "primary_index": "NDVI",
+            "complementary_indices": [
+              "NDMI"
+            ],
             "sensor": "modis-09A1-061",
             "sensors": [
               "modis-09A1-061"
@@ -236,22 +250,8 @@
             "resolution_m": 500,
             "include_comparison": true,
             "engine": "gee",
-            "user_query": "Rondônia (Ariquemes / BR-364)",
-            "location_name": "Amazon Rainforest (Rondônia, Brazil)",
-            "index": "NDVI",
-            "action": "time_series_and_comparison",
-            "bbox_4326": [
-              -65.33846488927549,
-              -12.174291732895412,
-              -60.74369257858972,
-              -7.645838935344255
-            ],
-            "target_season": "",
-            "primary_index": "NDVI",
-            "complementary_indices": [
-              "NDMI"
-            ],
-            "user_prompt": "Rondônia (Ariquemes / BR-364)"
+            "user_prompt": "Rondônia (Ariquemes / BR-364)",
+            "user_query": "Rondônia (Ariquemes / BR-364)"
           },
           "result_meta": {
             "is_visual_analysis": true,
